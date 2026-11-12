@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "valkyrie",
+  "version": "${version}",
+  "name": "ValkyrieRender",
+  "description": "Vulkan GPU-Driven Voxel Deferred Renderer for Minecraft 1.21.1",
+  "authors": [
+    "Valkyrie Team"
+  ],
+  "contact": {},
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "com.example.valkyrie.ValkyrieMod"
+    ]
+  },
+  "mixins": [
+    "valkyrie.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "~1.21.1",
+    "java": ">=21"
+  }
+}

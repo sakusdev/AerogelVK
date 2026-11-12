@@ -1,0 +1,96 @@
+#version 460
+
+// ValkyrieRender - Phase 5 Post Composite Compute Shader
+// Applies Fast Approximate Anti-Aliasing (FXAA), ACES Filmic Tonemapping, and Linear -> sRGB transfer.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// Set 1, Binding 5: HDR Scene Color Image (from Deferred Lighting)
+layout(set = 1, binding = 5, rgba16f) uniform readonly image2D uHdrColorImg;
+
+// Set 1, Binding 6: Shared Vulkan-OpenGL Interop Output Color Image (RGBA8)
+layout(set = 1, binding = 6, rgba8) uniform writeonly image2D uSharedColorImg;
+
+layout(push_constant) uniform PostPushConstants {
+    float exposure;
+    uint fxaaEnabled;
+} pc;
+
+// Luminance calculation (Rec. 601)
+float rgbToLuma(vec3 c) {
+    return dot(c, vec3(0.299, 0.587, 0.114));
+}
+
+// Narkowicz ACES Filmic Tonemapping Operator
+vec3 ACESFilm(vec3 x) {
+    float a = 2.51;
+    float b = 0.03;
+    float c = 2.43;
+    float d = 0.59;
+    float e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+// Standard Linear to sRGB transfer function
+vec3 linearToSrgb(vec3 color) {
+    return mix(
+        color * 12.92,
+        1.055 * pow(color, vec3(1.0 / 2.4)) - 0.055,
+        step(vec3(0.0031308), color)
+    );
+}
+
+void main() {
+    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 imgSize = imageSize(uHdrColorImg);
+
+    if (pixelCoord.x >= imgSize.x || pixelCoord.y >= imgSize.y) {
+        return;
+    }
+
+    vec3 colorM = imageLoad(uHdrColorImg, pixelCoord).rgb;
+
+    // FXAA Anti-Aliasing resolve
+    vec3 resolvedColor = colorM;
+    if (pc.fxaaEnabled != 0u) {
+        ivec2 maxCoord = imgSize - ivec2(1);
+        vec3 colorN = imageLoad(uHdrColorImg, clamp(pixelCoord + ivec2( 0,  1), ivec2(0), maxCoord)).rgb;
+        vec3 colorS = imageLoad(uHdrColorImg, clamp(pixelCoord + ivec2( 0, -1), ivec2(0), maxCoord)).rgb;
+        vec3 colorE = imageLoad(uHdrColorImg, clamp(pixelCoord + ivec2( 1,  0), ivec2(0), maxCoord)).rgb;
+        vec3 colorW = imageLoad(uHdrColorImg, clamp(pixelCoord + ivec2(-1,  0), ivec2(0), maxCoord)).rgb;
+
+        float lumaM = rgbToLuma(colorM);
+        float lumaN = rgbToLuma(colorN);
+        float lumaS = rgbToLuma(colorS);
+        float lumaE = rgbToLuma(colorE);
+        float lumaW = rgbToLuma(colorW);
+
+        float lumaMin = min(lumaM, min(min(lumaN, lumaS), min(lumaE, lumaW)));
+        float lumaMax = max(lumaM, max(max(lumaN, lumaS), max(lumaE, lumaW)));
+        float lumaRange = lumaMax - lumaMin;
+
+        // Skip FXAA if contrast is below edge threshold
+        float edgeThreshold = max(0.04, lumaMax * 0.125);
+        if (lumaRange >= edgeThreshold) {
+            float lumaL = (lumaN + lumaS + lumaE + lumaW) * 0.25;
+            float rangeL = abs(lumaL - lumaM);
+            float blendL = max(0.0, (rangeL / lumaRange) - 0.2) * 1.25;
+            blendL = min(blendL, 0.75);
+
+            vec3 colorL = (colorN + colorS + colorE + colorW) * 0.25;
+            resolvedColor = mix(colorM, colorL, blendL);
+        }
+    }
+
+    // Exposure adjustment
+    float exposure = (pc.exposure > 0.0) ? pc.exposure : 1.0;
+    resolvedColor *= exposure;
+
+    // ACES Filmic Tonemapping
+    vec3 tonemapped = ACESFilm(resolvedColor);
+
+    // Linear to sRGB transfer
+    vec3 finalColor = linearToSrgb(tonemapped);
+
+    imageStore(uSharedColorImg, pixelCoord, vec4(finalColor, 1.0));
+}

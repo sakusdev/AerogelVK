@@ -1,0 +1,285 @@
+#version 460
+
+// ValkyrieRender - Phase 5 Deferred PBR + 3-Cascade Shadow Map PCF + Water SSR + Atmospheric Fog
+// Evaluates HDR deferred shading across G-Buffer attachments and writes to uHdrColorImg.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// Set 0, Binding 0: Frame Uniform Buffer
+layout(std140, set = 0, binding = 0) uniform FrameData {
+    mat4 view;
+    mat4 proj;
+    mat4 viewProj;
+    mat4 invViewProj;
+    mat4 prevViewProj;
+    mat4 csmMatrices[3];
+    vec4 sunDir;
+    vec4 cameraPos;
+    vec2 viewportSize;
+    uint frameIndex;
+    float time;
+} FrameUBO;
+
+// Set 1 Bindings
+layout(set = 1, binding = 0) uniform sampler2D uGBufferRT0;
+layout(set = 1, binding = 1) uniform usampler2D uGBufferRT1;
+layout(set = 1, binding = 2) uniform sampler2D uDepthBuffer;
+layout(set = 1, binding = 4) uniform sampler2DArray uShadowMapArray;
+layout(set = 1, binding = 5, rgba16f) uniform writeonly image2D uHdrColorImg;
+
+const float PI = 3.14159265359;
+
+// Decode 16-bit octahedral normal
+vec3 decodeOctNormal(uint packedNormal) {
+    vec2 oct = vec2(float(packedNormal & 0xFFu), float((packedNormal >> 8) & 0xFFu)) / 255.0;
+    oct = oct * 2.0 - 1.0;
+    vec3 n = vec3(oct.x, oct.y, 1.0 - abs(oct.x) - abs(oct.y));
+    float t = clamp(-n.z, 0.0, 1.0);
+    n.x += (n.x >= 0.0) ? -t : t;
+    n.y += (n.y >= 0.0) ? -t : t;
+    return normalize(n);
+}
+
+// GGX Normal Distribution Function
+float distributionGGX(vec3 N, vec3 H, float roughness) {
+    float a = roughness * roughness;
+    float a2 = a * a;
+    float NdotH = max(dot(N, H), 0.0);
+    float NdotH2 = NdotH * NdotH;
+    float denom = (NdotH2 * (a2 - 1.0) + 1.0);
+    return a2 / (PI * denom * denom + 0.0001);
+}
+
+// Schlick-GGX Geometric Occlusion Function
+float geometrySchlickGGX(float NdotV, float roughness) {
+    float r = (roughness + 1.0);
+    float k = (r * r) / 8.0;
+    return NdotV / (NdotV * (1.0 - k) + k);
+}
+
+// Smith Geometric Shadowing Function
+float geometrySmith(vec3 N, vec3 V, vec3 L, float roughness) {
+    float NdotV = max(dot(N, V), 0.001);
+    float NdotL = max(dot(N, L), 0.001);
+    float ggx2 = geometrySchlickGGX(NdotV, roughness);
+    float ggx1 = geometrySchlickGGX(NdotL, roughness);
+    return ggx1 * ggx2;
+}
+
+// Fresnel Schlick Equation
+vec3 fresnelSchlick(float cosTheta, vec3 F0) {
+    return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+// 3-Cascade Shadow Map PCF Evaluation
+float sampleCSMShadow(vec3 worldPos, vec3 N, vec3 L) {
+    float dist = length(worldPos - FrameUBO.cameraPos.xyz);
+
+    // Cascade split distances (0..32, 32..96, 96..256)
+    int cascade = 2;
+    if (dist < 32.0) {
+        cascade = 0;
+    } else if (dist < 96.0) {
+        cascade = 1;
+    }
+
+    vec4 shadowClip = FrameUBO.csmMatrices[cascade] * vec4(worldPos, 1.0);
+    vec3 shadowCoords = shadowClip.xyz / shadowClip.w;
+
+    // Vulkan clip space [-1, 1] to [0, 1]
+    vec2 shadowUV = shadowCoords.xy * 0.5 + 0.5;
+    float currentDepth = shadowCoords.z;
+
+    // Outside cascade projection bounds
+    if (shadowUV.x < 0.0 || shadowUV.x > 1.0 || shadowUV.y < 0.0 || shadowUV.y > 1.0 || currentDepth > 1.0 || currentDepth < 0.0) {
+        return 1.0;
+    }
+
+    // Normal slope bias to avoid acne
+    float bias = max(0.002 * (1.0 - dot(N, L)), 0.0004);
+
+    // 3x3 Percentage Closer Filtering (PCF)
+    float shadow = 0.0;
+    vec2 texelSize = 1.0 / vec2(textureSize(uShadowMapArray, 0).xy);
+
+    for (int x = -1; x <= 1; ++x) {
+        for (int y = -1; y <= 1; ++y) {
+            vec2 offsetUV = shadowUV + vec2(x, y) * texelSize;
+            float pcfDepth = texture(uShadowMapArray, vec3(offsetUV, float(cascade))).r;
+            shadow += (currentDepth - bias <= pcfDepth) ? 1.0 : 0.0;
+        }
+    }
+    return shadow / 9.0;
+}
+
+void main() {
+    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 imgSize = imageSize(uHdrColorImg);
+
+    if (pixelCoord.x >= imgSize.x || pixelCoord.y >= imgSize.y) {
+        return;
+    }
+
+    vec2 uv = (vec2(pixelCoord) + 0.5) / vec2(imgSize);
+    float depth = texelFetch(uDepthBuffer, pixelCoord, 0).r;
+
+    // Sun vector and lighting direction
+    vec3 L = normalize(FrameUBO.sunDir.xyz);
+
+    // Sky Background handling (Reversed-Z: far plane depth <= 0.00001)
+    if (depth <= 0.00001) {
+        // Reconstruct background ray
+        vec4 clipPos = vec4(uv.x * 2.0 - 1.0, uv.y * 2.0 - 1.0, 1.0, 1.0);
+        vec4 worldRayH = FrameUBO.invViewProj * clipPos;
+        vec3 rayDir = normalize(worldRayH.xyz / worldRayH.w - FrameUBO.cameraPos.xyz);
+
+        // Sky Rayleigh + Mie scattering gradient
+        float sunCos = max(dot(rayDir, L), 0.0);
+        vec3 zenithColor = vec3(0.08, 0.22, 0.55);
+        vec3 horizonColor = vec3(0.65, 0.78, 0.95);
+        float horizonT = clamp(pow(max(1.0 - abs(rayDir.y), 0.0), 3.0), 0.0, 1.0);
+        vec3 skyColor = mix(zenithColor, horizonColor, horizonT);
+
+        // Sun disk
+        float sunDisk = smoothstep(0.9992, 0.9996, sunCos);
+        float sunGlow = pow(sunCos, 32.0) * 0.5;
+        vec3 sunLight = vec3(1.0, 0.95, 0.8) * (sunDisk * 4.0 + sunGlow);
+
+        imageStore(uHdrColorImg, pixelCoord, vec4(skyColor + sunLight, 1.0));
+        return;
+    }
+
+    // Reconstruct World-Space Position from Reversed-Z Depth Buffer
+    vec4 clip = vec4(uv.x * 2.0 - 1.0, uv.y * 2.0 - 1.0, depth, 1.0);
+    vec4 worldH = FrameUBO.invViewProj * clip;
+    vec3 worldPos = worldH.xyz / worldH.w;
+
+    // Sample G-Buffer Attachments
+    vec4 rt0 = texelFetch(uGBufferRT0, pixelCoord, 0);
+    uvec2 rt1 = texelFetch(uGBufferRT1, pixelCoord, 0).rg;
+
+    vec3 albedo = rt0.rgb;
+    uint packedMatRough = uint(clamp(rt0.a * 255.0 + 0.5, 0.0, 255.0));
+    uint materialMask = (packedMatRough >> 4) & 0xFu;
+    float roughness = clamp(float(packedMatRough & 0xFu) / 15.0, 0.05, 1.0);
+
+    vec3 N = decodeOctNormal(rt1.x);
+
+    // Unpack light levels
+    uint packedLight = rt1.y;
+    float blockLight = float(packedLight & 0xFu) / 15.0;
+    float skyLight   = float((packedLight >> 4) & 0xFu) / 15.0;
+    float ao         = float((packedLight >> 8) & 0xFu) / 3.0;
+    float emissive   = float((packedLight >> 12) & 0xFu) / 15.0;
+
+    // Camera view vector
+    vec3 V = normalize(FrameUBO.cameraPos.xyz - worldPos);
+    vec3 H = normalize(V + L);
+
+    float NdotL = max(dot(N, L), 0.0);
+    float NdotV = max(dot(N, V), 0.001);
+
+    // Water Surface SSR Ripples
+    if (materialMask == 1u) {
+        float r1 = sin(worldPos.x * 3.0 + FrameUBO.time * 2.5) * cos(worldPos.z * 3.0 + FrameUBO.time * 2.0);
+        float r2 = cos(worldPos.x * 4.5 - FrameUBO.time * 1.8) * sin(worldPos.z * 4.5 + FrameUBO.time * 2.2);
+        N = normalize(N + vec3(r1 * 0.03, 0.0, r2 * 0.03));
+    }
+
+    // PBR Specular F0
+    vec3 F0 = vec3(0.04);
+    if (materialMask == 1u) {
+        F0 = vec3(0.02); // Water
+    } else if (materialMask == 2u) {
+        F0 = albedo;     // Metallic
+    }
+
+    // Cook-Torrance BRDF Evaluation
+    float NDF = distributionGGX(N, H, roughness);
+    float G   = geometrySmith(N, V, L, roughness);
+    vec3  F   = fresnelSchlick(max(dot(H, V), 0.0), F0);
+
+    vec3 numerator = NDF * G * F;
+    float denominator = 4.0 * NdotV * NdotL + 0.0001;
+    vec3 specular = numerator / denominator;
+
+    vec3 kS = F;
+    vec3 kD = vec3(1.0) - kS;
+    if (materialMask == 2u) {
+        kD = vec3(0.0);
+    }
+    vec3 diffuse = (kD * albedo) / PI;
+
+    // Cascade Shadow Factor
+    float shadow = sampleCSMShadow(worldPos, N, L);
+
+    // Sun light intensity
+    vec3 sunColor = vec3(1.0, 0.95, 0.85) * 2.5;
+    vec3 directSun = (diffuse + specular) * sunColor * NdotL * shadow;
+
+    // Foliage Subsurface Scattering (materialMask == 4u)
+    if (materialMask == 4u) {
+        float sss = max(dot(-V, L), 0.0) * 0.35;
+        directSun += albedo * sunColor * sss * shadow;
+    }
+
+    // Minecraft Torch / Block Lighting
+    vec3 torchColor = vec3(1.0, 0.62, 0.28) * 2.8;
+    vec3 blockLighting = albedo * torchColor * (blockLight * blockLight);
+
+    // Sky Ambient Light (modulated by AO and skyLight)
+    vec3 skyAmbientColor = vec3(0.28, 0.42, 0.65) * 0.7;
+    vec3 skyAmbient = albedo * skyAmbientColor * skyLight * ao;
+
+    // Emissive Lighting
+    vec3 emissiveLight = albedo * (emissive * 3.5);
+
+    vec3 totalColor = directSun + blockLighting + skyAmbient + emissiveLight;
+
+    // Screen-Space Reflections (SSR) for Water (materialMask == 1u)
+    if (materialMask == 1u) {
+        vec3 R = reflect(-V, N);
+        vec3 hitColor = vec3(0.0);
+        float hitWeight = 0.0;
+        vec3 rayPos = worldPos + N * 0.06;
+        float stepSize = 0.35;
+
+        for (int s = 0; s < 16; ++s) {
+            rayPos += R * stepSize;
+            vec4 marchClip = FrameUBO.viewProj * vec4(rayPos, 1.0);
+            if (marchClip.w <= 0.0) break;
+
+            vec3 marchNDC = marchClip.xyz / marchClip.w;
+            vec2 marchUV = marchNDC.xy * 0.5 + 0.5;
+
+            if (marchUV.x < 0.0 || marchUV.x > 1.0 || marchUV.y < 0.0 || marchUV.y > 1.0) break;
+
+            float sceneDepth = texture(uDepthBuffer, marchUV).r;
+            // Intersection test in Reversed-Z
+            if (marchNDC.z <= sceneDepth && abs(marchNDC.z - sceneDepth) < 0.006) {
+                hitColor = texture(uGBufferRT0, marchUV).rgb;
+                hitWeight = 1.0;
+                break;
+            }
+            stepSize *= 1.18;
+        }
+
+        if (hitWeight > 0.0) {
+            totalColor = mix(totalColor, hitColor, clamp(F.x * 0.85, 0.0, 0.85));
+        }
+    }
+
+    // Atmospheric Rayleigh/Mie Fog
+    float viewDist = length(worldPos - FrameUBO.cameraPos.xyz);
+    vec3 viewDir = normalize(worldPos - FrameUBO.cameraPos.xyz);
+    float fogDensity = 0.0035;
+    float fogFactor = 1.0 - exp(-viewDist * fogDensity);
+
+    // Sun in-scattering
+    float sunScattering = max(dot(viewDir, L), 0.0);
+    vec3 fogColor = mix(vec3(0.55, 0.68, 0.82), vec3(1.0, 0.85, 0.65), pow(sunScattering, 6.0) * 0.6);
+
+    totalColor = mix(totalColor, fogColor, clamp(fogFactor, 0.0, 1.0));
+
+    imageStore(uHdrColorImg, pixelCoord, vec4(totalColor, 1.0));
+}
