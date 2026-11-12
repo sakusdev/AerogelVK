@@ -2,382 +2,392 @@ package com.example.valkyrie.meshing;
 
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.SectionPos;
 import net.minecraft.world.level.LightLayer;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.chunk.LevelChunkSection;
+import net.minecraft.world.level.chunk.PalettedContainer;
+import net.minecraft.world.level.lighting.LayerLightEventListener;
 
-import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-/**
- * 6-direction Greedy Mesher executing on Java 21 Virtual Threads.
- * Merges coplanar quad faces inside 16x16x16 chunk sections while respecting
- * AO, light levels, sprite IDs, and material masks to avoid interpolation artifacts.
- */
 public final class GreedyMesher {
-
-    private static final GreedyMesher INSTANCE = new GreedyMesher();
-
-    public static GreedyMesher getInstance() {
-        return INSTANCE;
-    }
-
-    private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
-    private final ConcurrentLinkedQueue<MeshedSectionResult> completedQueue = new ConcurrentLinkedQueue<>();
-
-    private GreedyMesher() {
-    }
-
-    /**
-     * Snapshot of a 16x16x16 chunk section plus 1-block halo (18x18x18 total voxels).
-     */
-    public record SectionSnapshot(
-            int sectionX,
-            int sectionY,
-            int sectionZ,
-            BlockState[] blocks18x18x18,
-            byte[] blockLight18x18x18,
-            byte[] skyLight18x18x18
-    ) {
-        public static int getIndex(int lx, int ly, int lz) {
-            // lx, ly, lz in [0..17]
-            return lx + lz * 18 + ly * 324; // 18 * 18 = 324
-        }
-
+    public static final int SECTION_SIZE = 16;
+    public static final int HALO_SIZE = 18;
+    
+    private static final ExecutorService EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
+    
+    private GreedyMesher() {}
+    
+    public record SectionSnapshot(int sectionX, int sectionY, int sectionZ,
+                                  BlockState[] blocks18x18x18,
+                                  byte[] blockLight18x18x18,
+                                  byte[] skyLight18x18x18) {
+        
         public static SectionSnapshot capture(ClientLevel level, int sectionX, int sectionY, int sectionZ) {
-            int originX = sectionX << 4;
-            int originY = sectionY << 4;
-            int originZ = sectionZ << 4;
-
-            BlockState[] blocks = new BlockState[18 * 18 * 18];
-            byte[] blockLight = new byte[18 * 18 * 18];
-            byte[] skyLight = new byte[18 * 18 * 18];
-
+            BlockState[] blocks = new BlockState[HALO_SIZE * HALO_SIZE * HALO_SIZE];
+            byte[] blockLight = new byte[HALO_SIZE * HALO_SIZE * HALO_SIZE];
+            byte[] skyLight = new byte[HALO_SIZE * HALO_SIZE * HALO_SIZE];
+            
+            LayerLightEventListener blockLightListener = level.getLightEngine().getLayerListener(LightLayer.BLOCK);
+            LayerLightEventListener skyLightListener = level.getLightEngine().getLayerListener(LightLayer.SKY);
+            
+            int baseX = sectionX << 4;
+            int baseY = sectionY << 4;
+            int baseZ = sectionZ << 4;
+            
             BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
-
-            for (int ly = 0; ly < 18; ly++) {
-                int wy = originY + ly - 1;
-                for (int lz = 0; lz < 18; lz++) {
-                    int wz = originZ + lz - 1;
-                    for (int lx = 0; lx < 18; lx++) {
-                        int wx = originX + lx - 1;
+            
+            for (int y = 0; y < HALO_SIZE; y++) {
+                for (int z = 0; z < HALO_SIZE; z++) {
+                    for (int x = 0; x < HALO_SIZE; x++) {
+                        int wx = baseX + x - 1;
+                        int wy = baseY + y - 1;
+                        int wz = baseZ + z - 1;
+                        int idx = (y * HALO_SIZE + z) * HALO_SIZE + x;
+                        
                         pos.set(wx, wy, wz);
-                        int idx = getIndex(lx, ly, lz);
-
-                        BlockState state = level.getBlockState(pos);
+                        
+                        // Get block state
+                        BlockState state;
+                        if (wy < level.getMinBuildHeight() || wy >= level.getMaxBuildHeight()) {
+                            state = net.minecraft.world.level.block.Blocks.AIR.defaultBlockState();
+                        } else {
+                            LevelChunk chunk = level.getChunk(SectionPos.blockToSectionCoord(wx), SectionPos.blockToSectionCoord(wz));
+                            if (chunk == null) {
+                                state = net.minecraft.world.level.block.Blocks.AIR.defaultBlockState();
+                            } else {
+                                LevelChunkSection section = chunk.getSection(chunk.getSectionIndex(wy));
+                                if (section == null || section.hasOnlyAir()) {
+                                    state = net.minecraft.world.level.block.Blocks.AIR.defaultBlockState();
+                                } else {
+                                    int lx = wx & 15;
+                                    int ly = wy & 15;
+                                    int lz = wz & 15;
+                                    state = section.getBlockState(lx, ly, lz);
+                                }
+                            }
+                        }
                         blocks[idx] = state;
-                        blockLight[idx] = (byte) level.getBrightness(LightLayer.BLOCK, pos);
-                        skyLight[idx] = (byte) level.getBrightness(LightLayer.SKY, pos);
+                        
+                        // Get light
+                        int bl = 0;
+                        int sl = 0;
+                        if (wy >= level.getMinBuildHeight() && wy < level.getMaxBuildHeight()) {
+                            try {
+                                bl = blockLightListener.getLightValue(pos);
+                                sl = skyLightListener.getLightValue(pos);
+                            } catch (Exception e) {
+                                bl = 0;
+                                sl = 0;
+                            }
+                        }
+                        blockLight[idx] = (byte) bl;
+                        skyLight[idx] = (byte) sl;
                     }
                 }
             }
-
+            
             return new SectionSnapshot(sectionX, sectionY, sectionZ, blocks, blockLight, skyLight);
         }
     }
-
-    /**
-     * Meshing result ready for upload to the Vulkan Mega-Buffer.
-     */
-    public record MeshedSectionResult(
-            int sectionX,
-            int sectionY,
-            int sectionZ,
-            long[] packedVertices,
-            int quadCount,
-            int aabbPacked,
-            int flags
-    ) {}
-
-    public void enqueue(SectionSnapshot snapshot) {
-        if (snapshot == null) return;
-        executor.submit(() -> {
-            try {
-                MeshedSectionResult result = meshSection(snapshot);
-                if (result != null) {
-                    completedQueue.add(result);
-                }
-            } catch (Throwable t) {
-                t.printStackTrace();
-            }
-        });
+    
+    public record MeshedSectionResult(int sectionX, int sectionY, int sectionZ,
+                                      long[] packedVertices, int quadCount,
+                                      int aabbPacked, int flags) {}
+    
+    private record FaceInfo(int spriteId, int materialMask, boolean windWaving,
+                            int ao0, int ao1, int ao2, int ao3,
+                            int blockLight, int skyLight) {}
+    
+    public static CompletableFuture<MeshedSectionResult> meshAsync(SectionSnapshot snapshot) {
+        return CompletableFuture.supplyAsync(() -> mesh(snapshot), EXECUTOR);
     }
-
-    public MeshedSectionResult pollCompleted() {
-        return completedQueue.poll();
-    }
-
-    public void clear() {
-        completedQueue.clear();
-    }
-
-    public void shutdown() {
-        executor.shutdownNow();
-        completedQueue.clear();
-    }
-
-    // Temporary storage for face masks during meshing
-    private static class FaceData {
-        int spriteId;
-        int materialMask;
-        boolean windWaving;
-        int ao0, ao1, ao2, ao3;
-        int bl0, bl1, bl2, bl3;
-        int sl0, sl1, sl2, sl3;
-
-        boolean matches(FaceData o) {
-            if (o == null) return false;
-            return this.spriteId == o.spriteId
-                    && this.materialMask == o.materialMask
-                    && this.windWaving == o.windWaving
-                    && this.ao0 == o.ao0 && this.ao1 == o.ao1 && this.ao2 == o.ao2 && this.ao3 == o.ao3
-                    && this.bl0 == o.bl0 && this.bl1 == o.bl1 && this.bl2 == o.bl2 && this.bl3 == o.bl3
-                    && this.sl0 == o.sl0 && this.sl1 == o.sl1 && this.sl2 == o.sl2 && this.sl3 == o.sl3;
-        }
-    }
-
-    private MeshedSectionResult meshSection(SectionSnapshot snapshot) {
-        AtlasUVTable uvTable = AtlasUVTable.getInstance();
-        BlockState[] blocks = snapshot.blocks18x18x18();
-        byte[] bLight = snapshot.blockLight18x18x18();
-        byte[] sLight = snapshot.skyLight18x18x18();
-
+    
+    public static MeshedSectionResult mesh(SectionSnapshot snapshot) {
+        List<Long> vertices = new ArrayList<>();
+        int quadCount = 0;
+        boolean hasTranslucent = false;
+        boolean dirtyShadow = false;
+        
         int minX = 16, minY = 16, minZ = 16;
         int maxX = 0, maxY = 0, maxZ = 0;
-        int flags = 0;
-
-        // Estimated vertex buffer capacity
-        long[] vertexBuffer = new long[16384];
-        int vertexCount = 0;
-        int quadCount = 0;
-
-        FaceData[][] mask = new FaceData[16][16];
-
-        // 6 Directions: 0:+X, 1:-X, 2:+Y, 3:-Y, 4:+Z, 5:-Z
-        int[] dx = { 1, -1,  0,  0,  0,  0 };
-        int[] dy = { 0,  0,  1, -1,  0,  0 };
-        int[] dz = { 0,  0,  0,  0,  1, -1 };
-
-        for (int normal = 0; normal < 6; normal++) {
-            int ndx = dx[normal];
-            int ndy = dy[normal];
-            int ndz = dz[normal];
-
-            // Primary axis slice: 0..15
+        boolean anyQuad = false;
+        
+        BlockState[] blocks = snapshot.blocks18x18x18();
+        byte[] blockLight = snapshot.blockLight18x18x18();
+        byte[] skyLight = snapshot.skyLight18x18x18();
+        
+        AtlasUVTable atlas = AtlasUVTable.getInstance();
+        
+        // Process each of 6 directions
+        for (int dir = 0; dir < 6; dir++) {
+            // For each slice along the normal axis
             for (int slice = 0; slice < 16; slice++) {
-                // Clear 16x16 mask
-                for (int u = 0; u < 16; u++) {
-                    for (int v = 0; v < 16; v++) {
-                        mask[u][v] = null;
+                FaceInfo[][] mask = new FaceInfo[16][16];
+                
+                // Build mask
+                for (int a = 0; a < 16; a++) {
+                    for (int b = 0; b < 16; b++) {
+                        int x, y, z;
+                        switch (dir) {
+                            case 0: x = slice; y = a; z = b; break; // +X
+                            case 1: x = slice; y = a; z = b; break; // -X
+                            case 2: x = a; y = slice; z = b; break; // +Y
+                            case 3: x = a; y = slice; z = b; break; // -Y
+                            case 4: x = a; y = b; z = slice; break; // +Z
+                            case 5: x = a; y = b; z = slice; break; // -Z
+                            default: continue;
+                        }
+                        
+                        // Get block at (x,y,z) and neighbor
+                        int idx = ((y + 1) * HALO_SIZE + (z + 1)) * HALO_SIZE + (x + 1);
+                        BlockState state = blocks[idx];
+                        
+                        if (state.isAir()) continue;
+                        
+                        // Check if this face is visible
+                        int nx = x, ny = y, nz = z;
+                        switch (dir) {
+                            case 0: nx = x + 1; break;
+                            case 1: nx = x - 1; break;
+                            case 2: ny = y + 1; break;
+                            case 3: ny = y - 1; break;
+                            case 4: nz = z + 1; break;
+                            case 5: nz = z - 1; break;
+                        }
+                        
+                        int nIdx = ((ny + 1) * HALO_SIZE + (nz + 1)) * HALO_SIZE + (nx + 1);
+                        BlockState neighbor = blocks[nIdx];
+                        
+                        // Face is visible if neighbor is not opaque
+                        if (isOpaqueFullCube(neighbor)) continue;
+                        
+                        // Also skip if this block is not opaque (e.g., water, glass)
+                        // Actually, we should render faces of transparent blocks too
+                        // But for simplicity, let's render all non-air blocks
+                        
+                        // Compute AO and light
+                        int[] ao = new int[4];
+                        computeAO(blocks, x, y, z, dir, ao);
+                        
+                        int bl = blockLight[nIdx] & 0xFF;
+                        int sl = skyLight[nIdx] & 0xFF;
+                        
+                        int spriteId = atlas.getSpriteId(state, dir);
+                        int materialMask = atlas.getMaterialMask(state);
+                        boolean wind = atlas.isWindWaving(state);
+                        
+                        mask[a][b] = new FaceInfo(spriteId, materialMask, wind,
+                                ao[0], ao[1], ao[2], ao[3], bl, sl);
                     }
                 }
-
-                boolean sliceHasFaces = false;
-
-                for (int v = 0; v < 16; v++) {
-                    for (int u = 0; u < 16; u++) {
-                        int lx, ly, lz;
-                        if (normal < 2) {
-                            // X slices: u = Z, v = Y
-                            lx = slice + 1;
-                            ly = v + 1;
-                            lz = u + 1;
-                        } else if (normal < 4) {
-                            // Y slices: u = X, v = Z
-                            lx = u + 1;
-                            ly = slice + 1;
-                            lz = v + 1;
-                        } else {
-                            // Z slices: u = X, v = Y
-                            lx = u + 1;
-                            ly = v + 1;
-                            lz = slice + 1;
-                        }
-
-                        BlockState current = blocks[SectionSnapshot.getIndex(lx, ly, lz)];
-                        if (current == null || current.isAir()) continue;
-
-                        int nlx = lx + ndx;
-                        int nly = ly + ndy;
-                        int nlz = lz + ndz;
-                        BlockState neighbor = blocks[SectionSnapshot.getIndex(nlx, nly, nlz)];
-
-                        // Cull if neighbor is fully opaque cube
-                        if (neighbor != null && !neighbor.isAir() && neighbor.canOcclude()) {
-                            continue;
-                        }
-
-                        FaceData fd = new FaceData();
-                        fd.spriteId = uvTable.getSpriteId(current);
-                        fd.materialMask = uvTable.getMaterialMask(current);
-                        fd.windWaving = uvTable.isWindWaving(current);
-
-                        if (fd.materialMask == VertexPacker.MAT_WATER) {
-                            flags |= 1; // Bit 0: HasTranslucent / Water
-                        }
-
-                        // Sample light and AO from neighbor cell
-                        int nIdx = SectionSnapshot.getIndex(nlx, nly, nlz);
-                        int bl = bLight[nIdx] & 0xFF;
-                        int sl = sLight[nIdx] & 0xFF;
-
-                        fd.bl0 = fd.bl1 = fd.bl2 = fd.bl3 = Math.min(15, bl);
-                        fd.sl0 = fd.sl1 = fd.sl2 = fd.sl3 = Math.min(15, sl);
-                        fd.ao0 = fd.ao1 = fd.ao2 = fd.ao3 = 3; // Full ambient
-
-                        mask[u][v] = fd;
-                        sliceHasFaces = true;
-                    }
-                }
-
-                if (!sliceHasFaces) continue;
-
-                // Greedy Quad Merging on 16x16 mask
-                for (int v = 0; v < 16; v++) {
-                    for (int u = 0; u < 16; u++) {
-                        FaceData fd = mask[u][v];
-                        if (fd == null) continue;
-
+                
+                // Greedy merge
+                for (int a = 0; a < 16; a++) {
+                    for (int b = 0; b < 16; b++) {
+                        FaceInfo info = mask[a][b];
+                        if (info == null) continue;
+                        
                         // Find width
-                        int width = 1;
-                        while (u + width < 16 && fd.matches(mask[u + width][v])) {
-                            width++;
-                        }
-
+                        int w = 1;
+                        while (a + w < 16 && info.equals(mask[a + w][b])) w++;
+                        
                         // Find height
-                        int height = 1;
-                        boolean canExpandH = true;
-                        while (v + height < 16 && canExpandH) {
-                            for (int w = 0; w < width; w++) {
-                                if (!fd.matches(mask[u + w][v + height])) {
-                                    canExpandH = false;
-                                    break;
-                                }
+                        int h = 1;
+                        outer:
+                        while (b + h < 16) {
+                            for (int k = 0; k < w; k++) {
+                                if (!info.equals(mask[a + k][b + h])) break outer;
                             }
-                            if (canExpandH) height++;
+                            h++;
                         }
-
-                        // Clear merged cells
-                        for (int h = 0; h < height; h++) {
-                            for (int w = 0; w < width; w++) {
-                                mask[u + w][v + h] = null;
-                            }
-                        }
-
-                        // Compute section-space coordinates for 4 corners
-                        int x0, y0, z0, x1, y1, z1;
-                        if (normal < 2) {
-                            // X-plane: slice, u=Z, v=Y
-                            int fx = (normal == 0) ? (slice + 1) : slice;
-                            x0 = x1 = fx;
-                            z0 = u;
-                            z1 = u + width;
-                            y0 = v;
-                            y1 = v + height;
-                        } else if (normal < 4) {
-                            // Y-plane: slice, u=X, v=Z
-                            int fy = (normal == 2) ? (slice + 1) : slice;
-                            y0 = y1 = fy;
-                            x0 = u;
-                            x1 = u + width;
-                            z0 = v;
-                            z1 = v + height;
-                        } else {
-                            // Z-plane: slice, u=X, v=Y
-                            int fz = (normal == 4) ? (slice + 1) : slice;
-                            z0 = z1 = fz;
-                            x0 = u;
-                            x1 = u + width;
-                            y0 = v;
-                            y1 = v + height;
-                        }
-
-                        // Update tight AABB bounds
-                        minX = Math.min(minX, Math.min(x0, x1));
-                        minY = Math.min(minY, Math.min(y0, y1));
-                        minZ = Math.min(minZ, Math.min(z0, z1));
-                        maxX = Math.max(maxX, Math.max(x0, x1));
-                        maxY = Math.max(maxY, Math.max(y0, y1));
-                        maxZ = Math.max(maxZ, Math.max(z0, z1));
-
-                        // Ensure buffer capacity (4 vertices per quad)
-                        if (vertexCount + 4 > vertexBuffer.length) {
-                            long[] newBuf = new long[vertexBuffer.length * 2];
-                            System.arraycopy(vertexBuffer, 0, newBuf, 0, vertexCount);
-                            vertexBuffer = newBuf;
-                        }
-
-                        // Emit 4 vertices
-                        // Corner 0: (x0, y0, z0)
-                        // Corner 1: depending on orientation
-                        int c0x = x0, c0y = y0, c0z = z0;
-                        int c1x, c1y, c1z, c2x, c2y, c2z, c3x, c3y, c3z;
-
-                        if (normal == 0) { // +X
-                            c0x = x0; c0y = y0; c0z = z0;
-                            c1x = x0; c1y = y0; c1z = z1;
-                            c2x = x0; c2y = y1; c2z = z1;
-                            c3x = x0; c3y = y1; c3z = z0;
-                        } else if (normal == 1) { // -X
-                            c0x = x0; c0y = y0; c0z = z1;
-                            c1x = x0; c1y = y0; c1z = z0;
-                            c2x = x0; c2y = y1; c2z = z0;
-                            c3x = x0; c3y = y1; c3z = z1;
-                        } else if (normal == 2) { // +Y
-                            c0x = x0; c0y = y0; c0z = z1;
-                            c1x = x1; c1y = y0; c1z = z1;
-                            c2x = x1; c2y = y0; c2z = z0;
-                            c3x = x0; c3y = y0; c3z = z0;
-                        } else if (normal == 3) { // -Y
-                            c0x = x0; c0y = y0; c0z = z0;
-                            c1x = x1; c1y = y0; c1z = z0;
-                            c2x = x1; c2y = y0; c2z = z1;
-                            c3x = x0; c3y = y0; c3z = z1;
-                        } else if (normal == 4) { // +Z
-                            c0x = x1; c0y = y0; c0z = z0;
-                            c1x = x0; c1y = y0; c1z = z0;
-                            c2x = x0; c2y = y1; c2z = z0;
-                            c3x = x1; c3y = y1; c3z = z0;
-                        } else { // -Z
-                            c0x = x0; c0y = y0; c0z = z0;
-                            c1x = x1; c1y = y0; c1z = z0;
-                            c2x = x1; c2y = y1; c2z = z0;
-                            c3x = x0; c3y = y1; c3z = z0;
-                        }
-
-                        vertexBuffer[vertexCount++] = VertexPacker.pack(
-                                c0x, c0y, c0z, normal, fd.ao0, fd.bl0, fd.sl0, fd.windWaving,
-                                fd.spriteId, width, height, 0, fd.materialMask);
-                        vertexBuffer[vertexCount++] = VertexPacker.pack(
-                                c1x, c1y, c1z, normal, fd.ao1, fd.bl1, fd.sl1, fd.windWaving,
-                                fd.spriteId, width, height, 1, fd.materialMask);
-                        vertexBuffer[vertexCount++] = VertexPacker.pack(
-                                c2x, c2y, c2z, normal, fd.ao2, fd.bl2, fd.sl2, fd.windWaving,
-                                fd.spriteId, width, height, 2, fd.materialMask);
-                        vertexBuffer[vertexCount++] = VertexPacker.pack(
-                                c3x, c3y, c3z, normal, fd.ao3, fd.bl3, fd.sl3, fd.windWaving,
-                                fd.spriteId, width, height, 3, fd.materialMask);
-
+                        
+                        // Emit quad
+                        emitQuad(vertices, dir, slice, a, b, w, h, info);
                         quadCount++;
+                        
+                        // Update AABB
+                        // Compute the 3D bounds of this quad
+                        int[] bounds = computeQuadBounds(dir, slice, a, b, w, h);
+                        if (!anyQuad) {
+                            minX = bounds[0]; minY = bounds[1]; minZ = bounds[2];
+                            maxX = bounds[3]; maxY = bounds[4]; maxZ = bounds[5];
+                            anyQuad = true;
+                        } else {
+                            minX = Math.min(minX, bounds[0]);
+                            minY = Math.min(minY, bounds[1]);
+                            minZ = Math.min(minZ, bounds[2]);
+                            maxX = Math.max(maxX, bounds[3]);
+                            maxY = Math.max(maxY, bounds[4]);
+                            maxZ = Math.max(maxZ, bounds[5]);
+                        }
+                        
+                        // Check for translucent
+                        if (info.materialMask() == 1) hasTranslucent = true;
+                        
+                        // Clear mask
+                        for (int k = 0; k < w; k++) {
+                            for (int l = 0; l < h; l++) {
+                                mask[a + k][b + l] = null;
+                            }
+                        }
                     }
                 }
             }
         }
-
-        if (quadCount == 0) {
-            return new MeshedSectionResult(
-                    snapshot.sectionX(), snapshot.sectionY(), snapshot.sectionZ(),
-                    new long[0], 0, 0, flags);
+        
+        long[] packed = new long[vertices.size()];
+        for (int i = 0; i < vertices.size(); i++) packed[i] = vertices.get(i);
+        
+        int aabbPacked = anyQuad ? VertexPacker.packTightAabb(minX, minY, minZ, maxX, maxY, maxZ) : 0;
+        int flags = 0;
+        if (hasTranslucent) flags |= 1;
+        if (dirtyShadow) flags |= 2;
+        
+        return new MeshedSectionResult(snapshot.sectionX(), snapshot.sectionY(), snapshot.sectionZ(),
+                packed, quadCount, aabbPacked, flags);
+    }
+    
+    private static boolean isOpaqueFullCube(BlockState state) {
+        if (state.isAir()) return false;
+        return state.isSolidRender(null, null);
+    }
+    
+    private static void computeAO(BlockState[] blocks, int x, int y, int z, int dir, int[] ao) {
+        // For each corner, check 3 neighbors
+        // Corner order: 0=(0,0), 1=(1,0), 2=(1,1), 3=(0,1) in (u,v) space
+        // u,v depend on direction
+        
+        int nx = x, ny = y, nz = z;
+        switch (dir) {
+            case 0: nx = x + 1; break;
+            case 1: nx = x - 1; break;
+            case 2: ny = y + 1; break;
+            case 3: ny = y - 1; break;
+            case 4: nz = z + 1; break;
+            case 5: nz = z - 1; break;
         }
-
-        long[] finalVertices = new long[vertexCount];
-        System.arraycopy(vertexBuffer, 0, finalVertices, 0, vertexCount);
-
-        int aabbPacked = VertexPacker.packTightAabb(minX, minY, minZ, maxX, maxY, maxZ);
-        flags |= 2; // Bit 1: DirtyShadow
-
-        return new MeshedSectionResult(
-                snapshot.sectionX(), snapshot.sectionY(), snapshot.sectionZ(),
-                finalVertices, quadCount, aabbPacked, flags);
+        
+        // u and v axes
+        int ux = 0, uy = 0, uz = 0;
+        int vx = 0, vy = 0, vz = 0;
+        switch (dir) {
+            case 0: case 1: ux = 0; uy = 1; uz = 0; vx = 0; vy = 0; vz = 1; break; // u=y, v=z
+            case 2: case 3: ux = 1; uy = 0; uz = 0; vx = 0; vy = 0; vz = 1; break; // u=x, v=z
+            case 4: case 5: ux = 1; uy = 0; uz = 0; vx = 0; vy = 1; vz = 0; break; // u=x, v=y
+        }
+        
+        for (int c = 0; c < 4; c++) {
+            int cu = (c == 0 || c == 3) ? -1 : 1;
+            int cv = (c == 0 || c == 1) ? -1 : 1;
+            
+            int s1x = nx + cu * ux;
+            int s1y = ny + cu * uy;
+            int s1z = nz + cu * uz;
+            
+            int s2x = nx + cv * vx;
+            int s2y = ny + cv * vy;
+            int s2z = nz + cv * vz;
+            
+            int ccx = nx + cu * ux + cv * vx;
+            int ccy = ny + cu * uy + cv * vy;
+            int ccz = nz + cu * uz + cv * vz;
+            
+            boolean s1 = isSolidAt(blocks, s1x, s1y, s1z);
+            boolean s2 = isSolidAt(blocks, s2x, s2y, s2z);
+            boolean cc = isSolidAt(blocks, ccx, ccy, ccz);
+            
+            int aoVal;
+            if (s1 && s2) aoVal = 0;
+            else aoVal = 3 - ((s1 ? 1 : 0) + (s2 ? 1 : 0) + (cc ? 1 : 0));
+            ao[c] = aoVal;
+        }
+    }
+    
+    private static boolean isSolidAt(BlockState[] blocks, int x, int y, int z) {
+        if (x < -1 || x > 16 || y < -1 || y > 16 || z < -1 || z > 16) return false;
+        int idx = ((y + 1) * HALO_SIZE + (z + 1)) * HALO_SIZE + (x + 1);
+        BlockState s = blocks[idx];
+        return s != null && !s.isAir() && s.isSolidRender(null, null);
+    }
+    
+    private static void emitQuad(List<Long> vertices, int dir, int slice, int a, int b, int w, int h, FaceInfo info) {
+        // Compute 4 corner positions
+        int[][] corners = new int[4][3];
+        
+        for (int c = 0; c < 4; c++) {
+            int ca = (c == 0 || c == 3) ? a : a + w;
+            int cb = (c == 0 || c == 1) ? b : b + h;
+            
+            int x, y, z;
+            switch (dir) {
+                case 0: x = slice + 1; y = ca; z = cb; break;
+                case 1: x = slice; y = ca; z = cb; break;
+                case 2: x = ca; y = slice + 1; z = cb; break;
+                case 3: x = ca; y = slice; z = cb; break;
+                case 4: x = ca; y = cb; z = slice + 1; break;
+                case 5: x = ca; y = cb; z = slice; break;
+                default: x = 0; y = 0; z = 0;
+            }
+            corners[c][0] = x;
+            corners[c][1] = y;
+            corners[c][2] = z;
+        }
+        
+        int[] ao = {info.ao0(), info.ao1(), info.ao2(), info.ao3()};
+        
+        for (int c = 0; c < 4; c++) {
+            long packed = VertexPacker.pack(
+                    corners[c][0], corners[c][1], corners[c][2],
+                    dir, ao[c], info.blockLight(), info.skyLight(),
+                    info.windWaving(), info.spriteId(), w, h, c, info.materialMask()
+            );
+            vertices.add(packed);
+        }
+    }
+    
+    private static int[] computeQuadBounds(int dir, int slice, int a, int b, int w, int h) {
+        int minX, minY, minZ, maxX, maxY, maxZ;
+        switch (dir) {
+            case 0: // +X
+                minX = slice + 1; maxX = slice + 1;
+                minY = a; maxY = a + h;
+                minZ = b; maxZ = b + w;
+                break;
+            case 1: // -X
+                minX = slice; maxX = slice;
+                minY = a; maxY = a + h;
+                minZ = b; maxZ = b + w;
+                break;
+            case 2: // +Y
+                minX = a; maxX = a + w;
+                minY = slice + 1; maxY = slice + 1;
+                minZ = b; maxZ = b + h;
+                break;
+            case 3: // -Y
+                minX = a; maxX = a + w;
+                minY = slice; maxY = slice;
+                minZ = b; maxZ = b + h;
+                break;
+            case 4: // +Z
+                minX = a; maxX = a + w;
+                minY = b; maxY = b + h;
+                minZ = slice + 1; maxZ = slice + 1;
+                break;
+            case 5: // -Z
+                minX = a; maxX = a + w;
+                minY = b; maxY = b + h;
+                minZ = slice; maxZ = slice;
+                break;
+            default:
+                minX = minY = minZ = maxX = maxY = maxZ = 0;
+        }
+        return new int[]{minX, minY, minZ, maxX, maxY, maxZ};
     }
 }
