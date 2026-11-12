@@ -35,6 +35,12 @@ dependencies {
     runtimeOnly "org.lwjgl:lwjgl-shaderc:${project.lwjgl_version}:natives-linux"
 }
 
+tasks.register('verifyValkyrie', JavaExec) {
+    group = 'verification'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.example.valkyrie.ValkyrieVerificationSuite'
+}
+
 processResources {
     inputs.property "version", project.version
 

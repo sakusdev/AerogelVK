@@ -21,7 +21,31 @@ public final class GreedyMesher {
     public static final int HALO_SIZE = 18;
     
     private static final ExecutorService EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
-    
+    private static final GreedyMesher INSTANCE = new GreedyMesher();
+    private static final java.util.concurrent.ConcurrentLinkedQueue<MeshedSectionResult> COMPLETED_QUEUE = new java.util.concurrent.ConcurrentLinkedQueue<>();
+
+    public static GreedyMesher getInstance() {
+        return INSTANCE;
+    }
+
+    public void enqueue(SectionSnapshot snapshot) {
+        if (snapshot == null) return;
+        meshAsync(snapshot).thenAccept(COMPLETED_QUEUE::add);
+    }
+
+    public MeshedSectionResult pollCompleted() {
+        return COMPLETED_QUEUE.poll();
+    }
+
+    public void clear() {
+        COMPLETED_QUEUE.clear();
+    }
+
+    public void shutdown() {
+        EXECUTOR.shutdownNow();
+        COMPLETED_QUEUE.clear();
+    }
+
     private GreedyMesher() {}
     
     public record SectionSnapshot(int sectionX, int sectionY, int sectionZ,

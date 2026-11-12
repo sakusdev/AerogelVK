@@ -107,8 +107,8 @@ public class VkInteropManager implements AutoCloseable {
     private void createSharedColorImage(VkContext ctx, VkDevice device, boolean isWindows) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             int handleType = isWindows
-                    ? KHRExternalMemoryWin32.VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT_KHR
-                    : KHRExternalMemoryFd.VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT_KHR;
+                    ? VK11.VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT
+                    : VK11.VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
 
             VkExternalMemoryImageCreateInfo extImageInfo = VkExternalMemoryImageCreateInfo.calloc(stack)
                     .sType(VK11.VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO)
@@ -187,7 +187,7 @@ public class VkInteropManager implements AutoCloseable {
                 VkMemoryGetWin32HandleInfoKHR win32HandleInfo = VkMemoryGetWin32HandleInfoKHR.calloc(stack)
                         .sType(KHRExternalMemoryWin32.VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR)
                         .memory(colorMemory)
-                        .handleType(KHRExternalMemoryWin32.VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT_KHR);
+                        .handleType(VK11.VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT);
 
                 PointerBuffer pHandle = stack.mallocPointer(1);
                 res = KHRExternalMemoryWin32.vkGetMemoryWin32HandleKHR(device, win32HandleInfo, pHandle);
@@ -204,7 +204,7 @@ public class VkInteropManager implements AutoCloseable {
                 VkMemoryGetFdInfoKHR fdInfo = VkMemoryGetFdInfoKHR.calloc(stack)
                         .sType(KHRExternalMemoryFd.VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR)
                         .memory(colorMemory)
-                        .handleType(KHRExternalMemoryFd.VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT_KHR);
+                        .handleType(VK11.VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT);
 
                 IntBuffer pFd = stack.mallocInt(1);
                 res = KHRExternalMemoryFd.vkGetMemoryFdKHR(device, fdInfo, pFd);
@@ -242,8 +242,8 @@ public class VkInteropManager implements AutoCloseable {
     private void createSharedDepthImage(VkContext ctx, VkDevice device, boolean isWindows) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             int handleType = isWindows
-                    ? KHRExternalMemoryWin32.VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT_KHR
-                    : KHRExternalMemoryFd.VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT_KHR;
+                    ? VK11.VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT
+                    : VK11.VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
 
             VkExternalMemoryImageCreateInfo extImageInfo = VkExternalMemoryImageCreateInfo.calloc(stack)
                     .sType(VK11.VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO)
@@ -321,7 +321,7 @@ public class VkInteropManager implements AutoCloseable {
                 VkMemoryGetWin32HandleInfoKHR win32HandleInfo = VkMemoryGetWin32HandleInfoKHR.calloc(stack)
                         .sType(KHRExternalMemoryWin32.VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR)
                         .memory(depthMemory)
-                        .handleType(KHRExternalMemoryWin32.VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT_KHR);
+                        .handleType(VK11.VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT);
 
                 PointerBuffer pHandle = stack.mallocPointer(1);
                 res = KHRExternalMemoryWin32.vkGetMemoryWin32HandleKHR(device, win32HandleInfo, pHandle);
@@ -338,7 +338,7 @@ public class VkInteropManager implements AutoCloseable {
                 VkMemoryGetFdInfoKHR fdInfo = VkMemoryGetFdInfoKHR.calloc(stack)
                         .sType(KHRExternalMemoryFd.VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR)
                         .memory(depthMemory)
-                        .handleType(KHRExternalMemoryFd.VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT_KHR);
+                        .handleType(VK11.VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT);
 
                 IntBuffer pFd = stack.mallocInt(1);
                 res = KHRExternalMemoryFd.vkGetMemoryFdKHR(device, fdInfo, pFd);
@@ -380,8 +380,8 @@ public class VkInteropManager implements AutoCloseable {
 
         try (MemoryStack stack = MemoryStack.stackPush()) {
             int handleType = isWindows
-                    ? KHRExternalSemaphoreWin32.VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT_KHR
-                    : KHRExternalSemaphoreFd.VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT_KHR;
+                    ? VK11.VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT
+                    : VK11.VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
 
             VkExportSemaphoreCreateInfo exportInfo = VkExportSemaphoreCreateInfo.calloc(stack)
                     .sType(VK11.VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO)
@@ -404,7 +404,7 @@ public class VkInteropManager implements AutoCloseable {
                 VkSemaphoreGetWin32HandleInfoKHR semHandleInfo = VkSemaphoreGetWin32HandleInfoKHR.calloc(stack)
                         .sType(KHRExternalSemaphoreWin32.VK_STRUCTURE_TYPE_SEMAPHORE_GET_WIN32_HANDLE_INFO_KHR)
                         .semaphore(vkRenderCompleteSemaphore)
-                        .handleType(KHRExternalSemaphoreWin32.VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT_KHR);
+                        .handleType(VK11.VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT);
 
                 PointerBuffer pHandle = stack.mallocPointer(1);
                 res = KHRExternalSemaphoreWin32.vkGetSemaphoreWin32HandleKHR(device, semHandleInfo, pHandle);
@@ -420,7 +420,7 @@ public class VkInteropManager implements AutoCloseable {
                 VkSemaphoreGetFdInfoKHR semFdInfo = VkSemaphoreGetFdInfoKHR.calloc(stack)
                         .sType(KHRExternalSemaphoreFd.VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR)
                         .semaphore(vkRenderCompleteSemaphore)
-                        .handleType(KHRExternalSemaphoreFd.VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT_KHR);
+                        .handleType(VK11.VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT);
 
                 IntBuffer pFd = stack.mallocInt(1);
                 res = KHRExternalSemaphoreFd.vkGetSemaphoreFdKHR(device, semFdInfo, pFd);
@@ -446,7 +446,7 @@ public class VkInteropManager implements AutoCloseable {
                 VkSemaphoreGetWin32HandleInfoKHR semHandleInfo = VkSemaphoreGetWin32HandleInfoKHR.calloc(stack)
                         .sType(KHRExternalSemaphoreWin32.VK_STRUCTURE_TYPE_SEMAPHORE_GET_WIN32_HANDLE_INFO_KHR)
                         .semaphore(vkGlReadySemaphore)
-                        .handleType(KHRExternalSemaphoreWin32.VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT_KHR);
+                        .handleType(VK11.VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT);
 
                 PointerBuffer pHandle = stack.mallocPointer(1);
                 res = KHRExternalSemaphoreWin32.vkGetSemaphoreWin32HandleKHR(device, semHandleInfo, pHandle);
@@ -462,7 +462,7 @@ public class VkInteropManager implements AutoCloseable {
                 VkSemaphoreGetFdInfoKHR semFdInfo = VkSemaphoreGetFdInfoKHR.calloc(stack)
                         .sType(KHRExternalSemaphoreFd.VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR)
                         .semaphore(vkGlReadySemaphore)
-                        .handleType(KHRExternalSemaphoreFd.VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT_KHR);
+                        .handleType(VK11.VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT);
 
                 IntBuffer pFd = stack.mallocInt(1);
                 res = KHRExternalSemaphoreFd.vkGetSemaphoreFdKHR(device, semFdInfo, pFd);
@@ -564,7 +564,7 @@ public class VkInteropManager implements AutoCloseable {
         // 1. OpenGL waits on Vulkan render complete semaphore
         try (MemoryStack stack = MemoryStack.stackPush()) {
             IntBuffer textures = stack.ints(glSharedColorTex, glSharedDepthTex);
-            IntBuffer layouts = stack.ints(EXTMemoryObject.GL_LAYOUT_TRANSFER_SRC_EXT, EXTMemoryObject.GL_LAYOUT_TRANSFER_SRC_EXT);
+            IntBuffer layouts = stack.ints(EXTSemaphore.GL_LAYOUT_TRANSFER_SRC_EXT, EXTSemaphore.GL_LAYOUT_TRANSFER_SRC_EXT);
             EXTSemaphore.glWaitSemaphoreEXT(glVkRenderCompleteSemaphore, null, textures, layouts);
         }
 
@@ -589,7 +589,7 @@ public class VkInteropManager implements AutoCloseable {
         // 5. Signal GL ready semaphore so Vulkan can proceed on next frame
         try (MemoryStack stack = MemoryStack.stackPush()) {
             IntBuffer textures = stack.ints(glSharedColorTex, glSharedDepthTex);
-            IntBuffer layouts = stack.ints(EXTMemoryObject.GL_LAYOUT_COLOR_ATTACHMENT_EXT, EXTMemoryObject.GL_LAYOUT_DEPTH_STENCIL_ATTACHMENT_EXT);
+            IntBuffer layouts = stack.ints(EXTSemaphore.GL_LAYOUT_COLOR_ATTACHMENT_EXT, EXTSemaphore.GL_LAYOUT_DEPTH_STENCIL_ATTACHMENT_EXT);
             EXTSemaphore.glSignalSemaphoreEXT(glReadySemaphore, null, textures, layouts);
         }
     }
@@ -665,7 +665,15 @@ public class VkInteropManager implements AutoCloseable {
         return colorImage;
     }
 
+    public long getSharedColorImage() {
+        return colorImage;
+    }
+
     public long getColorImageView() {
+        return colorImageView;
+    }
+
+    public long getSharedColorImageView() {
         return colorImageView;
     }
 
@@ -677,7 +685,15 @@ public class VkInteropManager implements AutoCloseable {
         return depthImage;
     }
 
+    public long getSharedDepthImage() {
+        return depthImage;
+    }
+
     public long getDepthImageView() {
+        return depthImageView;
+    }
+
+    public long getSharedDepthImageView() {
         return depthImageView;
     }
 

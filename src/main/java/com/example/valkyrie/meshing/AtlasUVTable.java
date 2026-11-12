@@ -98,8 +98,7 @@ public final class AtlasUVTable {
         float[] uv;
         try {
             TextureAtlas atlas = mc.getModelManager().getAtlas(InventoryMenu.BLOCK_ATLAS);
-            TextureAtlasSprite missing = atlas.getSprite(Material.DEFAULT_SPRITE_COLLECTOR == null
-                    ? new ResourceLocation("missingno") : new ResourceLocation("missingno"));
+            TextureAtlasSprite missing = atlas.getSprite(ResourceLocation.fromNamespaceAndPath("minecraft", "missingno"));
             uv = new float[]{missing.getU0(), missing.getV0(), missing.getU1(), missing.getV1()};
         } catch (Exception e) {
             uv = new float[]{0f, 0f, 1f, 1f};
@@ -133,6 +132,10 @@ public final class AtlasUVTable {
     /**
      * Returns the 16-bit Sprite ID for the given state (0 fallback for air/unknown).
      */
+    public int getSpriteId(BlockState state, int direction) {
+        return getSpriteId(state);
+    }
+
     public int getSpriteId(BlockState state) {
         if (state == null || state.isAir()) {
             return 0;
@@ -191,7 +194,7 @@ public final class AtlasUVTable {
     }
 
     private boolean isGrassLike(BlockState state) {
-        return state.is(Blocks.GRASS) || state.is(Blocks.TALL_GRASS) || state.is(Blocks.FERN)
+        return state.is(Blocks.TALL_GRASS) || state.is(Blocks.FERN)
                 || state.is(Blocks.LARGE_FERN) || state.is(Blocks.SHORT_GRASS)
                 || state.is(Blocks.SEAGRASS) || state.is(Blocks.TALL_SEAGRASS)
                 || state.is(Blocks.KELP) || state.is(Blocks.KELP_PLANT)

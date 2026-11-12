@@ -30,8 +30,8 @@ public class MixinChunkRebuild {
     @Inject(method = "onChunkLoaded", at = @At("RETURN"), require = 0)
     private void onChunkLoaded(ChunkPos chunkPos, CallbackInfo ci) {
         ClientLevel level = (ClientLevel) (Object) this;
-        int minSection = level.getMinSectionY();
-        int maxSection = level.getMaxSectionY();
+        int minSection = level.getMinSection();
+        int maxSection = level.getMaxSection();
         for (int sectionY = minSection; sectionY < maxSection; sectionY++) {
             ValkyrieRenderer.getInstance().scheduleSectionRebuild(chunkPos.x, sectionY, chunkPos.z);
         }
