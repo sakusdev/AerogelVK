@@ -433,7 +433,12 @@ public final class ShaderPackVerificationTest {
 
             int nonBlackPacks = 0;
             Set<String> blackPackNames = new HashSet<>();
+            String packFilter = System.getenv("AEROGELVK_PACK_FILTER");
             for (Path srcPack : packsToRender) {
+                if (packFilter != null && !packFilter.isBlank()
+                        && !srcPack.getFileName().toString().contains(packFilter)) {
+                    continue;
+                }
                 Path copiedPack = shaderpacksDir.resolve(srcPack.getFileName());
                 Files.copy(srcPack, copiedPack, StandardCopyOption.REPLACE_EXISTING);
 
@@ -443,7 +448,12 @@ public final class ShaderPackVerificationTest {
                     throw new AssertionError("VkShaderPackPipeline.loadShaderPack failed for " + copiedPack);
                 }
 
-                for (int frame = 0; frame < 2; frame++) {
+                int frameCount = 2;
+                String fcEnv = System.getenv("AEROGELVK_FRAME_COUNT");
+                if (fcEnv != null && !fcEnv.isBlank()) {
+                    frameCount = Math.max(1, Integer.parseInt(fcEnv.trim()));
+                }
+                for (int frame = 0; frame < frameCount; frame++) {
                     if (frame == 0) {
                         shaderPackPipeline.resetTemporalState();
                     }
@@ -460,7 +470,7 @@ public final class ShaderPackVerificationTest {
                     shaderPackPipeline.recordFrame(
                             cmd, offscreenColorImg, offscreenColorView, offscreenDepthImg, w, h, params
                     );
-                    if (frame == 1) {
+                    if (frame == frameCount - 1) {
                         VkBufferCopy.Buffer countCopy = VkBufferCopy.calloc(1, stack).srcOffset(0).dstOffset(0).size(4);
                         vkCmdCopyBuffer(cmd, mega.getDrawCountBuffer().buffer, readbackBuf, countCopy);
 
@@ -510,10 +520,13 @@ public final class ShaderPackVerificationTest {
                 if (drawCount != 1) {
                     throw new AssertionError("Expected drawCount=1 for shaderpack " + copiedPack.getFileName() + ", got " + drawCount);
                 }
+                String packFileName = copiedPack.getFileName().toString();
                 if (nonBlackPixels > 0) {
                     nonBlackPacks++;
                 } else {
-                    blackPackNames.add(copiedPack.getFileName().toString());
+                    blackPackNames.add(packFileName);
+                }
+                if (nonBlackPixels == 0 || shouldTracePack(packFileName)) {
                     traceBlackShaderPackPasses(
                             ctx, device, shaderPackPipeline, offscreenColorImg, offscreenColorView, offscreenDepthImg,
                             w, h, viewMatrix, glProj, camPos
@@ -528,14 +541,39 @@ public final class ShaderPackVerificationTest {
                 String packName = copiedPack.getFileName().toString();
                 int centerSum = cr + cg + cb;
                 if (packName.startsWith("Complementary")) {
-                    if (nonBlackPixels < 3500 || centerSum < 3 || avgLuma < 1.0) {
+                    if (nonBlackPixels < 3500 || centerSum < 100 || avgLuma < 45.0) {
                         throw new AssertionError("Regression in " + packName + ": nonBlack=" + nonBlackPixels
                                 + ", centerSum=" + centerSum + ", avgLuma=" + avgLuma);
                     }
                 } else if (packName.startsWith("YoFPS")) {
-                    if (nonBlackPixels < 4000 || centerSum < 150 || avgLuma < 30.0) {
+                    if (nonBlackPixels < 4000 || centerSum < 180 || avgLuma < 80.0) {
                         throw new AssertionError("Regression in " + packName + ": nonBlack=" + nonBlackPixels
                                 + ", centerSum=" + centerSum + ", avgLuma=" + avgLuma);
+                    }
+                } else if (packName.startsWith("BSL")) {
+                    if (nonBlackPixels < 3500 || distinctColors.size() < 2000 || centerSum < 150 || avgLuma < 55.0) {
+                        throw new AssertionError("Regression in " + packName + ": nonBlack=" + nonBlackPixels
+                                + ", distinct=" + distinctColors.size() + ", centerSum=" + centerSum + ", avgLuma=" + avgLuma);
+                    }
+                } else if (packName.startsWith("VanillaPlus")) {
+                    if (nonBlackPixels < 3500 || distinctColors.size() < 1800 || centerSum < 60 || avgLuma < 25.0) {
+                        throw new AssertionError("Regression in " + packName + ": nonBlack=" + nonBlackPixels
+                                + ", distinct=" + distinctColors.size() + ", centerSum=" + centerSum + ", avgLuma=" + avgLuma);
+                    }
+                } else if (packName.startsWith("PotatoShaders")) {
+                    if (nonBlackPixels < 3500 || distinctColors.size() < 2000 || centerSum < 90 || avgLuma < 40.0) {
+                        throw new AssertionError("Regression in " + packName + ": nonBlack=" + nonBlackPixels
+                                + ", distinct=" + distinctColors.size() + ", centerSum=" + centerSum + ", avgLuma=" + avgLuma);
+                    }
+                } else if (packName.startsWith("superDuperVanilla")) {
+                    if (nonBlackPixels < 3500 || distinctColors.size() < 100 || centerSum < 40 || avgLuma < 14.0) {
+                        throw new AssertionError("Regression in " + packName + ": nonBlack=" + nonBlackPixels
+                                + ", distinct=" + distinctColors.size() + ", centerSum=" + centerSum + ", avgLuma=" + avgLuma);
+                    }
+                } else if (packName.startsWith("MakeUp-UltraFast")) {
+                    if (nonBlackPixels < 3500 || distinctColors.size() < 75 || centerSum < 3 || avgLuma < 1.4) {
+                        throw new AssertionError("Regression in " + packName + ": nonBlack=" + nonBlackPixels
+                                + ", distinct=" + distinctColors.size() + ", centerSum=" + centerSum + ", avgLuma=" + avgLuma);
                     }
                 }
             }
@@ -592,6 +630,9 @@ public final class ShaderPackVerificationTest {
             Vector3f target,
             Matrix4f viewMatrix
     ) throws IOException {
+        if ("true".equalsIgnoreCase(System.getenv("AEROGELVK_SKIP_BENCH"))) {
+            return;
+        }
         final int bw = 1280;
         final int bh = 720;
         final int warmupFrames = 4;
@@ -689,6 +730,23 @@ public final class ShaderPackVerificationTest {
         }
     }
 
+    private static boolean shouldTracePack(String packFileName) {
+        String prop = System.getProperty("aerogelvk.trace.packs", "");
+        if (prop.isBlank()) {
+            prop = System.getenv("AEROGELVK_TRACE_PACKS");
+        }
+        if (prop == null || prop.isBlank()) {
+            return false;
+        }
+        for (String token : prop.split(",")) {
+            String trimmed = token.trim();
+            if (!trimmed.isEmpty() && packFileName.contains(trimmed)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static void traceBlackShaderPackPasses(
             VkContext ctx,
             VkDevice device,
@@ -733,6 +791,12 @@ public final class ShaderPackVerificationTest {
             long traceMem = pMem.get(0);
             vkBindBufferMemory(device, traceBuf, traceMem, 0);
 
+            int traceColorIdx = 0;
+            String traceColEnv = System.getenv("AEROGELVK_TRACE_COLORTEX");
+            if (traceColEnv != null && !traceColEnv.isBlank()) {
+                traceColorIdx = Math.max(0, Integer.parseInt(traceColEnv.trim()));
+            }
+            pipeline.setPassTraceColorIndex(traceColorIdx);
             final long[] cursor = {0L};
             pipeline.setPassTraceListener((cmd, s, passName, img, fmt) -> {
                 if (snaps.size() >= maxPasses || img == VK_NULL_HANDLE) return;
@@ -779,8 +843,9 @@ public final class ShaderPackVerificationTest {
 
                 PointerBuffer ppMapped = stack.mallocPointer(1);
                 vkMapMemory(device, traceMem, 0, totalTraceBytes, 0, ppMapped);
-                ByteBuffer mapped = MemoryUtil.memByteBuffer(ppMapped.get(0), (int) totalTraceBytes);
-                System.out.println("  -> [PassTrace colortex0] Pack=" + pipeline.getActivePackName());
+                ByteBuffer mapped = MemoryUtil.memByteBuffer(ppMapped.get(0), (int) totalTraceBytes)
+                        .order(java.nio.ByteOrder.LITTLE_ENDIAN);
+                System.out.println("  -> [PassTrace colortex" + traceColorIdx + "] Pack=" + pipeline.getActivePackName());
                 for (PassSnap snap : snaps) {
                     int nonBlack = 0;
                     Set<Integer> distinct = new HashSet<>();

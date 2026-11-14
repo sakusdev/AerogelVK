@@ -297,6 +297,7 @@ public class VkShaderPackPipeline implements AutoCloseable {
     private boolean initialized = false;
     private boolean packReady = false;
     private PassTraceListener passTraceListener;
+    private int passTraceColorIndex = 0;
 
     @FunctionalInterface
     public interface PassTraceListener {
@@ -307,10 +308,14 @@ public class VkShaderPackPipeline implements AutoCloseable {
         this.passTraceListener = listener;
     }
 
+    public void setPassTraceColorIndex(int index) {
+        this.passTraceColorIndex = Math.max(0, index);
+    }
+
     private void notifyPassTrace(VkCommandBuffer cmd, MemoryStack stack, String passName) {
         PassTraceListener listener = this.passTraceListener;
         if (listener != null && targets != null) {
-            listener.onPassRecorded(cmd, stack, passName, targets.getColorReadImage(0), targets.getColorFormat(0));
+            listener.onPassRecorded(cmd, stack, passName, targets.getColorReadImage(passTraceColorIndex), targets.getColorFormat(passTraceColorIndex));
         }
     }
 

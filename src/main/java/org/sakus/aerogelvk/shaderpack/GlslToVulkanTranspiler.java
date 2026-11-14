@@ -123,7 +123,7 @@ public final class GlslToVulkanTranspiler {
      * ({@code gcolor}) in fullscreen deferred/composite/final passes.
      */
     private static String resolveSamplerAlias(String name, PassKind passKind) {
-        if ("texture".equals(name) || "gtexture".equals(name) || "tex".equals(name)) {
+        if ("texture".equals(name) || "gtexture".equals(name) || "tex".equals(name) || "gcolor".equals(name)) {
             return (passKind == PassKind.GBUFFERS || passKind == PassKind.SHADOW)
                     ? "vk_gtexture"
                     : "colortex0";
@@ -323,7 +323,7 @@ public final class GlslToVulkanTranspiler {
         PassKind kind = passKind != null ? passKind : PassKind.GBUFFERS;
         ParsedShader parsed = parseShader(preprocessedSource, true);
         Map<String, Integer> varyingLocations = assignVaryingLocations(parsed.varyings, null);
-        return emitShader(parsed, true, kind, new int[0], varyingLocations, Collections.emptyList());
+        return emitShader(parsed, true, kind, new int[0], varyingLocations, Collections.emptyList(), Collections.emptyMap());
     }
 
     /**
@@ -342,7 +342,7 @@ public final class GlslToVulkanTranspiler {
         int[] effectiveDb = normalizeDrawbuffers(kind, drawbuffers);
         ParsedShader parsed = parseShader(preprocessedSource, false);
         Map<String, Integer> varyingLocations = assignVaryingLocations(parsed.varyings, null);
-        return emitShader(parsed, false, kind, effectiveDb, varyingLocations, Collections.emptyList());
+        return emitShader(parsed, false, kind, effectiveDb, varyingLocations, Collections.emptyList(), Collections.emptyMap());
     }
 
     /**
@@ -355,6 +355,16 @@ public final class GlslToVulkanTranspiler {
             PassKind passKind,
             int[] drawbuffers
     ) {
+        return transpileProgram(preprocessedVertex, preprocessedFragment, passKind, drawbuffers, Collections.emptyMap());
+    }
+
+    public static TranspiledProgram transpileProgram(
+            String preprocessedVertex,
+            String preprocessedFragment,
+            PassKind passKind,
+            int[] drawbuffers,
+            Map<String, ShaderPackProperties.CustomUniform> customUniforms
+    ) {
         if (preprocessedVertex == null) {
             throw new IllegalArgumentException("preprocessedVertex must not be null");
         }
@@ -363,9 +373,13 @@ public final class GlslToVulkanTranspiler {
         }
         PassKind kind = passKind != null ? passKind : PassKind.GBUFFERS;
         int[] effectiveDb = normalizeDrawbuffers(kind, drawbuffers);
+        Map<String, ShaderPackProperties.CustomUniform> effectiveCustomUniforms =
+                customUniforms != null ? customUniforms : Collections.emptyMap();
 
         ParsedShader vertParsed = parseShader(preprocessedVertex, true);
         ParsedShader fragParsed = parseShader(preprocessedFragment, false);
+        promoteCustomUniformsOverDerived(vertParsed, effectiveCustomUniforms);
+        promoteCustomUniformsOverDerived(fragParsed, effectiveCustomUniforms);
 
         Map<String, Integer> varyingLocations = assignVaryingLocations(vertParsed.varyings, fragParsed.varyings);
 
@@ -376,8 +390,8 @@ public final class GlslToVulkanTranspiler {
             }
         }
 
-        String vertOut = emitShader(vertParsed, true, kind, effectiveDb, varyingLocations, missingVertOutputs);
-        String fragOut = emitShader(fragParsed, false, kind, effectiveDb, varyingLocations, Collections.emptyList());
+        String vertOut = emitShader(vertParsed, true, kind, effectiveDb, varyingLocations, missingVertOutputs, effectiveCustomUniforms);
+        String fragOut = emitShader(fragParsed, false, kind, effectiveDb, varyingLocations, Collections.emptyList(), effectiveCustomUniforms);
         int attachmentCount = computeAttachmentCount(fragParsed, effectiveDb);
         return new TranspiledProgram(vertOut, fragOut, attachmentCount);
     }
@@ -611,6 +625,8 @@ public final class GlslToVulkanTranspiler {
         final Map<String, String> unknownSamplers = new LinkedHashMap<>();
         final Set<String> shadowCompareSamplers = new HashSet<>();
         final Set<String> declaredDerivedUniforms = new HashSet<>();
+        final Map<String, VarDecl> declaredDerivedUniformDecls = new LinkedHashMap<>();
+        final Set<String> resolvedCustomUniformNames = new HashSet<>();
         final Map<String, VarDecl> attributes = new LinkedHashMap<>();
         final Map<String, VarDecl> varyings = new LinkedHashMap<>();
         final Map<String, VarDecl> customFragOuts = new LinkedHashMap<>();
@@ -859,6 +875,7 @@ public final class GlslToVulkanTranspiler {
                         }
                     } else if (resolveDerivedUniform(d.name, PassKind.GBUFFERS) != null) {
                         parsed.declaredDerivedUniforms.add(d.name);
+                        parsed.declaredDerivedUniformDecls.putIfAbsent(d.name, d);
                     } else if (!ShaderUniformLayout.UBO_FIELD_NAMES.contains(d.name)) {
                         parsed.unknownUniforms.putIfAbsent(d.name, d);
                     }
@@ -995,8 +1012,15 @@ public final class GlslToVulkanTranspiler {
             PassKind passKind,
             int[] drawbuffers,
             Map<String, Integer> varyingLocations,
-            List<VarDecl> extraVertStubs
+            List<VarDecl> extraVertStubs,
+            Map<String, ShaderPackProperties.CustomUniform> customUniforms
     ) {
+        List<ResolvedCustomUniform> resolvedCustoms = resolveCustomUniforms(parsed, customUniforms, passKind);
+        Set<String> resolvedCustomNames = new HashSet<>();
+        for (ResolvedCustomUniform rc : resolvedCustoms) {
+            resolvedCustomNames.add(rc.name());
+        }
+
         StringBuilder out = new StringBuilder(4096);
         out.append("#version 460\n\n");
 
@@ -1018,12 +1042,23 @@ public final class GlslToVulkanTranspiler {
         // 4. Fog struct & compatibility texture helpers
         emitCompatibilityHelpers(out, isVertex, passKind);
 
-        // 5. Unknown uniforms -> constant zero defaults
+        // 5. Unknown uniforms -> custom uniform globals or constant zero defaults
+        boolean emittedAnyUnknown = false;
         for (VarDecl u : parsed.unknownUniforms.values()) {
-            out.append("const ").append(u.type).append(' ').append(u.name).append(u.arraySuffix)
-                    .append(" = ").append(zeroInitExpr(u.type, u.arraySuffix)).append(";\n");
+            if (!resolvedCustomNames.contains(u.name)) {
+                out.append("const ").append(u.type).append(' ').append(u.name).append(u.arraySuffix)
+                        .append(" = ").append(zeroInitExpr(u.type, u.arraySuffix)).append(";\n");
+                emittedAnyUnknown = true;
+            }
         }
-        if (!parsed.unknownUniforms.isEmpty()) {
+        parsed.resolvedCustomUniformNames.clear();
+        parsed.resolvedCustomUniformNames.addAll(resolvedCustomNames);
+        for (ResolvedCustomUniform rc : resolvedCustoms) {
+            out.append(rc.type()).append(" _vk_cu_").append(rc.name()).append("() { return ")
+                    .append(rc.glslExpr()).append("; }\n");
+            emittedAnyUnknown = true;
+        }
+        if (emittedAnyUnknown) {
             out.append('\n');
         }
 
@@ -1215,7 +1250,10 @@ public final class GlslToVulkanTranspiler {
                 .append("    vec4(0.0, 0.0, 1.0, 0.0),\n")
                 .append("    vec4(0.5, 0.5, 0.0, 1.0)\n")
                 .append(");\n\n");
-        out.append("vec3 vk_safeNorm(vec3 v) { float l = dot(v, v); return l > 1e-8 ? v * inversesqrt(l) : vec3(0.0, 1.0, 0.0); }\n\n");
+        out.append("vec3 vk_safeNorm(vec3 v) { float l = dot(v, v); return l > 1e-8 ? v * inversesqrt(l) : vec3(0.0, 1.0, 0.0); }\n")
+                .append("vec2 _vk_normalize(vec2 v) { float l = dot(v, v); return l > 1e-20 ? v * inversesqrt(l) : vec2(0.0); }\n")
+                .append("vec3 _vk_normalize(vec3 v) { float l = dot(v, v); return l > 1e-20 ? v * inversesqrt(l) : vec3(0.0); }\n")
+                .append("vec4 _vk_normalize(vec4 v) { float l = dot(v, v); return l > 1e-20 ? v * inversesqrt(l) : vec4(0.0); }\n\n");
 
         // Lightmap texture matrix maps [0..240] -> [8/256..248/256], matching Minecraft OpenGL
         out.append("const mat4 VK_LIGHTMAP_MATRIX = mat4(\n")
@@ -1561,6 +1599,11 @@ public final class GlslToVulkanTranspiler {
                 appendSpaceIfNeeded(tokens, i, sb);
                 continue;
             }
+            if (w.equals("normalize") && followedByParen && (prev == null || !".".equals(prev.text))) {
+                sb.append("_vk_normalize");
+                appendSpaceIfNeeded(tokens, i, sb);
+                continue;
+            }
 
             // 1. ftransform()
             if (w.equals("ftransform") && followedByParen) {
@@ -1691,6 +1734,11 @@ public final class GlslToVulkanTranspiler {
                     && !globalShadowedNames.contains(w)) {
                 if (ShaderUniformLayout.UBO_FIELD_NAMES.contains(w)) {
                     sb.append("vk_ubo.").append(w);
+                    appendSpaceIfNeeded(tokens, i, sb);
+                    continue;
+                }
+                if (parsed.resolvedCustomUniformNames.contains(w)) {
+                    sb.append("_vk_cu_").append(w).append("()");
                     appendSpaceIfNeeded(tokens, i, sb);
                     continue;
                 }
@@ -1877,7 +1925,11 @@ public final class GlslToVulkanTranspiler {
         out.append("}\n");
     }
 
-    private static void emitFragmentMainWrapper(StringBuilder out, boolean useFragDataWrapper, int attachmentCount) {
+    private static void emitFragmentMainWrapper(
+            StringBuilder out,
+            boolean useFragDataWrapper,
+            int attachmentCount
+    ) {
         out.append("void main() {\n");
         emitFogAndNormalInit(out, PassKind.GBUFFERS);
         if (useFragDataWrapper) {
@@ -1905,6 +1957,337 @@ public final class GlslToVulkanTranspiler {
             case GBUFFERS -> out.append("    vk_NormalMatrix = transpose(inverse(mat3(vk_ubo.gbufferModelView)));\n");
             default -> out.append("    vk_NormalMatrix = mat3(1.0);\n");
         }
+    }
+
+    private record ResolvedCustomUniform(String name, String type, String glslExpr) {}
+
+    private static void promoteCustomUniformsOverDerived(
+            ParsedShader parsed,
+            Map<String, ShaderPackProperties.CustomUniform> customUniforms
+    ) {
+        if (customUniforms == null || customUniforms.isEmpty()) {
+            return;
+        }
+        for (String name : customUniforms.keySet()) {
+            if (parsed.declaredDerivedUniforms.remove(name)) {
+                VarDecl decl = parsed.declaredDerivedUniformDecls.get(name);
+                if (decl != null) {
+                    parsed.unknownUniforms.putIfAbsent(name, decl);
+                }
+            }
+        }
+    }
+
+    private static List<ResolvedCustomUniform> resolveCustomUniforms(
+            ParsedShader parsed,
+            Map<String, ShaderPackProperties.CustomUniform> customUniforms,
+            PassKind passKind
+    ) {
+        if (customUniforms == null || customUniforms.isEmpty() || parsed.unknownUniforms.isEmpty()) {
+            return Collections.emptyList();
+        }
+        Set<String> needed = new LinkedHashSet<>();
+        Set<String> visiting = new HashSet<>();
+        for (VarDecl u : parsed.unknownUniforms.values()) {
+            if (customUniforms.containsKey(u.name)) {
+                collectCustomUniformDeps(u.name, customUniforms, needed, visiting);
+            }
+        }
+        if (needed.isEmpty()) {
+            return Collections.emptyList();
+        }
+        Set<String> activeNames = new HashSet<>();
+        List<ResolvedCustomUniform> result = new ArrayList<>();
+        for (String name : needed) {
+            ShaderPackProperties.CustomUniform def = customUniforms.get(name);
+            if (def == null) {
+                continue;
+            }
+            VarDecl unknownDecl = parsed.unknownUniforms.get(def.name());
+            // Skip internal variable.* if its name collides with an existing shader symbol
+            if (unknownDecl == null && (parsed.declaredDerivedUniforms.contains(def.name())
+                    || ShaderUniformLayout.UBO_FIELD_NAMES.contains(def.name())
+                    || parsed.attributes.containsKey(def.name())
+                    || parsed.varyings.containsKey(def.name())
+                    || parsed.structNames.contains(def.name()))) {
+                continue;
+            }
+            String targetType = unknownDecl != null ? unknownDecl.type : def.type();
+            if (unknownDecl != null && !unknownDecl.arraySuffix.isEmpty()) {
+                continue;
+            }
+            String translated = translateCustomUniformExpr(def.expression(), passKind, activeNames);
+            if (translated == null || translated.isBlank()) {
+                continue;
+            }
+            if ("int".equals(targetType)) {
+                translated = "int(" + translated + ")";
+            } else if ("float".equals(targetType) && "int".equals(def.type())) {
+                translated = "float(" + translated + ")";
+            } else if ("bool".equals(targetType)) {
+                translated = "bool(" + translated + ")";
+            }
+            activeNames.add(def.name());
+            result.add(new ResolvedCustomUniform(def.name(), targetType, translated));
+        }
+        return result;
+    }
+
+    private static void collectCustomUniformDeps(
+            String name,
+            Map<String, ShaderPackProperties.CustomUniform> customUniforms,
+            Set<String> needed,
+            Set<String> visiting
+    ) {
+        if (needed.contains(name) || !visiting.add(name)) {
+            return;
+        }
+        ShaderPackProperties.CustomUniform def = customUniforms.get(name);
+        if (def != null) {
+            List<Token> tokens = tokenize(def.expression());
+            for (Token t : tokens) {
+                if (t.kind == TokenKind.WORD && customUniforms.containsKey(t.text) && !t.text.equals(name)) {
+                    collectCustomUniformDeps(t.text, customUniforms, needed, visiting);
+                }
+            }
+            needed.add(name);
+        }
+        visiting.remove(name);
+    }
+
+    private static final Set<String> CUSTOM_EXPR_GLSL_BUILTINS = Set.of(
+            "float", "int", "bool", "vec2", "vec3", "vec4", "ivec2", "ivec3", "ivec4", "mat3", "mat4",
+            "abs", "sign", "floor", "ceil", "fract", "mod", "min", "max", "clamp", "mix", "step", "smoothstep",
+            "sin", "cos", "tan", "asin", "acos", "atan", "pow", "exp", "log", "exp2", "log2", "sqrt", "inversesqrt",
+            "length", "distance", "dot", "cross", "normalize", "radians", "degrees", "round", "trunc",
+            "true", "false"
+    );
+
+    private static String translateCustomUniformExpr(
+            String expr,
+            PassKind passKind,
+            Set<String> activeCustomNames
+    ) {
+        List<Token> tokens = tokenize(expr);
+        return translateCustomTokens(tokens, 0, tokens.size(), passKind, activeCustomNames);
+    }
+
+    private static String translateCustomTokens(
+            List<Token> tokens,
+            int start,
+            int end,
+            PassKind passKind,
+            Set<String> activeCustomNames
+    ) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = start; i < end; i++) {
+            Token t = tokens.get(i);
+            if (t.kind == TokenKind.NEWLINE || t.kind == TokenKind.PREPROC) {
+                continue;
+            }
+            if (t.kind == TokenKind.WORD) {
+                // Check function calls: if(...), fmod(...), frac(...), smooth(...), random(...), in(...), between(...), equals(...), torad(...), todeg(...), lerp(...)
+                int nextIdx = nextCodeToken(tokens, i + 1);
+                if (nextIdx >= 0 && nextIdx < end && "(".equals(tokens.get(nextIdx).text)) {
+                    int closeIdx = findMatchingParen(tokens, nextIdx, end);
+                    if (closeIdx > nextIdx) {
+                        List<int[]> args = splitCallArgs(tokens, nextIdx + 1, closeIdx);
+                        String fn = t.text;
+                        if ("if".equals(fn) && args.size() == 3) {
+                            String c = translateCustomTokens(tokens, args.get(0)[0], args.get(0)[1], passKind, activeCustomNames);
+                            String a = translateCustomTokens(tokens, args.get(1)[0], args.get(1)[1], passKind, activeCustomNames);
+                            String b = translateCustomTokens(tokens, args.get(2)[0], args.get(2)[1], passKind, activeCustomNames);
+                            if (c == null || a == null || b == null) return null;
+                            sb.append("(bool(").append(c).append(") ? (").append(a).append(") : (").append(b).append("))");
+                            i = closeIdx;
+                            continue;
+                        } else if ("fmod".equals(fn) && args.size() == 2) {
+                            String a = translateCustomTokens(tokens, args.get(0)[0], args.get(0)[1], passKind, activeCustomNames);
+                            String b = translateCustomTokens(tokens, args.get(1)[0], args.get(1)[1], passKind, activeCustomNames);
+                            if (a == null || b == null) return null;
+                            sb.append("mod(float(").append(a).append("), float(").append(b).append("))");
+                            i = closeIdx;
+                            continue;
+                        } else if ("frac".equals(fn) && args.size() == 1) {
+                            String a = translateCustomTokens(tokens, args.get(0)[0], args.get(0)[1], passKind, activeCustomNames);
+                            if (a == null) return null;
+                            sb.append("fract(float(").append(a).append("))");
+                            i = closeIdx;
+                            continue;
+                        } else if ("smooth".equals(fn) && (args.size() == 2 || args.size() == 4)) {
+                            int valIdx = args.size() == 4 ? 1 : 0;
+                            String v = translateCustomTokens(tokens, args.get(valIdx)[0], args.get(valIdx)[1], passKind, activeCustomNames);
+                            if (v == null) return null;
+                            sb.append("(").append(v).append(")");
+                            i = closeIdx;
+                            continue;
+                        } else if ("random".equals(fn)) {
+                            sb.append("fract(sin(float(vk_ubo.frameCounter) * 12.9898) * 43758.5453)");
+                            i = closeIdx;
+                            continue;
+                        } else if ("in".equals(fn) && args.size() >= 2) {
+                            String x = translateCustomTokens(tokens, args.get(0)[0], args.get(0)[1], passKind, activeCustomNames);
+                            if (x == null) return null;
+                            sb.append("(");
+                            for (int ai = 1; ai < args.size(); ai++) {
+                                if (ai > 1) sb.append(" || ");
+                                String v = translateCustomTokens(tokens, args.get(ai)[0], args.get(ai)[1], passKind, activeCustomNames);
+                                if (v == null) return null;
+                                sb.append("((").append(x).append(") == (").append(v).append("))");
+                            }
+                            sb.append(")");
+                            i = closeIdx;
+                            continue;
+                        } else if ("between".equals(fn) && args.size() == 3) {
+                            String x = translateCustomTokens(tokens, args.get(0)[0], args.get(0)[1], passKind, activeCustomNames);
+                            String lo = translateCustomTokens(tokens, args.get(1)[0], args.get(1)[1], passKind, activeCustomNames);
+                            String hi = translateCustomTokens(tokens, args.get(2)[0], args.get(2)[1], passKind, activeCustomNames);
+                            if (x == null || lo == null || hi == null) return null;
+                            sb.append("((").append(x).append(") >= (").append(lo).append(") && (").append(x).append(") <= (").append(hi).append("))");
+                            i = closeIdx;
+                            continue;
+                        } else if ("equals".equals(fn) && args.size() == 3) {
+                            String a = translateCustomTokens(tokens, args.get(0)[0], args.get(0)[1], passKind, activeCustomNames);
+                            String b = translateCustomTokens(tokens, args.get(1)[0], args.get(1)[1], passKind, activeCustomNames);
+                            String eps = translateCustomTokens(tokens, args.get(2)[0], args.get(2)[1], passKind, activeCustomNames);
+                            if (a == null || b == null || eps == null) return null;
+                            sb.append("(abs((").append(a).append(") - (").append(b).append(")) <= (").append(eps).append("))");
+                            i = closeIdx;
+                            continue;
+                        } else if ("torad".equals(fn) && args.size() == 1) {
+                            String a = translateCustomTokens(tokens, args.get(0)[0], args.get(0)[1], passKind, activeCustomNames);
+                            if (a == null) return null;
+                            sb.append("radians(float(").append(a).append("))");
+                            i = closeIdx;
+                            continue;
+                        } else if ("todeg".equals(fn) && args.size() == 1) {
+                            String a = translateCustomTokens(tokens, args.get(0)[0], args.get(0)[1], passKind, activeCustomNames);
+                            if (a == null) return null;
+                            sb.append("degrees(float(").append(a).append("))");
+                            i = closeIdx;
+                            continue;
+                        } else if ("lerp".equals(fn) && args.size() == 3) {
+                            String a = translateCustomTokens(tokens, args.get(0)[0], args.get(0)[1], passKind, activeCustomNames);
+                            String b = translateCustomTokens(tokens, args.get(1)[0], args.get(1)[1], passKind, activeCustomNames);
+                            String tArg = translateCustomTokens(tokens, args.get(2)[0], args.get(2)[1], passKind, activeCustomNames);
+                            if (a == null || b == null || tArg == null) return null;
+                            sb.append("mix(").append(a).append(", ").append(b).append(", ").append(tArg).append(")");
+                            i = closeIdx;
+                            continue;
+                        }
+                    }
+                }
+
+                // Check member access after dot (like .x, .y, .z, .w or matrix .1.1)
+                Token prev = prevCodeToken(tokens, i);
+                if (prev != null && ".".equals(prev.text)) {
+                    sb.append(t.text);
+                    continue;
+                }
+
+                // Resolve identifier
+                String w = t.text;
+                String mapped = null;
+                if (activeCustomNames.contains(w)) {
+                    mapped = "_vk_cu_" + w + "()";
+                } else if (CUSTOM_EXPR_GLSL_BUILTINS.contains(w)) {
+                    mapped = w;
+                } else if (ShaderUniformLayout.UBO_FIELD_NAMES.contains(w)) {
+                    mapped = "vk_ubo." + w;
+                } else {
+                    String derived = resolveDerivedUniform(w, passKind);
+                    if (derived != null) {
+                        mapped = derived;
+                    } else {
+                        mapped = switch (w) {
+                            case "pi" -> "3.14159265359";
+                            case "dhRenderDistance" -> "vk_ubo.far";
+                            case "biome", "biome_precipitation", "biome_category", "worldDay" -> "0";
+                            case "eyeAltitude" -> "vk_ubo.cameraPosition.y";
+                            case "temperature", "rainfall" -> "0.5";
+                            case "lightningBoltPosition" -> "vec4(0.0)";
+                            default -> null;
+                        };
+                    }
+                }
+                if (mapped == null) {
+                    return null;
+                }
+                sb.append(mapped);
+
+                // Handle OptiFine matrix .col.row indexing e.g. gbufferProjection.1.1
+                int dot1 = nextCodeToken(tokens, i + 1);
+                if (dot1 >= 0 && dot1 < end && tokens.get(dot1).kind == TokenKind.NUMBER
+                        && tokens.get(dot1).text.startsWith(".")) {
+                    int dot2 = nextCodeToken(tokens, dot1 + 1);
+                    if (dot2 >= 0 && dot2 < end && tokens.get(dot2).kind == TokenKind.NUMBER
+                            && tokens.get(dot2).text.startsWith(".")) {
+                        sb.append('[').append(tokens.get(dot1).text.substring(1)).append("][")
+                                .append(tokens.get(dot2).text.substring(1)).append(']');
+                        i = dot2;
+                        continue;
+                    }
+                } else if (dot1 >= 0 && dot1 < end && ".".equals(tokens.get(dot1).text)) {
+                    int colIdx = nextCodeToken(tokens, dot1 + 1);
+                    if (colIdx >= 0 && colIdx < end && tokens.get(colIdx).kind == TokenKind.NUMBER) {
+                        int dot2 = nextCodeToken(tokens, colIdx + 1);
+                        if (dot2 >= 0 && dot2 < end && ".".equals(tokens.get(dot2).text)) {
+                            int rowIdx = nextCodeToken(tokens, dot2 + 1);
+                            if (rowIdx >= 0 && rowIdx < end && tokens.get(rowIdx).kind == TokenKind.NUMBER) {
+                                sb.append('[').append(tokens.get(colIdx).text).append("][")
+                                        .append(tokens.get(rowIdx).text).append(']');
+                                i = rowIdx;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            } else {
+                sb.append(t.text);
+            }
+        }
+        return sb.toString();
+    }
+
+    private static int findMatchingParen(List<Token> tokens, int openIdx, int end) {
+        int depth = 0;
+        for (int i = openIdx; i < end; i++) {
+            String s = tokens.get(i).text;
+            if ("(".equals(s)) depth++;
+            else if (")".equals(s)) {
+                depth--;
+                if (depth == 0) return i;
+            }
+        }
+        return -1;
+    }
+
+    private static List<int[]> splitCallArgs(List<Token> tokens, int start, int end) {
+        List<int[]> args = new ArrayList<>();
+        int depth = 0;
+        int curStart = start;
+        for (int i = start; i < end; i++) {
+            String s = tokens.get(i).text;
+            if ("(".equals(s) || "[".equals(s)) depth++;
+            else if (")".equals(s) || "]".equals(s)) depth--;
+            else if (",".equals(s) && depth == 0) {
+                args.add(new int[]{curStart, i});
+                curStart = i + 1;
+            }
+        }
+        if (curStart < end) {
+            boolean hasCode = false;
+            for (int i = curStart; i < end; i++) {
+                if (tokens.get(i).kind != TokenKind.NEWLINE && tokens.get(i).kind != TokenKind.PREPROC) {
+                    hasCode = true;
+                    break;
+                }
+            }
+            if (hasCode) {
+                args.add(new int[]{curStart, end});
+            }
+        }
+        return args;
     }
 
     private static String attributeInitExpr(VarDecl attr) {
@@ -2151,7 +2534,8 @@ public final class GlslToVulkanTranspiler {
     }
 
     private static boolean isBlockAtlasArg(String ident) {
-        return "texture".equals(ident) || "tex".equals(ident) || "gtexture".equals(ident) || "vk_gtexture".equals(ident);
+        return "texture".equals(ident) || "tex".equals(ident) || "gtexture".equals(ident)
+                || "gcolor".equals(ident) || "vk_gtexture".equals(ident);
     }
 
     private static int countCallArgs(List<Token> tokens, int openParenIdx) {
@@ -2248,6 +2632,8 @@ public final class GlslToVulkanTranspiler {
                 sub.append("vk_round");
             } else if (parsed.hasUserFma && w.equals("fma") && followedByParen) {
                 sub.append("vk_fma");
+            } else if (w.equals("normalize") && followedByParen && (prev == null || !".".equals(prev.text))) {
+                sub.append("_vk_normalize");
             } else if (w.equals("texture") && followedByParen) {
                 int lp = nextCodeToken(tokens, i + 1);
                 String firstArg = firstArgIdentifier(tokens, lp + 1);
@@ -2282,6 +2668,8 @@ public final class GlslToVulkanTranspiler {
                     && !isShadowed(w, localScopes) && !prototypeParams.contains(w) && !globalShadowedNames.contains(w)) {
                 if (ShaderUniformLayout.UBO_FIELD_NAMES.contains(w)) {
                     sub.append("vk_ubo.").append(w);
+                } else if (parsed.resolvedCustomUniformNames.contains(w)) {
+                    sub.append("_vk_cu_").append(w).append("()");
                 } else if (parsed.declaredDerivedUniforms.contains(w)) {
                     String derived = resolveDerivedUniformForToken(w, passKind, prev, nextCodeTokenObj(tokens, i));
                     if (derived != null) {

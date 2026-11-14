@@ -159,6 +159,12 @@ public class VkContext implements AutoCloseable {
                 } else if (properties.deviceType() == VK10.VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
                     score += 500;
                 }
+                String preferredDevice = System.getProperty("aerogelvk.vk.device", System.getenv("AEROGELVK_VK_DEVICE"));
+                if (preferredDevice != null && !preferredDevice.isBlank()
+                        && properties.deviceNameString().toLowerCase(java.util.Locale.ROOT)
+                        .contains(preferredDevice.trim().toLowerCase(java.util.Locale.ROOT))) {
+                    score += 10000;
+                }
 
                 LOGGER.info("[Valkyrie] Evaluated GPU [{}]: {} (Score: {})", i, properties.deviceNameString(), score);
 

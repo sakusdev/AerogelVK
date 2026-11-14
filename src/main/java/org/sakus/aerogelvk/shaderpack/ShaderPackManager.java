@@ -117,6 +117,7 @@ public final class ShaderPackManager {
         private final float scale;
         private final String alphaTest;
         private final String blend;
+        private final Map<String, ShaderPackProperties.CustomUniform> customUniforms;
 
         public PassProgram(
                 String name,
@@ -133,6 +134,27 @@ public final class ShaderPackManager {
                 float scale,
                 String alphaTest,
                 String blend) {
+            this(name, resolvedFrom, passKind, vertexPath, fragmentPath, rawVertexSource, rawFragmentSource,
+                    preprocessedVertexSource, preprocessedFragmentSource, drawBuffers, explicitDrawBuffers,
+                    scale, alphaTest, blend, Collections.emptyMap());
+        }
+
+        public PassProgram(
+                String name,
+                String resolvedFrom,
+                PassKind passKind,
+                String vertexPath,
+                String fragmentPath,
+                String rawVertexSource,
+                String rawFragmentSource,
+                String preprocessedVertexSource,
+                String preprocessedFragmentSource,
+                int[] drawBuffers,
+                boolean explicitDrawBuffers,
+                float scale,
+                String alphaTest,
+                String blend,
+                Map<String, ShaderPackProperties.CustomUniform> customUniforms) {
             this.name = name;
             this.resolvedFrom = resolvedFrom;
             this.passKind = passKind;
@@ -147,6 +169,7 @@ public final class ShaderPackManager {
             this.scale = scale;
             this.alphaTest = alphaTest;
             this.blend = blend;
+            this.customUniforms = customUniforms != null ? Map.copyOf(customUniforms) : Collections.emptyMap();
         }
 
         public String getName() {
@@ -232,7 +255,8 @@ public final class ShaderPackManager {
                     preprocessedVertexSource,
                     preprocessedFragmentSource,
                     passKind,
-                    dbsForTranspile);
+                    dbsForTranspile,
+                    customUniforms);
         }
 
         @Override
@@ -686,7 +710,8 @@ public final class ShaderPackManager {
                     explicitDbs,
                     properties.getPassScale(passName),
                     properties.getAlphaTest(passName),
-                    properties.getBlend(passName));
+                    properties.getBlend(passName),
+                    properties.getCustomUniforms());
 
             resolvedPrograms.put(passName, passProgram);
         }

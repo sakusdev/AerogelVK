@@ -86,9 +86,12 @@ public final class ShaderPackProperties {
     private final Map<String, String> passBlends = new LinkedHashMap<>();
     private final Map<String, Map<String, Boolean>> passFlips = new LinkedHashMap<>();
 
+    public record CustomUniform(String name, String type, String expression, boolean isUniform) {}
+
     private final Set<String> sliders = new LinkedHashSet<>();
     private final Map<String, Map<String, String>> profiles = new LinkedHashMap<>();
     private final Map<String, String> optionDefaults = new LinkedHashMap<>();
+    private final Map<String, CustomUniform> customUniforms = new LinkedHashMap<>();
 
     private int shadowMapResolution = DEFAULT_SHADOW_MAP_RESOLUTION;
     private float shadowDistance = DEFAULT_SHADOW_DISTANCE;
@@ -238,7 +241,36 @@ public final class ShaderPackProperties {
         if (key.startsWith("format.")) {
             String buf = key.substring("format.".length()).trim();
             assignBufferFormat(buf, value);
+            return;
         }
+        if ((key.startsWith("uniform.") || key.startsWith("variable.")) && !value.isEmpty()) {
+            String[] parts = key.split("\\.");
+            if (parts.length == 3 && isSupportedCustomUniformType(parts[1]) && isValidGlslIdent(parts[2])) {
+                customUniforms.put(parts[2], new CustomUniform(parts[2], parts[1], value, "uniform".equals(parts[0])));
+            }
+        }
+    }
+
+    public Map<String, CustomUniform> getCustomUniforms() {
+        return Collections.unmodifiableMap(customUniforms);
+    }
+
+    private static boolean isSupportedCustomUniformType(String type) {
+        return switch (type) {
+            case "float", "int", "bool", "vec2", "vec3", "vec4", "ivec2", "ivec3", "ivec4", "mat3", "mat4" -> true;
+            default -> false;
+        };
+    }
+
+    private static boolean isValidGlslIdent(String ident) {
+        if (ident == null || ident.isEmpty()) return false;
+        char c0 = ident.charAt(0);
+        if (!(Character.isLetter(c0) || c0 == '_')) return false;
+        for (int i = 1; i < ident.length(); i++) {
+            char c = ident.charAt(i);
+            if (!(Character.isLetterOrDigit(c) || c == '_')) return false;
+        }
+        return true;
     }
 
     /**
