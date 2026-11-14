@@ -22,5 +22,26 @@
     "fabricloader": ">=0.16.0",
     "minecraft": "~1.21.1",
     "java": ">=21"
+  },
+  "suggests": {
+    "sodium": ">=0.8.0",
+    "sodium-extra": "*",
+    "reeses-sodium-options": "*",
+    "immediatelyfast": "*",
+    "entityculling": "*",
+    "moreculling": "*",
+    "enhancedblockentities": "*",
+    "iris": "*",
+    "lithium": ">=0.15.0",
+    "c2me": "*",
+    "scalablelux": "*",
+    "noisium": "*",
+    "alternate-current": "*",
+    "ferritecore": "*",
+    "modernfix": "*",
+    "krypton": "*",
+    "dynamic_fps": "*",
+    "fastquit": "*",
+    "distanthorizons": ">=3.0.0"
   }
 }

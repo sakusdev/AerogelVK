@@ -68,6 +68,9 @@ public final class VkShaderCompiler {
         long compiler = MemoryUtil.NULL;
         long options = MemoryUtil.NULL;
         long result = MemoryUtil.NULL;
+        ByteBuffer srcUtf8 = null;
+        ByteBuffer nameUtf8 = null;
+        ByteBuffer entryUtf8 = null;
 
         try {
             compiler = Shaderc.shaderc_compiler_initialize();
@@ -92,12 +95,19 @@ public final class VkShaderCompiler {
             // Emit debug info so validation layers / RenderDoc can map SPIR-V back to GLSL.
             Shaderc.shaderc_compile_options_set_generate_debug_info(options);
 
-            result = Shaderc.shaderc_compile_into_spv(
+            // Allocate UTF-8 buffers on the heap via MemoryUtil instead of MemoryStack so large (>64 KB)
+            // shaderpack sources never overflow LWJGL's 64 KB thread stack.
+            srcUtf8 = MemoryUtil.memUTF8(glslSource, false);
+            nameUtf8 = MemoryUtil.memUTF8(shaderName, true);
+            entryUtf8 = MemoryUtil.memUTF8(DEFAULT_ENTRY_POINT, true);
+
+            result = Shaderc.nshaderc_compile_into_spv(
                     compiler,
-                    glslSource,
+                    MemoryUtil.memAddress(srcUtf8),
+                    srcUtf8.remaining(),
                     shadercStage,
-                    shaderName,
-                    DEFAULT_ENTRY_POINT,
+                    MemoryUtil.memAddress(nameUtf8),
+                    MemoryUtil.memAddress(entryUtf8),
                     options);
 
             if (result == MemoryUtil.NULL) {
@@ -142,6 +152,15 @@ public final class VkShaderCompiler {
             }
             return out;
         } finally {
+            if (entryUtf8 != null) {
+                MemoryUtil.memFree(entryUtf8);
+            }
+            if (nameUtf8 != null) {
+                MemoryUtil.memFree(nameUtf8);
+            }
+            if (srcUtf8 != null) {
+                MemoryUtil.memFree(srcUtf8);
+            }
             if (result != MemoryUtil.NULL) {
                 Shaderc.shaderc_result_release(result);
             }

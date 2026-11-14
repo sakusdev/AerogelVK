@@ -1,6 +1,7 @@
 package com.example.valkyrie.mixin;
 
 import com.example.valkyrie.ValkyrieRenderer;
+import com.example.valkyrie.compat.CompatManager;
 import net.minecraft.client.Camera;
 import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.Minecraft;
@@ -14,14 +15,16 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
-@Mixin(LevelRenderer.class)
+@Mixin(value = LevelRenderer.class, priority = 1100)
 public class MixinLevelRenderer {
 
     @Inject(method = "renderSectionLayer", at = @At("HEAD"), cancellable = true)
     private void onRenderSectionLayer(RenderType renderType, double camX, double camY, double camZ, 
                                       Matrix4f frustumMatrix, Matrix4f projectionMatrix, CallbackInfo ci) {
-        // Cancel vanilla chunk rendering (Solid, CutoutMipped, Cutout, Translucent)
-        ci.cancel();
+        if (!CompatManager.shouldYieldToExternalShaderPipeline()) {
+            // Cancel vanilla chunk rendering (Solid, CutoutMipped, Cutout, Translucent)
+            ci.cancel();
+        }
     }
 
     @Inject(method = "renderLevel", at = @At(
@@ -32,6 +35,9 @@ public class MixinLevelRenderer {
     private void onBeforeTerrainRender(DeltaTracker deltaTracker, boolean renderBlockOutline, Camera camera, 
                                        GameRenderer gameRenderer, LightTexture lightTexture, 
                                        Matrix4f frustumMatrix, Matrix4f projectionMatrix, CallbackInfo ci) {
+        if (CompatManager.shouldYieldToExternalShaderPipeline()) {
+            return;
+        }
         // 1. Execute Vulkan Culling, G-Buffer, Shadow, and Deferred Lighting
         ValkyrieRenderer.getInstance().renderWorld(camera, frustumMatrix, projectionMatrix, deltaTracker);
         
@@ -42,5 +48,10 @@ public class MixinLevelRenderer {
     @Inject(method = "allChanged", at = @At("RETURN"))
     private void onAllChanged(CallbackInfo ci) {
         ValkyrieRenderer.getInstance().onWorldReload();
+    }
+
+    @Inject(method = "setSectionDirty(III)V", at = @At("HEAD"), require = 0)
+    private void onSetSectionDirty(int sectionX, int sectionY, int sectionZ, CallbackInfo ci) {
+        ValkyrieRenderer.getInstance().scheduleSectionRebuild(sectionX, sectionY, sectionZ);
     }
 }

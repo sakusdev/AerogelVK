@@ -1,5 +1,6 @@
 package com.example.valkyrie;
 
+import com.example.valkyrie.command.ValkyrieCommand;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
@@ -14,6 +15,8 @@ public class ValkyrieMod implements ClientModInitializer {
     @Override
     public void onInitializeClient() {
         LOGGER.info("[Valkyrie] Initializing Valkyrie Vulkan Deferred Renderer for Minecraft 1.21.1...");
+        com.example.valkyrie.compat.CompatManager.init();
+        ValkyrieCommand.register();
 
         // Register JVM / lifecycle shutdown hook to clean up ValkyrieRenderer
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {

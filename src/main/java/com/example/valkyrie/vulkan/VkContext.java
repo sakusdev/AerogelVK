@@ -35,6 +35,10 @@ public class VkContext implements AutoCloseable {
     private long commandPool;
     private long vmaAllocator;
     private VkPhysicalDeviceMemoryProperties memoryProperties;
+    private String deviceName = "Unknown";
+    private byte[] deviceUuid;
+    private boolean externalMemorySupported = false;
+    private boolean externalSemaphoreSupported = false;
     private boolean initialized = false;
 
     public static synchronized VkContext getInstance() {
@@ -171,13 +175,21 @@ public class VkContext implements AutoCloseable {
             this.physicalDevice = bestDevice;
             this.queueFamilyIndex = bestQueueIndex;
 
-            // Cache memory properties
-            this.memoryProperties = VkPhysicalDeviceMemoryProperties.create();
+            // Cache memory properties (calloc via MemoryUtil so close() can free() cleanly)
+            this.memoryProperties = VkPhysicalDeviceMemoryProperties.calloc();
             VK10.vkGetPhysicalDeviceMemoryProperties(this.physicalDevice, this.memoryProperties);
 
-            VkPhysicalDeviceProperties props = VkPhysicalDeviceProperties.malloc(stack);
-            VK10.vkGetPhysicalDeviceProperties(this.physicalDevice, props);
-            LOGGER.info("[Valkyrie] Selected Physical Device: {} (Queue Family: {})", props.deviceNameString(), queueFamilyIndex);
+            VkPhysicalDeviceIDProperties idProps = VkPhysicalDeviceIDProperties.calloc(stack)
+                    .sType(VK11.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES);
+            VkPhysicalDeviceProperties2 props2 = VkPhysicalDeviceProperties2.calloc(stack)
+                    .sType(VK11.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2)
+                    .pNext(idProps.address());
+            VK11.vkGetPhysicalDeviceProperties2(this.physicalDevice, props2);
+            this.deviceName = props2.properties().deviceNameString();
+            byte[] uuid = new byte[VK10.VK_UUID_SIZE];
+            idProps.deviceUUID().get(uuid);
+            this.deviceUuid = uuid;
+            LOGGER.info("[Valkyrie] Selected Physical Device: {} (Queue Family: {})", this.deviceName, queueFamilyIndex);
         }
     }
 
@@ -217,8 +229,9 @@ public class VkContext implements AutoCloseable {
         boolean hasSync2 = vk13Features.synchronization2();
         boolean hasScalarBlockLayout = vk12Features.scalarBlockLayout();
         boolean hasDrawIndirectCount = vk12Features.drawIndirectCount();
+        boolean hasMultiDrawIndirect = features2.features().multiDrawIndirect();
 
-        return hasDynamicRendering && hasSync2 && hasScalarBlockLayout && hasDrawIndirectCount;
+        return hasDynamicRendering && hasSync2 && hasScalarBlockLayout && hasDrawIndirectCount && hasMultiDrawIndirect;
     }
 
     private void createLogicalDevice() {
@@ -235,28 +248,45 @@ public class VkContext implements AutoCloseable {
                 supportedDevExts.add(devExts.get(i).extensionNameString());
             }
 
-            List<String> extensionsToEnable = new ArrayList<>();
-            extensionsToEnable.add(KHRExternalMemory.VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME);
-            extensionsToEnable.add(KHRExternalSemaphore.VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME);
-
             boolean isWindows = Platform.get() == Platform.WINDOWS;
-            if (isWindows) {
-                extensionsToEnable.add(KHRExternalMemoryWin32.VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
-                extensionsToEnable.add(KHRExternalSemaphoreWin32.VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME);
+            String extMemPlatform = isWindows
+                    ? KHRExternalMemoryWin32.VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME
+                    : KHRExternalMemoryFd.VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME;
+            String extSemPlatform = isWindows
+                    ? KHRExternalSemaphoreWin32.VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME
+                    : KHRExternalSemaphoreFd.VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME;
+
+            List<String> extensionsToEnable = new ArrayList<>();
+            externalMemorySupported = supportedDevExts.contains(KHRExternalMemory.VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME)
+                    && supportedDevExts.contains(extMemPlatform);
+            if (externalMemorySupported) {
+                extensionsToEnable.add(KHRExternalMemory.VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME);
+                extensionsToEnable.add(extMemPlatform);
             } else {
-                extensionsToEnable.add(KHRExternalMemoryFd.VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
-                extensionsToEnable.add(KHRExternalSemaphoreFd.VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME);
+                LOGGER.warn("[Valkyrie] External memory extensions ({}, {}) not supported on selected GPU; GL interop disabled.",
+                        KHRExternalMemory.VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME, extMemPlatform);
+            }
+
+            externalSemaphoreSupported = supportedDevExts.contains(KHRExternalSemaphore.VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME)
+                    && supportedDevExts.contains(extSemPlatform);
+            if (externalSemaphoreSupported) {
+                extensionsToEnable.add(KHRExternalSemaphore.VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME);
+                extensionsToEnable.add(extSemPlatform);
+            } else {
+                LOGGER.warn("[Valkyrie] External semaphore extensions ({}, {}) not supported on selected GPU; GL semaphore sync disabled.",
+                        KHRExternalSemaphore.VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME, extSemPlatform);
             }
 
             PointerBuffer ppExtensions = stack.mallocPointer(extensionsToEnable.size());
             for (String ext : extensionsToEnable) {
-                if (!supportedDevExts.contains(ext)) {
-                    LOGGER.warn("[Valkyrie] Requested device extension {} not reported by driver, attempting enablement anyway...", ext);
-                }
                 LOGGER.info("[Valkyrie] Enabling Vulkan Device extension: {}", ext);
                 ppExtensions.put(stack.UTF8(ext));
             }
             ppExtensions.flip();
+
+            // Query supported core features so we only enable optional features (like shaderInt64) if present
+            VkPhysicalDeviceFeatures supportedCore = VkPhysicalDeviceFeatures.calloc(stack);
+            VK10.vkGetPhysicalDeviceFeatures(physicalDevice, supportedCore);
 
             // Queue setup
             FloatBuffer pQueuePriorities = stack.floats(1.0f);
@@ -282,7 +312,8 @@ public class VkContext implements AutoCloseable {
                     .sType(VK11.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)
                     .pNext(vk12Features.address());
             features2.features().multiDrawIndirect(true);
-            features2.features().shaderInt64(true);
+            features2.features().shaderInt64(supportedCore.shaderInt64());
+            features2.features().shaderStorageImageArrayDynamicIndexing(supportedCore.shaderStorageImageArrayDynamicIndexing());
 
             VkDeviceCreateInfo deviceCreateInfo = VkDeviceCreateInfo.calloc(stack)
                     .sType(VK10.VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO)
@@ -448,6 +479,22 @@ public class VkContext implements AutoCloseable {
         return memoryProperties;
     }
 
+    public String getDeviceName() {
+        return deviceName;
+    }
+
+    public byte[] getDeviceUuid() {
+        return deviceUuid != null ? deviceUuid.clone() : null;
+    }
+
+    public boolean isExternalMemorySupported() {
+        return externalMemorySupported;
+    }
+
+    public boolean isExternalSemaphoreSupported() {
+        return externalSemaphoreSupported;
+    }
+
     public boolean isInitialized() {
         return initialized;
     }
@@ -485,6 +532,11 @@ public class VkContext implements AutoCloseable {
         if (vkInstance != null) {
             VK10.vkDestroyInstance(vkInstance, null);
             vkInstance = null;
+        }
+
+        if (memoryProperties != null) {
+            memoryProperties.free();
+            memoryProperties = null;
         }
 
         initialized = false;

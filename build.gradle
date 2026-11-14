@@ -1,5 +1,5 @@
 plugins {
-    id 'fabric-loom' version '1.7-SNAPSHOT'
+    id 'fabric-loom' version '1.17.21'
     id 'maven-publish'
 }
 
@@ -16,6 +16,10 @@ repositories {
         name = "Fabric"
         url = "https://maven.fabricmc.net/"
     }
+    maven {
+        name = "Modrinth"
+        url = "https://api.modrinth.com/maven"
+    }
 }
 
 dependencies {
@@ -24,15 +28,138 @@ dependencies {
     modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
     modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
 
+    // Optional mod compatibility APIs (Sodium, Iris, Lithium, Distant Horizons)
+    modCompileOnly "maven.modrinth:sodium:${project.sodium_version}"
+    modCompileOnly "maven.modrinth:iris:${project.iris_version}"
+    modCompileOnly "maven.modrinth:lithium:${project.lithium_version}"
+    modCompileOnly "maven.modrinth:distanthorizons:${project.dh_version}"
+
+    if (project.hasProperty("withCompatMods") && project.property("withCompatMods").toString().toBoolean()) {
+        modRuntimeOnly "maven.modrinth:sodium:${project.sodium_version}"
+        modRuntimeOnly "maven.modrinth:lithium:${project.lithium_version}"
+        modRuntimeOnly "maven.modrinth:distanthorizons:${project.dh_version}"
+    }
+
+    if (project.hasProperty("withAllCompatMods") && project.property("withAllCompatMods").toString().toBoolean()) {
+        def excludeIris = project.hasProperty("excludeIris") && project.property("excludeIris").toString().toBoolean()
+        def allCompatCoords = [
+                "maven.modrinth:sodium:${project.sodium_version}",
+                "maven.modrinth:sodium-extra:${project.sodium_extra_version}",
+                "maven.modrinth:reeses-sodium-options:${project.reeses_sodium_options_version}",
+                "maven.modrinth:immediatelyfast:${project.immediatelyfast_version}",
+                "maven.modrinth:entityculling:${project.entityculling_version}",
+                "maven.modrinth:moreculling:${project.moreculling_version}",
+                "maven.modrinth:ebe:${project.ebe_version}",
+                "maven.modrinth:lithium:${project.lithium_version}",
+                "maven.modrinth:c2me-fabric:${project.c2me_version}",
+                "maven.modrinth:scalablelux:${project.scalablelux_version}",
+                "maven.modrinth:noisium:${project.noisium_version}",
+                "maven.modrinth:alternate-current:${project.alternate_current_version}",
+                "maven.modrinth:ferrite-core:${project.ferritecore_version}",
+                "maven.modrinth:modernfix:${project.modernfix_version}",
+                "maven.modrinth:krypton:${project.krypton_version}",
+                "maven.modrinth:dynamic-fps:${project.dynamic_fps_version}",
+                "maven.modrinth:fastquit:${project.fastquit_version}",
+                "maven.modrinth:cloth-config:${project.cloth_config_version}",
+                "maven.modrinth:distanthorizons:${project.dh_version}"
+        ]
+        if (!excludeIris) {
+            allCompatCoords.add("maven.modrinth:iris:${project.iris_version}")
+        }
+        allCompatCoords.each { coord ->
+            modRuntimeOnly(coord)
+        }
+        // Extract JiJ nested jars (e.g., c2me-base, TRansition, Reflect, conditional-mixin) so Loom remaps/loads them
+        def nestedCfg = configurations.detachedConfiguration(
+                allCompatCoords.collect { coord ->
+                    def dep = dependencies.create(coord)
+                    dep.transitive = false
+                    dep
+                } as Dependency[]
+        )
+        def nestedDir = file("${buildDir}/compat-nested-jars")
+        nestedDir.mkdirs()
+        def modJars = []
+        def libJars = []
+        nestedCfg.resolve().each { outerJar ->
+            def zf = new java.util.zip.ZipFile(outerJar)
+            try {
+                zf.entries().findAll { it.name.startsWith("META-INF/jars/") && it.name.endsWith(".jar") }.each { entry ->
+                    def baseName = new File(entry.name).name
+                    if (baseName.startsWith("mixinextras") || baseName.contains("natives-math")) {
+                        return
+                    }
+                    def outJar = new File(nestedDir, baseName)
+                    if (!outJar.exists() || outJar.length() != entry.size) {
+                        zf.getInputStream(entry).withStream { ins ->
+                            outJar.bytes = ins.bytes
+                        }
+                    }
+                    def nzf = new java.util.zip.ZipFile(outJar)
+                    try {
+                        if (nzf.getEntry("fabric.mod.json") != null) {
+                            modJars << outJar
+                        } else {
+                            libJars << outJar
+                        }
+                    } finally {
+                        nzf.close()
+                    }
+                }
+            } finally {
+                zf.close()
+            }
+        }
+        if (!modJars.isEmpty()) {
+            modRuntimeOnly files(modJars)
+        }
+        if (!libJars.isEmpty()) {
+            runtimeOnly files(libJars)
+        }
+    }
+
     // LWJGL 3 Vulkan, VMA, Shaderc (plus Windows/Linux natives)
     implementation "org.lwjgl:lwjgl-vulkan:${project.lwjgl_version}"
+    include "org.lwjgl:lwjgl-vulkan:${project.lwjgl_version}"
     implementation "org.lwjgl:lwjgl-vma:${project.lwjgl_version}"
+    include "org.lwjgl:lwjgl-vma:${project.lwjgl_version}"
     runtimeOnly "org.lwjgl:lwjgl-vma:${project.lwjgl_version}:natives-windows"
+    include "org.lwjgl:lwjgl-vma:${project.lwjgl_version}:natives-windows"
     runtimeOnly "org.lwjgl:lwjgl-vma:${project.lwjgl_version}:natives-linux"
+    include "org.lwjgl:lwjgl-vma:${project.lwjgl_version}:natives-linux"
 
     implementation "org.lwjgl:lwjgl-shaderc:${project.lwjgl_version}"
+    include "org.lwjgl:lwjgl-shaderc:${project.lwjgl_version}"
     runtimeOnly "org.lwjgl:lwjgl-shaderc:${project.lwjgl_version}:natives-windows"
+    include "org.lwjgl:lwjgl-shaderc:${project.lwjgl_version}:natives-windows"
     runtimeOnly "org.lwjgl:lwjgl-shaderc:${project.lwjgl_version}:natives-linux"
+    include "org.lwjgl:lwjgl-shaderc:${project.lwjgl_version}:natives-linux"
+}
+
+sourceSets {
+    testmod {
+        compileClasspath += main.compileClasspath + main.output
+        runtimeClasspath += main.runtimeClasspath + main.output
+    }
+}
+
+loom {
+    mods {
+        "valkyrie" {
+            sourceSet sourceSets.main
+        }
+        "valkyrie-smoke-test" {
+            sourceSet sourceSets.testmod
+        }
+    }
+    runs {
+        renderSmokeClient {
+            client()
+            name = "Render Smoke Client"
+            source sourceSets.testmod
+            runDir = "run"
+        }
+    }
 }
 
 tasks.register('verifyValkyrie', JavaExec) {
@@ -62,5 +189,103 @@ java {
 jar {
     from("LICENSE") {
         rename { "${it}_${project.base.archivesName.get()}" }
+    }
+}
+
+tasks.register('testmodJar', Jar) {
+    group = 'build'
+    from sourceSets.testmod.output
+    archiveBaseName = "${project.archives_base_name}-smoke-test-dev"
+}
+
+tasks.register('remapTestmodJar', net.fabricmc.loom.task.RemapJarTask) {
+    group = 'build'
+    dependsOn testmodJar, jar
+    inputFile.set(testmodJar.archiveFile)
+    archiveBaseName = "${project.archives_base_name}-smoke-test"
+    addNestedDependencies.set(false)
+    classpath.from(sourceSets.main.output, sourceSets.main.compileClasspath)
+}
+
+tasks.register('runProdCompatSmokeClient', JavaExec) {
+    group = 'verification'
+    description = 'Runs intermediary production Fabric client with all 18 compat mods including Iris Shaders'
+    dependsOn remapJar, remapTestmodJar
+
+    def prodDir = file("run-prod")
+    def modsDir = new File(prodDir, "mods")
+    def prodModCoords = [
+            "maven.modrinth:sodium:${project.sodium_version}",
+            "maven.modrinth:sodium-extra:${project.sodium_extra_version}",
+            "maven.modrinth:reeses-sodium-options:${project.reeses_sodium_options_version}",
+            "maven.modrinth:immediatelyfast:${project.immediatelyfast_version}",
+            "maven.modrinth:entityculling:${project.entityculling_version}",
+            "maven.modrinth:moreculling:${project.moreculling_version}",
+            "maven.modrinth:ebe:${project.ebe_version}",
+            "maven.modrinth:iris:${project.iris_version}",
+            "maven.modrinth:lithium:${project.lithium_version}",
+            "maven.modrinth:c2me-fabric:${project.c2me_version}",
+            "maven.modrinth:scalablelux:${project.scalablelux_version}",
+            "maven.modrinth:noisium:${project.noisium_version}",
+            "maven.modrinth:alternate-current:${project.alternate_current_version}",
+            "maven.modrinth:ferrite-core:${project.ferritecore_version}",
+            "maven.modrinth:modernfix:${project.modernfix_version}",
+            "maven.modrinth:krypton:${project.krypton_version}",
+            "maven.modrinth:dynamic-fps:${project.dynamic_fps_version}",
+            "maven.modrinth:fastquit:${project.fastquit_version}",
+            "maven.modrinth:cloth-config:${project.cloth_config_version}",
+            "maven.modrinth:distanthorizons:${project.dh_version}"
+    ]
+
+    def gradleHome = gradle.gradleUserHomeDir
+    workingDir = prodDir
+    mainClass.set("net.fabricmc.loader.impl.launch.knot.KnotClient")
+    jvmArgs(
+            "-Xmx2G",
+            "-Dfabric.development=false",
+            "-Dfabric.gameJarPath=${gradleHome}/caches/fabric-loom/${project.minecraft_version}/minecraft-client.jar",
+            "-Dlog4j.configurationFile=${projectDir}/.gradle/loom-cache/log4j.xml",
+            "-Djava.library.path=${projectDir}/.gradle/loom-cache/natives/${project.minecraft_version}"
+    )
+    args("--assetIndex", "1.21.1-17", "--assetsDir", "${gradleHome}/caches/fabric-loom/assets")
+
+    doFirst {
+        modsDir.mkdirs()
+        modsDir.listFiles()?.each { if (it.name.endsWith(".jar")) it.delete() }
+
+        copy {
+            from remapJar.archiveFile
+            from remapTestmodJar.archiveFile
+            into modsDir
+        }
+
+        def modsCfg = configurations.detachedConfiguration(
+                ([dependencies.create("net.fabricmc.fabric-api:fabric-api:0.116.11+1.21.1")] +
+                        prodModCoords.collect { coord ->
+                            def d = dependencies.create(coord)
+                            d.transitive = false
+                            d
+                        }) as Dependency[]
+        )
+        modsCfg.transitive = false
+        modsCfg.resolve().each { jarFile ->
+            copy {
+                from jarFile
+                into modsDir
+            }
+        }
+
+        def interCfg = configurations.detachedConfiguration(
+                dependencies.create("net.fabricmc:intermediary:${project.minecraft_version}:v2")
+        )
+        def cleanCp = configurations.runtimeClasspath.files.findAll { f ->
+            f.isFile() &&
+                    !f.absolutePath.contains("minecraft-merged") &&
+                    !f.name.startsWith("fabric-api") &&
+                    !f.name.startsWith("lwjgl-vulkan") &&
+                    !f.name.startsWith("lwjgl-vma") &&
+                    !f.name.startsWith("lwjgl-shaderc")
+        } + interCfg.resolve()
+        classpath = files(cleanCp)
     }
 }

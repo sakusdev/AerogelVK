@@ -14,6 +14,7 @@ layout(location = 5) in vec4 vLightAO; // x: blockLight, y: skyLight, z: aoLevel
 struct AtlasUVEntry {
     vec2 uvMin; // (u0, v0)
     vec2 uvMax; // (u1, v1)
+    vec4 tint;  // (r, g, b, 1.0) in sRGB
 };
 
 layout(std430, set = 0, binding = 6) readonly buffer AtlasUVSSBO {
@@ -49,9 +50,9 @@ void main() {
     vec2 localFrac = fract(vTiledUV);
     vec2 spriteSpan = entry.uvMax - entry.uvMin;
 
-    // Half-texel inward clamp to strictly eliminate atlas bleeding
+    // Half-texel inward clamp to strictly eliminate atlas bleeding (guarded when spriteSpan < 1 texel)
     vec2 atlasSize = vec2(textureSize(uBlockAtlas, 0));
-    vec2 halfTexel = 0.5 / max(atlasSize, vec2(1.0));
+    vec2 halfTexel = min(0.5 / max(atlasSize, vec2(1.0)), max(spriteSpan, vec2(0.0)) * 0.49);
     vec2 atlasUV = mix(entry.uvMin, entry.uvMax, localFrac);
     vec2 clampedUV = clamp(atlasUV, entry.uvMin + halfTexel, entry.uvMax - halfTexel);
 
@@ -63,6 +64,9 @@ void main() {
     if (albedo.a < 0.1) {
         discard;
     }
+
+    // Apply per-sprite/biome tint (converting sRGB tint to linear space)
+    albedo.rgb *= pow(max(entry.tint.rgb, vec3(0.0)), vec3(2.2));
 
     // Material roughness selection (4 bits: 0..15)
     // 0: Matte, 1: Water, 2: Metallic, 3: Emissive, 4: Foliage

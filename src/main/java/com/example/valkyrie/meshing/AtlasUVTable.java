@@ -2,34 +2,49 @@ package com.example.valkyrie.meshing;
 
 import it.unimi.dsi.fastutil.objects.Object2IntOpenHashMap;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.color.block.BlockColors;
+import net.minecraft.client.renderer.block.model.BakedQuad;
+import net.minecraft.client.renderer.texture.AbstractTexture;
 import net.minecraft.client.renderer.texture.TextureAtlas;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
-import net.minecraft.client.resources.model.Material;
+import net.minecraft.client.resources.model.BakedModel;
+import net.minecraft.core.Direction;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.tags.BlockTags;
-import net.minecraft.tags.TagKey;
+import net.minecraft.util.RandomSource;
 import net.minecraft.world.inventory.InventoryMenu;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.material.FluidState;
 import net.minecraft.world.level.material.Fluids;
+import org.lwjgl.opengl.GL11C;
 import org.lwjgl.system.MemoryUtil;
 
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
- * Maps BlockStates to 16-bit Sprite IDs and maintains a std430-layout native
- * ByteBuffer of atlas UV bounds (u0, v0, u1, v1 per entry) for upload to the
- * Vulkan AtlasUVSSBO (Descriptor Set 0, Binding 6).
+ * Maps (BlockState, faceDirection) to 16-bit Sprite IDs and maintains a std430-layout
+ * native ByteBuffer of atlas UV bounds + tint color (32 bytes per entry) for upload
+ * to the Vulkan AtlasUVSSBO (Descriptor Set 0, Binding 6).
  */
 public final class AtlasUVTable {
 
     public static final int MAX_SPRITES = 65536;
-    public static final int ENTRY_BYTES = 16; // 4 floats
+    public static final int ENTRY_BYTES = 32; // vec2 uvMin, vec2 uvMax, vec4 tint (std430)
+
+    private static final Direction[] FACE_DIRS = {
+            Direction.EAST,  // 0: +X
+            Direction.WEST,  // 1: -X
+            Direction.UP,    // 2: +Y
+            Direction.DOWN,  // 3: -Y
+            Direction.SOUTH, // 4: +Z
+            Direction.NORTH  // 5: -Z
+    };
 
     private static final AtlasUVTable INSTANCE = new AtlasUVTable();
 
@@ -37,27 +52,32 @@ public final class AtlasUVTable {
         return INSTANCE;
     }
 
-    /** spriteId -> [u0, v0, u1, v1] */
-    private final List<float[]> uvEntries = new ArrayList<>(1024);
-    /** ResourceLocation (atlas sprite id) -> spriteId */
-    private final Object2IntOpenHashMap<ResourceLocation> spriteIdLookup = new Object2IntOpenHashMap<>(1024);
-    /** BlockState -> spriteId */
-    private final Object2IntOpenHashMap<BlockState> stateSpriteLookup = new Object2IntOpenHashMap<>(4096);
+    private record SpriteKey(ResourceLocation name, int tintRgb) {}
+
+    /** Immutable lookup snapshot published after rebuildFromBlockAtlas() for lock-free worker reads. */
+    private record SpriteLookup(
+            Map<BlockState, int[]> stateDirSpriteLookup,
+            Object2IntOpenHashMap<BlockState> stateSpriteLookup,
+            int spriteCount
+    ) {}
+
+    /** (spriteName, tintRgb) -> spriteId (mutated only under synchronized rebuild) */
+    private final Map<SpriteKey, Integer> spriteIdLookup = new HashMap<>(1024);
+    private volatile SpriteLookup lookup = new SpriteLookup(Map.of(), new Object2IntOpenHashMap<>(), 0);
 
     private ByteBuffer uvTableBuffer;
     private volatile boolean dirty = true;
     private int spriteCount = 0;
 
     private AtlasUVTable() {
-        spriteIdLookup.defaultReturnValue(-1);
-        stateSpriteLookup.defaultReturnValue(-1);
+        lookup.stateSpriteLookup().defaultReturnValue(-1);
         uvTableBuffer = MemoryUtil.memAlloc(MAX_SPRITES * ENTRY_BYTES);
         uvTableBuffer.limit(0);
     }
 
     /**
      * Rebuilds the sprite table by iterating all registered blocks and their
-     * possible states, resolving the particle icon for each state.
+     * possible states, resolving per-face sprites and default biome/block tints.
      */
     public synchronized void rebuildFromBlockAtlas() {
         Minecraft mc = Minecraft.getInstance();
@@ -65,33 +85,137 @@ public final class AtlasUVTable {
             return; // Too early during client bootstrap
         }
 
-        uvEntries.clear();
         spriteIdLookup.clear();
-        stateSpriteLookup.clear();
+        Map<BlockState, int[]> nextDirLookup = new HashMap<>(4096);
+        Object2IntOpenHashMap<BlockState> nextStateLookup = new Object2IntOpenHashMap<>(4096);
+        nextStateLookup.defaultReturnValue(-1);
         uvTableBuffer.clear();
-        uvTableBuffer.limit(0);
         spriteCount = 0;
 
-        // Reserve entry 0 as the fallback (full-atlas / white)
+        // Entry 0: fallback (missingno or full-atlas, untinted white)
         registerFallbackEntry(mc);
 
-        for (Block block : BuiltInRegistries.BLOCK) {
-            for (BlockState state : block.getStateDefinition().getPossibleStates()) {
-                try {
-                    TextureAtlasSprite sprite = mc.getBlockRenderer().getBlockModelShaper().getParticleIcon(state);
-                    if (sprite == null) {
-                        stateSpriteLookup.put(state, 0);
-                        continue;
-                    }
-                    int id = registerSprite(sprite);
-                    stateSpriteLookup.put(state, id);
-                } catch (Exception e) {
-                    stateSpriteLookup.put(state, 0);
-                }
+        TextureAtlas blockAtlas = null;
+        try {
+            blockAtlas = mc.getModelManager().getAtlas(InventoryMenu.BLOCK_ATLAS);
+        } catch (Exception ignored) {
+        }
+
+        TextureAtlasSprite waterSprite = null;
+        if (blockAtlas != null) {
+            try {
+                waterSprite = blockAtlas.getSprite(ResourceLocation.fromNamespaceAndPath("minecraft", "block/water_still"));
+            } catch (Exception ignored) {
             }
         }
 
+        BlockColors blockColors = mc.getBlockColors();
+        RandomSource random = RandomSource.create(42L);
+
+        for (Block block : BuiltInRegistries.BLOCK) {
+            for (BlockState state : block.getStateDefinition().getPossibleStates()) {
+                if (state.isAir()) {
+                    continue;
+                }
+
+                // Water / fluid states do not use BakedModel quads in vanilla
+                if (state.is(Blocks.WATER) || state.is(Blocks.BUBBLE_COLUMN)) {
+                    TextureAtlasSprite sprite = waterSprite != null
+                            ? waterSprite
+                            : safeGetParticleIcon(mc, state);
+                    int id = (sprite != null) ? registerSprite(sprite, 0x3F76E4) : 0;
+                    nextStateLookup.put(state, id);
+                    nextDirLookup.put(state, new int[]{id, id, id, id, id, id});
+                    continue;
+                }
+
+                TextureAtlasSprite particleSprite = safeGetParticleIcon(mc, state);
+                int fallbackTint = resolveFallbackTint(blockColors, state);
+                int particleId = (particleSprite != null) ? registerSprite(particleSprite, fallbackTint) : 0;
+                nextStateLookup.put(state, particleId);
+
+                int[] dirIds = new int[6];
+                BakedModel model = null;
+                try {
+                    model = mc.getBlockRenderer().getBlockModel(state);
+                } catch (Exception ignored) {
+                }
+
+                for (int d = 0; d < 6; d++) {
+                    if (model == null) {
+                        dirIds[d] = particleId;
+                        continue;
+                    }
+                    try {
+                        List<BakedQuad> quads = model.getQuads(state, FACE_DIRS[d], random);
+                        if (quads.isEmpty()) {
+                            quads = model.getQuads(state, null, random);
+                        }
+                        if (quads.isEmpty()) {
+                            dirIds[d] = particleId;
+                            continue;
+                        }
+                        BakedQuad quad = quads.get(0);
+                        TextureAtlasSprite faceSprite = quad.getSprite();
+                        int tintRgb = 0xFFFFFF;
+                        if (quad.isTinted()) {
+                            tintRgb = resolveQuadTint(blockColors, state, quad.getTintIndex());
+                        }
+                        dirIds[d] = (faceSprite != null) ? registerSprite(faceSprite, tintRgb) : particleId;
+                    } catch (Exception e) {
+                        dirIds[d] = particleId;
+                    }
+                }
+                nextDirLookup.put(state, dirIds);
+            }
+        }
+
+        uvTableBuffer.flip();
+        this.lookup = new SpriteLookup(nextDirLookup, nextStateLookup, spriteCount);
         dirty = true;
+    }
+
+    private TextureAtlasSprite safeGetParticleIcon(Minecraft mc, BlockState state) {
+        try {
+            return mc.getBlockRenderer().getBlockModelShaper().getParticleIcon(state);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private int resolveQuadTint(BlockColors blockColors, BlockState state, int tintIndex) {
+        if (blockColors != null) {
+            try {
+                int c = blockColors.getColor(state, null, null, tintIndex);
+                if (c != -1) {
+                    return c & 0xFFFFFF;
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        return resolveFallbackTint(blockColors, state);
+    }
+
+    private int resolveFallbackTint(BlockColors blockColors, BlockState state) {
+        if (state.is(Blocks.GRASS_BLOCK) || isGrassLike(state)) {
+            return 0x7CBD52; // Plains grass green
+        }
+        if (state.is(BlockTags.LEAVES)) {
+            if (state.is(Blocks.SPRUCE_LEAVES)) return 0x619961;
+            if (state.is(Blocks.BIRCH_LEAVES)) return 0x80A755;
+            if (state.is(Blocks.CHERRY_LEAVES)) return 0xFFFFFF;
+            return 0x59AE30; // Default oak/jungle foliage green
+        }
+        if (blockColors != null) {
+            try {
+                int c = blockColors.getColor(state, null, null, 0);
+                if (c != -1) {
+                    return c & 0xFFFFFF;
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        return 0xFFFFFF;
     }
 
     private void registerFallbackEntry(Minecraft mc) {
@@ -103,44 +227,94 @@ public final class AtlasUVTable {
         } catch (Exception e) {
             uv = new float[]{0f, 0f, 1f, 1f};
         }
-        appendEntry(uv);
+        spriteCount = 1;
+        appendEntry(uv, 0xFFFFFF);
     }
 
-    /** Registers a unique sprite, returning its 16-bit ID. Reuses existing IDs. */
-    private int registerSprite(TextureAtlasSprite sprite) {
+    /** Registers a unique (sprite, tint) pair, returning its 16-bit ID. Reuses existing IDs. */
+    private int registerSprite(TextureAtlasSprite sprite, int tintRgb) {
         ResourceLocation name = sprite.contents().name();
-        int existing = spriteIdLookup.getInt(name);
-        if (existing >= 0) {
+        SpriteKey key = new SpriteKey(name, tintRgb & 0xFFFFFF);
+        Integer existing = spriteIdLookup.get(key);
+        if (existing != null) {
             return existing;
         }
         if (spriteCount >= MAX_SPRITES) {
             return 0; // Table full; fall back
         }
         int id = spriteCount++;
-        spriteIdLookup.put(name, id);
-        appendEntry(new float[]{sprite.getU0(), sprite.getV0(), sprite.getU1(), sprite.getV1()});
+        spriteIdLookup.put(key, id);
+        appendEntry(new float[]{sprite.getU0(), sprite.getV0(), sprite.getU1(), sprite.getV1()}, tintRgb);
         return id;
     }
 
-    private void appendEntry(float[] uv) {
+    private void appendEntry(float[] uv, int tintRgb) {
         ByteBuffer buf = uvTableBuffer;
-        int pos = buf.position();
+        float r = ((tintRgb >>> 16) & 0xFF) / 255.0f;
+        float g = ((tintRgb >>> 8) & 0xFF) / 255.0f;
+        float b = (tintRgb & 0xFF) / 255.0f;
         buf.putFloat(uv[0]).putFloat(uv[1]).putFloat(uv[2]).putFloat(uv[3]);
-        buf.limit(Math.max(buf.limit(), pos + ENTRY_BYTES));
+        buf.putFloat(r).putFloat(g).putFloat(b).putFloat(1.0f);
     }
 
     /**
-     * Returns the 16-bit Sprite ID for the given state (0 fallback for air/unknown).
+     * Reads the current OpenGL Block Texture Atlas into a newly allocated native RGBA8 ByteBuffer.
+     * Returns null if the atlas is unavailable. Caller must free with MemoryUtil.memFree(pixels).
+     */
+    public record AtlasPixels(int width, int height, ByteBuffer rgbaPixels) {}
+
+    public AtlasPixels captureBlockAtlasPixels() {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.getTextureManager() == null) {
+            return null;
+        }
+        AbstractTexture tex = mc.getTextureManager().getTexture(InventoryMenu.BLOCK_ATLAS);
+        if (tex == null) {
+            return null;
+        }
+        int glTexId = tex.getId();
+        if (glTexId <= 0) {
+            return null;
+        }
+
+        int prevTex = GL11C.glGetInteger(GL11C.GL_TEXTURE_BINDING_2D);
+        GL11C.glBindTexture(GL11C.GL_TEXTURE_2D, glTexId);
+        int width = GL11C.glGetTexLevelParameteri(GL11C.GL_TEXTURE_2D, 0, GL11C.GL_TEXTURE_WIDTH);
+        int height = GL11C.glGetTexLevelParameteri(GL11C.GL_TEXTURE_2D, 0, GL11C.GL_TEXTURE_HEIGHT);
+
+        if (width <= 0 || height <= 0) {
+            GL11C.glBindTexture(GL11C.GL_TEXTURE_2D, prevTex);
+            return null;
+        }
+
+        ByteBuffer pixels = MemoryUtil.memAlloc(width * height * 4);
+        GL11C.glGetTexImage(GL11C.GL_TEXTURE_2D, 0, GL11C.GL_RGBA, GL11C.GL_UNSIGNED_BYTE, pixels);
+        GL11C.glBindTexture(GL11C.GL_TEXTURE_2D, prevTex);
+        pixels.position(0);
+        return new AtlasPixels(width, height, pixels);
+    }
+
+    /**
+     * Returns the 16-bit Sprite ID for the given state and face direction (0:+X..5:-Z).
      */
     public int getSpriteId(BlockState state, int direction) {
-        return getSpriteId(state);
+        if (state == null || state.isAir()) {
+            return 0;
+        }
+        SpriteLookup snap = this.lookup;
+        int[] dirIds = snap.stateDirSpriteLookup().get(state);
+        if (dirIds != null && direction >= 0 && direction < 6) {
+            return dirIds[direction] & 0xFFFF;
+        }
+        int id = snap.stateSpriteLookup().getInt(state);
+        return id >= 0 ? (id & 0xFFFF) : 0;
     }
 
     public int getSpriteId(BlockState state) {
         if (state == null || state.isAir()) {
             return 0;
         }
-        int id = stateSpriteLookup.getInt(state);
+        int id = this.lookup.stateSpriteLookup().getInt(state);
         return id >= 0 ? (id & 0xFFFF) : 0;
     }
 
@@ -244,14 +418,16 @@ public final class AtlasUVTable {
      * Returns the native std430-layout ByteBuffer ready for Vulkan SSBO upload.
      * The buffer's position/limit cover exactly {@link #getSpriteCount()} entries.
      */
-    public ByteBuffer getUvTableBuffer() {
+    public synchronized ByteBuffer getUvTableBuffer() {
         ByteBuffer buf = uvTableBuffer;
-        buf.position(0);
-        return buf;
+        if (buf == null) {
+            return null;
+        }
+        return buf.duplicate().order(buf.order()).position(0);
     }
 
     public int getSpriteCount() {
-        return spriteCount;
+        return this.lookup.spriteCount();
     }
 
     public boolean isDirty() {

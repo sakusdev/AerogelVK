@@ -16,6 +16,10 @@ layout(std140, set = 0, binding = 0) uniform FrameData {
     vec2 viewportSize;
     uint frameIndex;
     float time;
+    uint renderFlags;
+    uint activeCascades;
+    float csmFarDist;
+    float reserved0;
 } FrameUBO;
 
 // Set 0, Binding 1: Mega-Vertex Arena SSBO (64-bit / uvec2 per vertex)
@@ -42,12 +46,26 @@ layout(std430, set = 0, binding = 5) readonly buffer VisibleChunkIdSSBO {
     uint instanceToChunkIdx[];
 };
 
-// Push constant for selecting the active shadow cascade
+// Push constant for selecting the active shadow cascade and culling out-of-range sections
 layout(push_constant) uniform ShadowPushConstants {
     uint cascadeIndex;
+    float maxCascadeDistSq;
 } pc;
 
 void main() {
+    // Lookup chunk section position first for early cascade range rejection
+    uint chunkIdx = instanceToChunkIdx[gl_InstanceIndex];
+    ChunkDrawMeta meta = chunks[chunkIdx];
+    vec3 sectionOrigin = vec3(meta.chunkPos) * 16.0;
+
+    if (pc.maxCascadeDistSq > 0.0) {
+        vec3 delta = (sectionOrigin + vec3(8.0)) - FrameUBO.cameraPos.xyz;
+        if (dot(delta, delta) > pc.maxCascadeDistSq) {
+            gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+            return;
+        }
+    }
+
     uvec2 packedVertex = vertices[gl_VertexIndex];
     uint dataLow = packedVertex.x;
 
@@ -57,10 +75,6 @@ void main() {
     uint posZ       = (dataLow >> 12) & 0x3Fu;
     uint windWaving = (dataLow >> 31) & 0x1u;
 
-    // Lookup chunk section position
-    uint chunkIdx = instanceToChunkIdx[gl_InstanceIndex];
-    ChunkDrawMeta meta = chunks[chunkIdx];
-    vec3 sectionOrigin = vec3(meta.chunkPos) * 16.0;
     vec3 worldPos = sectionOrigin + vec3(float(posX), float(posY), float(posZ));
 
     // Dynamic wind sway (consistent with G-Buffer pass)

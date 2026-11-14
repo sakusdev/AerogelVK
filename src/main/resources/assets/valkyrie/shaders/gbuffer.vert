@@ -16,6 +16,10 @@ layout(std140, set = 0, binding = 0) uniform FrameData {
     vec2 viewportSize;
     uint frameIndex;
     float time;
+    uint renderFlags;
+    uint activeCascades;
+    float csmFarDist;
+    float reserved0;
 } FrameUBO;
 
 // Set 0, Binding 1: Mega-Vertex Arena SSBO (64-bit / uvec2 per vertex)

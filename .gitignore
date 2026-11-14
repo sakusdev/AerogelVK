@@ -21,6 +21,12 @@ run-*/
 bin/
 out/
 
+# Runtime logs
+logs/
+
+# opencode config (local tooling)
+opencode.json
+
 # Log files
 *.log
 

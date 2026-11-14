@@ -1,5 +1,6 @@
 package com.example.valkyrie.vulkan;
 
+import com.example.valkyrie.config.ValkyrieConfig;
 import org.joml.Matrix4f;
 import org.joml.Vector3f;
 import org.joml.Vector4f;
@@ -55,8 +56,10 @@ public final class VkPipelineManager implements AutoCloseable {
     // Pipelines
     private long testGradientPipeline;
     private long chunkCullPipeline;
+    private long hizDownsamplePipeline;
     private long gbufferPipeline;
     private long csmShadowPipeline;
+    private long depthConvertPipeline;
     private long deferredLightingPipeline;
     private long postCompositePipeline;
 
@@ -80,15 +83,23 @@ public final class VkPipelineManager implements AutoCloseable {
     private long rt1Allocation;
     private long rt1View;
 
+    // Internal Reversed-Z G-Buffer Depth: VK_FORMAT_D32_SFLOAT
+    private long gbufferDepthImage;
+    private long gbufferDepthAllocation;
+    private long gbufferDepthView;
+
     // Hi-Z: VK_FORMAT_R32_SFLOAT
+    public static final int MAX_HIZ_MIPS = 16;
     private long hiZImage;
     private long hiZAllocation;
     private long hiZView;
+    private final long[] hiZMipViews = new long[MAX_HIZ_MIPS];
     private int hiZMipLevels = 1;
 
-    // CSM Array: VK_FORMAT_D16_UNORM (2048 x 2048 x 3 layers)
+    // CSM Array: VK_FORMAT_D16_UNORM (configurable resolution x 3 layers)
     public static final int CSM_RESOLUTION = 2048;
     public static final int CSM_CASCADE_COUNT = 3;
+    private int csmResolution = 1024;
     private long csmArrayImage;
     private long csmArrayAllocation;
     private long csmArrayView;
@@ -103,11 +114,16 @@ public final class VkPipelineManager implements AutoCloseable {
     private long nearestSampler;
     private long linearSampler;
     private long shadowSampler;
+    private long atlasSampler;
 
-    // Dummy block atlas fallback
+    // Block atlas (dummy fallback + uploaded MC block atlas)
     private long dummyAtlasImage;
     private long dummyAtlasAllocation;
     private long dummyAtlasView;
+
+    private long blockAtlasImage;
+    private long blockAtlasAllocation;
+    private long blockAtlasView;
 
     private boolean initialized = false;
 
@@ -117,13 +133,17 @@ public final class VkPipelineManager implements AutoCloseable {
     public synchronized void init(int initialWidth, int initialHeight, long sharedColorView, long sharedDepthView) {
         if (initialized) return;
 
+        ValkyrieConfig config = ValkyrieConfig.get();
+        config.loadOrCreate();
+
         VkContext ctx = VkContext.getInstance();
         this.device = ctx.getVkDevice();
         this.vmaAllocator = ctx.getVmaAllocator();
         this.width = Math.max(1, initialWidth);
         this.height = Math.max(1, initialHeight);
+        this.csmResolution = config.getCsmResolution();
 
-        LOGGER.info("[Valkyrie] Initializing VkPipelineManager (width={}, height={})...", width, height);
+        LOGGER.info("[Valkyrie] Initializing VkPipelineManager (width={}, height={}, csmRes={})...", width, height, csmResolution);
 
         createSamplers();
         createDummyAtlas();
@@ -145,15 +165,28 @@ public final class VkPipelineManager implements AutoCloseable {
     // ------------------------------------------------------------------------
 
     /**
-     * Cascade 0 (0..32 blocks): Updated every frame.
-     * Cascade 1 & 2 (32..192 blocks): Updated only every 6 frames (frameIndex % 6 == 0)
-     * or when dirtyShadow flag is set (chunk meshing update).
+     * Cascade 0 (0..32 blocks): Updated every frame when CSM is enabled.
+     * Cascade 1 & 2: Staggered across frames based on csmUpdateInterval, avoiding
+     * rendering all outer cascades simultaneously during chunk streaming.
      */
     public boolean shouldUpdateCascade(int cascadeIndex, long frameIndex, boolean dirtyShadow) {
+        ValkyrieConfig config = ValkyrieConfig.get();
+        if (!config.isCsmEnabled() || cascadeIndex >= config.getCsmCascades()) {
+            return false;
+        }
         if (cascadeIndex == 0) {
             return true;
         }
-        return (frameIndex % 6 == 0) || dirtyShadow;
+        int interval = Math.max(2, config.getCsmUpdateInterval());
+        int phase = (cascadeIndex == 1) ? (interval / 3) : ((interval * 2) / 3);
+        if (frameIndex % interval == phase) {
+            return true;
+        }
+        return dirtyShadow && (frameIndex % 3 == cascadeIndex);
+    }
+
+    public int getCsmResolution() {
+        return csmResolution;
     }
 
     // ------------------------------------------------------------------------
@@ -220,8 +253,19 @@ public final class VkPipelineManager implements AutoCloseable {
         // float time (556..559)
         frameUboHostBuffer.putFloat(556, time);
 
+        // Runtime lighting/culling flags & shadow range (560..575)
+        ValkyrieConfig config = ValkyrieConfig.get();
+        int renderFlags = 0;
+        if (config.isCsmEnabled()) renderFlags |= 1;
+        if (config.isFastShadowPcf()) renderFlags |= 2;
+        if (config.isSsrEnabled()) renderFlags |= 4;
+        frameUboHostBuffer.putInt(560, renderFlags);
+        frameUboHostBuffer.putInt(564, config.getCsmCascades());
+        frameUboHostBuffer.putFloat(568, config.getMaxShadowDistance());
+        frameUboHostBuffer.putFloat(572, 0f);
+
         // Copy host bytes directly into mapped Vulkan buffer
-        MemoryUtil.memCopy(MemoryUtil.memAddress(frameUboHostBuffer), frameUboAddress, 560);
+        MemoryUtil.memCopy(MemoryUtil.memAddress(frameUboHostBuffer), frameUboAddress, 576);
     }
 
     // ------------------------------------------------------------------------
@@ -299,14 +343,14 @@ public final class VkPipelineManager implements AutoCloseable {
             descriptorSetLayout0 = pLayout0.get(0);
 
             // Set 1 Bindings
-            VkDescriptorSetLayoutBinding.Buffer bindings1 = VkDescriptorSetLayoutBinding.calloc(7, stack);
+            VkDescriptorSetLayoutBinding.Buffer bindings1 = VkDescriptorSetLayoutBinding.calloc(8, stack);
 
             // Binding 0: uGBufferRT0 (COMBINED_IMAGE_SAMPLER, compute)
             bindings1.get(0).binding(0).descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT);
             // Binding 1: uGBufferRT1 (COMBINED_IMAGE_SAMPLER, compute)
             bindings1.get(1).binding(1).descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT);
-            // Binding 2: uDepthBuffer (COMBINED_IMAGE_SAMPLER, compute)
-            bindings1.get(2).binding(2).descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT);
+            // Binding 2: uDepthBuffer (COMBINED_IMAGE_SAMPLER, compute | fragment for depth conversion)
+            bindings1.get(2).binding(2).descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT);
             // Binding 3: uHiZPyramid (COMBINED_IMAGE_SAMPLER, compute)
             bindings1.get(3).binding(3).descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT);
             // Binding 4: uShadowMapArray (COMBINED_IMAGE_SAMPLER, compute)
@@ -315,6 +359,8 @@ public final class VkPipelineManager implements AutoCloseable {
             bindings1.get(5).binding(5).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT);
             // Binding 6: uSharedColorImg (STORAGE_IMAGE, compute)
             bindings1.get(6).binding(6).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT);
+            // Binding 7: uHiZMips[16] (STORAGE_IMAGE array, compute)
+            bindings1.get(7).binding(7).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(MAX_HIZ_MIPS).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT);
 
             VkDescriptorSetLayoutCreateInfo layoutInfo1 = VkDescriptorSetLayoutCreateInfo.calloc(stack)
                     .sType(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO)
@@ -355,7 +401,7 @@ public final class VkPipelineManager implements AutoCloseable {
             poolSizes.get(0).type(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER).descriptorCount(4);
             poolSizes.get(1).type(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(16);
             poolSizes.get(2).type(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(16);
-            poolSizes.get(3).type(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(16);
+            poolSizes.get(3).type(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(32);
 
             VkDescriptorPoolCreateInfo poolInfo = VkDescriptorPoolCreateInfo.calloc(stack)
                     .sType(VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO)
@@ -390,6 +436,7 @@ public final class VkPipelineManager implements AutoCloseable {
     private void createComputePipelines() {
         testGradientPipeline = createComputePipeline("/assets/valkyrie/shaders/test_gradient.comp");
         chunkCullPipeline = createComputePipeline("/assets/valkyrie/shaders/chunk_cull.comp");
+        hizDownsamplePipeline = createComputePipeline("/assets/valkyrie/shaders/hiz_downsample.comp");
         deferredLightingPipeline = createComputePipeline("/assets/valkyrie/shaders/deferred_lighting.comp");
         postCompositePipeline = createComputePipeline("/assets/valkyrie/shaders/post_composite.comp");
     }
@@ -420,6 +467,7 @@ public final class VkPipelineManager implements AutoCloseable {
     private void createGraphicsPipelines() {
         createGBufferPipeline();
         createCsmShadowPipeline();
+        createDepthConvertPipeline();
     }
 
     private void createGBufferPipeline() {
@@ -449,7 +497,8 @@ public final class VkPipelineManager implements AutoCloseable {
                     .sType(VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO)
                     .polygonMode(VK_POLYGON_MODE_FILL)
                     .cullMode(VK_CULL_MODE_BACK_BIT)
-                    .frontFace(VK_FRONT_FACE_COUNTER_CLOCKWISE)
+                    // Y-up projection (m11 > 0) + positive viewport flips Vulkan framebuffer signed area parity
+                    .frontFace(VK_FRONT_FACE_CLOCKWISE)
                     .lineWidth(1.0f);
 
             VkPipelineMultisampleStateCreateInfo multisampling = VkPipelineMultisampleStateCreateInfo.calloc(stack)
@@ -584,6 +633,78 @@ public final class VkPipelineManager implements AutoCloseable {
         }
     }
 
+    private void createDepthConvertPipeline() {
+        long vertModule = VkShaderCompiler.compileResourceToModule(device, "/assets/valkyrie/shaders/depth_convert.vert", VkShaderCompiler.STAGE_VERTEX);
+        long fragModule = VkShaderCompiler.compileResourceToModule(device, "/assets/valkyrie/shaders/depth_convert.frag", VkShaderCompiler.STAGE_FRAGMENT);
+
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkPipelineShaderStageCreateInfo.Buffer stages = VkPipelineShaderStageCreateInfo.calloc(2, stack);
+            stages.get(0).sType(VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO).stage(VK_SHADER_STAGE_VERTEX_BIT).module(vertModule).pName(stack.UTF8("main"));
+            stages.get(1).sType(VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO).stage(VK_SHADER_STAGE_FRAGMENT_BIT).module(fragModule).pName(stack.UTF8("main"));
+
+            VkPipelineVertexInputStateCreateInfo vertexInput = VkPipelineVertexInputStateCreateInfo.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO);
+
+            VkPipelineInputAssemblyStateCreateInfo inputAssembly = VkPipelineInputAssemblyStateCreateInfo.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO)
+                    .topology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
+                    .primitiveRestartEnable(false);
+
+            VkPipelineViewportStateCreateInfo viewportState = VkPipelineViewportStateCreateInfo.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO)
+                    .viewportCount(1)
+                    .scissorCount(1);
+
+            VkPipelineRasterizationStateCreateInfo rasterizer = VkPipelineRasterizationStateCreateInfo.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO)
+                    .polygonMode(VK_POLYGON_MODE_FILL)
+                    .cullMode(VK_CULL_MODE_NONE)
+                    .lineWidth(1.0f);
+
+            VkPipelineMultisampleStateCreateInfo multisampling = VkPipelineMultisampleStateCreateInfo.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO)
+                    .rasterizationSamples(VK_SAMPLE_COUNT_1_BIT);
+
+            VkPipelineDepthStencilStateCreateInfo depthStencil = VkPipelineDepthStencilStateCreateInfo.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO)
+                    .depthTestEnable(true)
+                    .depthWriteEnable(true)
+                    .depthCompareOp(VK_COMPARE_OP_ALWAYS)
+                    .depthBoundsTestEnable(false)
+                    .stencilTestEnable(false);
+
+            IntBuffer dynamicStates = stack.ints(VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR);
+            VkPipelineDynamicStateCreateInfo dynamicState = VkPipelineDynamicStateCreateInfo.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO)
+                    .pDynamicStates(dynamicStates);
+
+            VkPipelineRenderingCreateInfo renderingCreateInfo = VkPipelineRenderingCreateInfo.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO)
+                    .depthAttachmentFormat(VK_FORMAT_D32_SFLOAT);
+
+            VkGraphicsPipelineCreateInfo.Buffer pipelineInfo = VkGraphicsPipelineCreateInfo.calloc(1, stack)
+                    .sType(VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO)
+                    .pNext(renderingCreateInfo.address())
+                    .pStages(stages)
+                    .pVertexInputState(vertexInput)
+                    .pInputAssemblyState(inputAssembly)
+                    .pViewportState(viewportState)
+                    .pRasterizationState(rasterizer)
+                    .pMultisampleState(multisampling)
+                    .pDepthStencilState(depthStencil)
+                    .pDynamicState(dynamicState)
+                    .layout(pipelineLayout);
+
+            LongBuffer pPipeline = stack.mallocLong(1);
+            int res = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, pipelineInfo, null, pPipeline);
+            if (res != VK_SUCCESS) throw new RuntimeException("Failed to create depth convert graphics pipeline: " + res);
+            depthConvertPipeline = pPipeline.get(0);
+        } finally {
+            vkDestroyShaderModule(device, vertModule, null);
+            vkDestroyShaderModule(device, fragModule, null);
+        }
+    }
+
     // ------------------------------------------------------------------------
     // Resource Allocation & Resizing
     // ------------------------------------------------------------------------
@@ -628,6 +749,21 @@ public final class VkPipelineManager implements AutoCloseable {
 
             vkCreateSampler(device, shadowInfo, null, pSampler);
             shadowSampler = pSampler.get(0);
+
+            // Block Atlas Sampler (nearest texel + linear mipmap LOD for crisp pixel textures without shimmer)
+            VkSamplerCreateInfo atlasInfo = VkSamplerCreateInfo.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO)
+                    .magFilter(VK_FILTER_NEAREST)
+                    .minFilter(VK_FILTER_NEAREST)
+                    .mipmapMode(VK_SAMPLER_MIPMAP_MODE_LINEAR)
+                    .addressModeU(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
+                    .addressModeV(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
+                    .addressModeW(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
+                    .minLod(0.0f)
+                    .maxLod(16.0f);
+
+            vkCreateSampler(device, atlasInfo, null, pSampler);
+            atlasSampler = pSampler.get(0);
         }
     }
 
@@ -660,7 +796,7 @@ public final class VkPipelineManager implements AutoCloseable {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             LongBuffer pAlloc = stack.mallocLong(1);
             csmArrayImage = createImage(
-                    CSM_RESOLUTION, CSM_RESOLUTION, VK_FORMAT_D16_UNORM,
+                    csmResolution, csmResolution, VK_FORMAT_D16_UNORM,
                     VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                     1, CSM_CASCADE_COUNT, pAlloc
             );
@@ -677,6 +813,14 @@ public final class VkPipelineManager implements AutoCloseable {
                         VK_IMAGE_VIEW_TYPE_2D, 0, 1, i, 1
                 );
             }
+
+            // Transition CSM array to SHADER_READ_ONLY_OPTIMAL initially so DescriptorSet1 is always valid
+            VkContext ctx = VkContext.getInstance();
+            VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
+            recordImageBarrier(cmd, csmArrayImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, CSM_CASCADE_COUNT,
+                    0, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, stack);
+            ctx.endSingleTimeCommands(cmd);
         }
     }
 
@@ -694,6 +838,148 @@ public final class VkPipelineManager implements AutoCloseable {
                     dummyAtlasImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_ASPECT_COLOR_BIT,
                     VK_IMAGE_VIEW_TYPE_2D, 0, 1, 0, 1
             );
+
+            // Clear 1x1 fallback atlas to opaque white and transition to SHADER_READ_ONLY_OPTIMAL
+            VkContext ctx = VkContext.getInstance();
+            VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
+            recordImageBarrier(cmd, dummyAtlasImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1,
+                    0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, stack);
+
+            VkClearColorValue clearWhite = VkClearColorValue.calloc(stack);
+            clearWhite.float32(0, 1f).float32(1, 1f).float32(2, 1f).float32(3, 1f);
+            VkImageSubresourceRange.Buffer range = VkImageSubresourceRange.calloc(1, stack)
+                    .aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1);
+            vkCmdClearColorImage(cmd, dummyAtlasImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, clearWhite, range);
+
+            recordImageBarrier(cmd, dummyAtlasImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, stack);
+            ctx.endSingleTimeCommands(cmd);
+        }
+    }
+
+    /**
+     * Uploads RGBA8 pixels of Minecraft's Block Atlas into a mipmapped Vulkan VkImage.
+     */
+    public synchronized void uploadBlockAtlas(int atlasWidth, int atlasHeight, ByteBuffer rgbaPixels) {
+        if (!initialized || atlasWidth <= 0 || atlasHeight <= 0 || rgbaPixels == null) {
+            return;
+        }
+
+        vkDeviceWaitIdle(device);
+
+        if (blockAtlasView != VK_NULL_HANDLE) {
+            vkDestroyImageView(device, blockAtlasView, null);
+            blockAtlasView = VK_NULL_HANDLE;
+        }
+        if (blockAtlasImage != VK_NULL_HANDLE) {
+            Vma.vmaDestroyImage(vmaAllocator, blockAtlasImage, blockAtlasAllocation);
+            blockAtlasImage = VK_NULL_HANDLE;
+            blockAtlasAllocation = VK_NULL_HANDLE;
+        }
+
+        int mipLevels = Math.max(1, 1 + (int) Math.floor(Math.log(Math.max(atlasWidth, atlasHeight)) / Math.log(2)));
+        // Limit mip chain to 5 levels (down to 16x16 per tile) to avoid excessive cross-tile bleeding
+        mipLevels = Math.min(mipLevels, 5);
+
+        long pixelBytes = (long) atlasWidth * atlasHeight * 4L;
+
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            // Create temporary staging buffer
+            VkBufferCreateInfo bufInfo = VkBufferCreateInfo.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO)
+                    .size(pixelBytes)
+                    .usage(VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            VmaAllocationCreateInfo bufAllocInfo = VmaAllocationCreateInfo.calloc(stack)
+                    .usage(Vma.VMA_MEMORY_USAGE_CPU_TO_GPU)
+                    .flags(Vma.VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | Vma.VMA_ALLOCATION_CREATE_MAPPED_BIT);
+
+            LongBuffer pBuf = stack.mallocLong(1);
+            PointerBuffer pBufAlloc = stack.mallocPointer(1);
+            int res = Vma.vmaCreateBuffer(vmaAllocator, bufInfo, bufAllocInfo, pBuf, pBufAlloc, null);
+            if (res != VK_SUCCESS) throw new RuntimeException("Failed to create atlas staging buffer: " + res);
+            long stagingBuf = pBuf.get(0);
+            long stagingAlloc = pBufAlloc.get(0);
+
+            PointerBuffer pMapped = stack.mallocPointer(1);
+            Vma.vmaMapMemory(vmaAllocator, stagingAlloc, pMapped);
+            ByteBuffer src = rgbaPixels.duplicate();
+            src.position(0);
+            src.limit((int) pixelBytes);
+            MemoryUtil.memByteBuffer(pMapped.get(0), (int) pixelBytes).put(src);
+            Vma.vmaUnmapMemory(vmaAllocator, stagingAlloc);
+
+            LongBuffer pImgAlloc = stack.mallocLong(1);
+            blockAtlasImage = createImage(
+                    atlasWidth, atlasHeight, VK_FORMAT_R8G8B8A8_SRGB,
+                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                    mipLevels, 1, pImgAlloc
+            );
+            blockAtlasAllocation = pImgAlloc.get(0);
+            blockAtlasView = createImageView(
+                    blockAtlasImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_ASPECT_COLOR_BIT,
+                    VK_IMAGE_VIEW_TYPE_2D, 0, mipLevels, 0, 1
+            );
+
+            VkContext ctx = VkContext.getInstance();
+            VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
+
+            recordImageBarrier(cmd, blockAtlasImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_IMAGE_ASPECT_COLOR_BIT, 0, mipLevels, 0, 1,
+                    0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, stack);
+
+            VkBufferImageCopy.Buffer copyRegion = VkBufferImageCopy.calloc(1, stack)
+                    .bufferOffset(0)
+                    .bufferRowLength(0)
+                    .bufferImageHeight(0);
+            copyRegion.imageSubresource()
+                    .aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
+                    .mipLevel(0)
+                    .baseArrayLayer(0)
+                    .layerCount(1);
+            copyRegion.imageExtent().set(atlasWidth, atlasHeight, 1);
+            vkCmdCopyBufferToImage(cmd, stagingBuf, blockAtlasImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copyRegion);
+
+            // Generate mipmaps via vkCmdBlitImage
+            int mipW = atlasWidth;
+            int mipH = atlasHeight;
+            for (int i = 1; i < mipLevels; i++) {
+                recordImageBarrier(cmd, blockAtlasImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 1, 0, 1,
+                        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, stack);
+
+                int nextW = Math.max(1, mipW / 2);
+                int nextH = Math.max(1, mipH / 2);
+
+                VkImageBlit.Buffer blit = VkImageBlit.calloc(1, stack);
+                blit.srcOffsets(0).set(0, 0, 0);
+                blit.srcOffsets(1).set(mipW, mipH, 1);
+                blit.srcSubresource().aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).mipLevel(i - 1).baseArrayLayer(0).layerCount(1);
+
+                blit.dstOffsets(0).set(0, 0, 0);
+                blit.dstOffsets(1).set(nextW, nextH, 1);
+                blit.dstSubresource().aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).mipLevel(i).baseArrayLayer(0).layerCount(1);
+
+                vkCmdBlitImage(cmd, blockAtlasImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        blockAtlasImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, blit, VK_FILTER_LINEAR);
+
+                recordImageBarrier(cmd, blockAtlasImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 1, 0, 1,
+                        VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, stack);
+
+                mipW = nextW;
+                mipH = nextH;
+            }
+
+            // Transition final mip to SHADER_READ_ONLY_OPTIMAL
+            recordImageBarrier(cmd, blockAtlasImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_IMAGE_ASPECT_COLOR_BIT, mipLevels - 1, 1, 0, 1,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, stack);
+
+            ctx.endSingleTimeCommands(cmd);
+            Vma.vmaDestroyBuffer(vmaAllocator, stagingBuf, stagingAlloc);
+            LOGGER.info("[Valkyrie] Uploaded Minecraft Block Atlas ({}x{}, {} mip levels) to Vulkan.", atlasWidth, atlasHeight, mipLevels);
         }
     }
 
@@ -718,13 +1004,37 @@ public final class VkPipelineManager implements AutoCloseable {
             rt1Allocation = pAlloc.get(0);
             rt1View = createImageView(rt1Image, VK_FORMAT_R16G16_UINT, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_VIEW_TYPE_2D, 0, 1, 0, 1);
 
+            // Internal Reversed-Z G-Buffer Depth: D32_SFLOAT
+            gbufferDepthImage = createImage(width, height, VK_FORMAT_D32_SFLOAT,
+                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, 1, 1, pAlloc);
+            gbufferDepthAllocation = pAlloc.get(0);
+            gbufferDepthView = createImageView(gbufferDepthImage, VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_VIEW_TYPE_2D, 0, 1, 0, 1);
+
             // Hi-Z: R32_SFLOAT
-            hiZMipLevels = Math.max(1, (int) Math.floor(Math.log(Math.max(width, height)) / Math.log(2)));
+            hiZMipLevels = Math.min(MAX_HIZ_MIPS, Math.max(1, 1 + (int) Math.floor(Math.log(Math.max(width, height)) / Math.log(2))));
             hiZImage = createImage(width, height, VK_FORMAT_R32_SFLOAT,
                     VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                     hiZMipLevels, 1, pAlloc);
             hiZAllocation = pAlloc.get(0);
             hiZView = createImageView(hiZImage, VK_FORMAT_R32_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_VIEW_TYPE_2D, 0, hiZMipLevels, 0, 1);
+            for (int m = 0; m < hiZMipLevels; m++) {
+                hiZMipViews[m] = createImageView(hiZImage, VK_FORMAT_R32_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_VIEW_TYPE_2D, m, 1, 0, 1);
+            }
+
+            // Transition Hi-Z to SHADER_READ_ONLY_OPTIMAL and clear to 0.0 (Reversed-Z far) initially
+            VkContext ctx = VkContext.getInstance();
+            VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
+            recordImageBarrier(cmd, hiZImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_IMAGE_ASPECT_COLOR_BIT, 0, hiZMipLevels, 0, 1,
+                    0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, stack);
+            VkClearColorValue clearZero = VkClearColorValue.calloc(stack);
+            VkImageSubresourceRange.Buffer range = VkImageSubresourceRange.calloc(1, stack)
+                    .aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).baseMipLevel(0).levelCount(hiZMipLevels).baseArrayLayer(0).layerCount(1);
+            vkCmdClearColorImage(cmd, hiZImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, clearZero, range);
+            recordImageBarrier(cmd, hiZImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_IMAGE_ASPECT_COLOR_BIT, 0, hiZMipLevels, 0, 1,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, stack);
+            ctx.endSingleTimeCommands(cmd);
 
             // HDR Color: R16G16B16A16_SFLOAT
             hdrColorImage = createImage(width, height, VK_FORMAT_R16G16B16A16_SFLOAT,
@@ -732,8 +1042,8 @@ public final class VkPipelineManager implements AutoCloseable {
             hdrColorAllocation = pAlloc.get(0);
             hdrColorView = createImageView(hdrColorImage, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_VIEW_TYPE_2D, 0, 1, 0, 1);
 
-            // Update Descriptor Set 1
-            updateDescriptorSet1(sharedColorView, sharedDepthView);
+            // Update Descriptor Set 1 (binding uDepthBuffer to gbufferDepthView!)
+            updateDescriptorSet1(sharedColorView, gbufferDepthView);
         }
     }
 
@@ -744,6 +1054,15 @@ public final class VkPipelineManager implements AutoCloseable {
         if (rt1View != VK_NULL_HANDLE) { vkDestroyImageView(device, rt1View, null); rt1View = VK_NULL_HANDLE; }
         if (rt1Image != VK_NULL_HANDLE) { Vma.vmaDestroyImage(vmaAllocator, rt1Image, rt1Allocation); rt1Image = VK_NULL_HANDLE; }
 
+        if (gbufferDepthView != VK_NULL_HANDLE) { vkDestroyImageView(device, gbufferDepthView, null); gbufferDepthView = VK_NULL_HANDLE; }
+        if (gbufferDepthImage != VK_NULL_HANDLE) { Vma.vmaDestroyImage(vmaAllocator, gbufferDepthImage, gbufferDepthAllocation); gbufferDepthImage = VK_NULL_HANDLE; }
+
+        for (int m = 0; m < MAX_HIZ_MIPS; m++) {
+            if (hiZMipViews[m] != VK_NULL_HANDLE) {
+                vkDestroyImageView(device, hiZMipViews[m], null);
+                hiZMipViews[m] = VK_NULL_HANDLE;
+            }
+        }
         if (hiZView != VK_NULL_HANDLE) { vkDestroyImageView(device, hiZView, null); hiZView = VK_NULL_HANDLE; }
         if (hiZImage != VK_NULL_HANDLE) { Vma.vmaDestroyImage(vmaAllocator, hiZImage, hiZAllocation); hiZImage = VK_NULL_HANDLE; }
 
@@ -771,105 +1090,138 @@ public final class VkPipelineManager implements AutoCloseable {
             VkDescriptorBufferInfo.Buffer uboInfo = VkDescriptorBufferInfo.calloc(1, stack)
                     .buffer(frameUboBuffer).offset(0).range(VK_WHOLE_SIZE);
             writes.get(0).sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET).dstSet(descriptorSet0).dstBinding(0)
-                    .descriptorType(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER).pBufferInfo(uboInfo);
+                    .descriptorCount(1).descriptorType(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER).pBufferInfo(uboInfo);
 
             // 1: MegaVertexSSBO
             VkDescriptorBufferInfo.Buffer vtxInfo = VkDescriptorBufferInfo.calloc(1, stack)
                     .buffer(megaVertexBuffer).offset(0).range(VK_WHOLE_SIZE);
             writes.get(1).sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET).dstSet(descriptorSet0).dstBinding(1)
-                    .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).pBufferInfo(vtxInfo);
+                    .descriptorCount(1).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).pBufferInfo(vtxInfo);
 
             // 2: ChunkMetaSSBO
             VkDescriptorBufferInfo.Buffer metaInfo = VkDescriptorBufferInfo.calloc(1, stack)
                     .buffer(chunkMetaBuffer).offset(0).range(VK_WHOLE_SIZE);
             writes.get(2).sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET).dstSet(descriptorSet0).dstBinding(2)
-                    .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).pBufferInfo(metaInfo);
+                    .descriptorCount(1).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).pBufferInfo(metaInfo);
 
             // 3: IndirectCmdSSBO
             VkDescriptorBufferInfo.Buffer cmdInfo = VkDescriptorBufferInfo.calloc(1, stack)
                     .buffer(indirectCmdBuffer).offset(0).range(VK_WHOLE_SIZE);
             writes.get(3).sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET).dstSet(descriptorSet0).dstBinding(3)
-                    .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).pBufferInfo(cmdInfo);
+                    .descriptorCount(1).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).pBufferInfo(cmdInfo);
 
             // 4: DrawCountSSBO
             VkDescriptorBufferInfo.Buffer countInfo = VkDescriptorBufferInfo.calloc(1, stack)
                     .buffer(drawCountBuffer).offset(0).range(VK_WHOLE_SIZE);
             writes.get(4).sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET).dstSet(descriptorSet0).dstBinding(4)
-                    .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).pBufferInfo(countInfo);
+                    .descriptorCount(1).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).pBufferInfo(countInfo);
 
             // 5: VisibleChunkIdSSBO
             VkDescriptorBufferInfo.Buffer idInfo = VkDescriptorBufferInfo.calloc(1, stack)
                     .buffer(visibleChunkIdBuffer).offset(0).range(VK_WHOLE_SIZE);
             writes.get(5).sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET).dstSet(descriptorSet0).dstBinding(5)
-                    .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).pBufferInfo(idInfo);
+                    .descriptorCount(1).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).pBufferInfo(idInfo);
 
             // 6: AtlasUVSSBO
             VkDescriptorBufferInfo.Buffer uvInfo = VkDescriptorBufferInfo.calloc(1, stack)
                     .buffer(atlasUvBuffer).offset(0).range(VK_WHOLE_SIZE);
             writes.get(6).sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET).dstSet(descriptorSet0).dstBinding(6)
-                    .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).pBufferInfo(uvInfo);
+                    .descriptorCount(1).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).pBufferInfo(uvInfo);
 
             // 7: uBlockAtlas
             long atlasView = (blockAtlasView != VK_NULL_HANDLE) ? blockAtlasView : dummyAtlasView;
             VkDescriptorImageInfo.Buffer atlasInfo = VkDescriptorImageInfo.calloc(1, stack)
                     .imageLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
                     .imageView(atlasView)
-                    .sampler(nearestSampler);
+                    .sampler(atlasSampler);
             writes.get(7).sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET).dstSet(descriptorSet0).dstBinding(7)
-                    .descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).pImageInfo(atlasInfo);
+                    .descriptorCount(1).descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).pImageInfo(atlasInfo);
 
             vkUpdateDescriptorSets(device, writes, null);
         }
     }
 
-    public void updateDescriptorSet1(long sharedColorView, long sharedDepthView) {
+    public void updateDescriptorSet1(long sharedColorView, long gbufferDepthView) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(7, stack);
+            VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(8, stack);
 
             // 0: uGBufferRT0
             VkDescriptorImageInfo.Buffer rt0Info = VkDescriptorImageInfo.calloc(1, stack)
                     .imageLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL).imageView(rt0View).sampler(nearestSampler);
             writes.get(0).sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET).dstSet(descriptorSet1).dstBinding(0)
-                    .descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).pImageInfo(rt0Info);
+                    .descriptorCount(1).descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).pImageInfo(rt0Info);
 
             // 1: uGBufferRT1
             VkDescriptorImageInfo.Buffer rt1Info = VkDescriptorImageInfo.calloc(1, stack)
                     .imageLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL).imageView(rt1View).sampler(nearestSampler);
             writes.get(1).sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET).dstSet(descriptorSet1).dstBinding(1)
-                    .descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).pImageInfo(rt1Info);
+                    .descriptorCount(1).descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).pImageInfo(rt1Info);
 
-            // 2: uDepthBuffer
+            // 2: uDepthBuffer (internal Reversed-Z depth)
             VkDescriptorImageInfo.Buffer depthInfo = VkDescriptorImageInfo.calloc(1, stack)
-                    .imageLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL).imageView(sharedDepthView).sampler(nearestSampler);
+                    .imageLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL).imageView(gbufferDepthView).sampler(nearestSampler);
             writes.get(2).sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET).dstSet(descriptorSet1).dstBinding(2)
-                    .descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).pImageInfo(depthInfo);
+                    .descriptorCount(1).descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).pImageInfo(depthInfo);
 
             // 3: uHiZPyramid
             VkDescriptorImageInfo.Buffer hiZInfo = VkDescriptorImageInfo.calloc(1, stack)
                     .imageLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL).imageView(hiZView).sampler(nearestSampler);
             writes.get(3).sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET).dstSet(descriptorSet1).dstBinding(3)
-                    .descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).pImageInfo(hiZInfo);
+                    .descriptorCount(1).descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).pImageInfo(hiZInfo);
 
             // 4: uShadowMapArray
             VkDescriptorImageInfo.Buffer csmInfo = VkDescriptorImageInfo.calloc(1, stack)
                     .imageLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL).imageView(csmArrayView).sampler(shadowSampler);
             writes.get(4).sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET).dstSet(descriptorSet1).dstBinding(4)
-                    .descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).pImageInfo(csmInfo);
+                    .descriptorCount(1).descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).pImageInfo(csmInfo);
 
             // 5: uHdrColorImg (STORAGE_IMAGE)
             VkDescriptorImageInfo.Buffer hdrInfo = VkDescriptorImageInfo.calloc(1, stack)
                     .imageLayout(VK_IMAGE_LAYOUT_GENERAL).imageView(hdrColorView);
             writes.get(5).sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET).dstSet(descriptorSet1).dstBinding(5)
-                    .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).pImageInfo(hdrInfo);
+                    .descriptorCount(1).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).pImageInfo(hdrInfo);
 
             // 6: uSharedColorImg (STORAGE_IMAGE)
             VkDescriptorImageInfo.Buffer sharedInfo = VkDescriptorImageInfo.calloc(1, stack)
                     .imageLayout(VK_IMAGE_LAYOUT_GENERAL).imageView(sharedColorView);
             writes.get(6).sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET).dstSet(descriptorSet1).dstBinding(6)
-                    .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).pImageInfo(sharedInfo);
+                    .descriptorCount(1).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).pImageInfo(sharedInfo);
+
+            // 7: uHiZMips[16] (STORAGE_IMAGE array)
+            VkDescriptorImageInfo.Buffer hiZMipInfos = VkDescriptorImageInfo.calloc(MAX_HIZ_MIPS, stack);
+            for (int m = 0; m < MAX_HIZ_MIPS; m++) {
+                long view = (m < hiZMipLevels) ? hiZMipViews[m] : hiZMipViews[0];
+                hiZMipInfos.get(m).imageLayout(VK_IMAGE_LAYOUT_GENERAL).imageView(view);
+            }
+            writes.get(7).sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET).dstSet(descriptorSet1).dstBinding(7)
+                    .descriptorCount(MAX_HIZ_MIPS)
+                    .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).pImageInfo(hiZMipInfos);
 
             vkUpdateDescriptorSets(device, writes, null);
         }
+    }
+
+    private void recordImageBarrier(
+            VkCommandBuffer cmd, long image, int oldLayout, int newLayout, int aspectMask,
+            int baseMip, int mipCount, int baseLayer, int layerCount,
+            int srcAccess, int dstAccess, int srcStage, int dstStage, MemoryStack stack
+    ) {
+        VkImageMemoryBarrier.Buffer barrier = VkImageMemoryBarrier.calloc(1, stack)
+                .sType(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER)
+                .oldLayout(oldLayout)
+                .newLayout(newLayout)
+                .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .srcAccessMask(srcAccess)
+                .dstAccessMask(dstAccess);
+        barrier.subresourceRange()
+                .aspectMask(aspectMask)
+                .baseMipLevel(baseMip)
+                .levelCount(mipCount)
+                .baseArrayLayer(baseLayer)
+                .layerCount(layerCount);
+        vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, null, null, barrier);
     }
 
     // ------------------------------------------------------------------------
@@ -938,8 +1290,10 @@ public final class VkPipelineManager implements AutoCloseable {
 
     public long getTestGradientPipeline() { return testGradientPipeline; }
     public long getChunkCullPipeline() { return chunkCullPipeline; }
+    public long getHizDownsamplePipeline() { return hizDownsamplePipeline; }
     public long getGbufferPipeline() { return gbufferPipeline; }
     public long getCsmShadowPipeline() { return csmShadowPipeline; }
+    public long getDepthConvertPipeline() { return depthConvertPipeline; }
     public long getDeferredLightingPipeline() { return deferredLightingPipeline; }
     public long getPostCompositePipeline() { return postCompositePipeline; }
 
@@ -948,8 +1302,12 @@ public final class VkPipelineManager implements AutoCloseable {
     public long getRt0View() { return rt0View; }
     public long getRt1Image() { return rt1Image; }
     public long getRt1View() { return rt1View; }
+    public long getGbufferDepthImage() { return gbufferDepthImage; }
+    public long getGbufferDepthView() { return gbufferDepthView; }
     public long getHiZImage() { return hiZImage; }
     public long getHiZView() { return hiZView; }
+    public int getHiZMipLevels() { return hiZMipLevels; }
+    public long getBlockAtlasView() { return blockAtlasView != VK_NULL_HANDLE ? blockAtlasView : dummyAtlasView; }
     public long getCsmArrayImage() { return csmArrayImage; }
     public long getCsmArrayView() { return csmArrayView; }
     public long getCsmLayerView(int cascade) { return csmLayerViews[cascade]; }
@@ -977,12 +1335,16 @@ public final class VkPipelineManager implements AutoCloseable {
         if (csmArrayView != VK_NULL_HANDLE) vkDestroyImageView(device, csmArrayView, null);
         if (csmArrayImage != VK_NULL_HANDLE) Vma.vmaDestroyImage(vmaAllocator, csmArrayImage, csmArrayAllocation);
 
+        if (blockAtlasView != VK_NULL_HANDLE) { vkDestroyImageView(device, blockAtlasView, null); blockAtlasView = VK_NULL_HANDLE; }
+        if (blockAtlasImage != VK_NULL_HANDLE) { Vma.vmaDestroyImage(vmaAllocator, blockAtlasImage, blockAtlasAllocation); blockAtlasImage = VK_NULL_HANDLE; }
+
         if (dummyAtlasView != VK_NULL_HANDLE) vkDestroyImageView(device, dummyAtlasView, null);
         if (dummyAtlasImage != VK_NULL_HANDLE) Vma.vmaDestroyImage(vmaAllocator, dummyAtlasImage, dummyAtlasAllocation);
 
         if (nearestSampler != VK_NULL_HANDLE) vkDestroySampler(device, nearestSampler, null);
         if (linearSampler != VK_NULL_HANDLE) vkDestroySampler(device, linearSampler, null);
         if (shadowSampler != VK_NULL_HANDLE) vkDestroySampler(device, shadowSampler, null);
+        if (atlasSampler != VK_NULL_HANDLE) vkDestroySampler(device, atlasSampler, null);
 
         if (frameUboAllocation != VK_NULL_HANDLE) {
             Vma.vmaUnmapMemory(vmaAllocator, frameUboAllocation);
@@ -993,8 +1355,10 @@ public final class VkPipelineManager implements AutoCloseable {
 
         if (testGradientPipeline != VK_NULL_HANDLE) vkDestroyPipeline(device, testGradientPipeline, null);
         if (chunkCullPipeline != VK_NULL_HANDLE) vkDestroyPipeline(device, chunkCullPipeline, null);
+        if (hizDownsamplePipeline != VK_NULL_HANDLE) vkDestroyPipeline(device, hizDownsamplePipeline, null);
         if (gbufferPipeline != VK_NULL_HANDLE) vkDestroyPipeline(device, gbufferPipeline, null);
         if (csmShadowPipeline != VK_NULL_HANDLE) vkDestroyPipeline(device, csmShadowPipeline, null);
+        if (depthConvertPipeline != VK_NULL_HANDLE) vkDestroyPipeline(device, depthConvertPipeline, null);
         if (deferredLightingPipeline != VK_NULL_HANDLE) vkDestroyPipeline(device, deferredLightingPipeline, null);
         if (postCompositePipeline != VK_NULL_HANDLE) vkDestroyPipeline(device, postCompositePipeline, null);
 

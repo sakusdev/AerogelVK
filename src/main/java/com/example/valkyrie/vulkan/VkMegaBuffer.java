@@ -35,6 +35,9 @@ public class VkMegaBuffer implements AutoCloseable {
     public static final int INDIRECT_CMD_SIZE_BYTES = 20; // VkDrawIndexedIndirectCommand
     public static final int MAX_QUADS = 1048576; // 1M quads
     public static final long STAGING_BUFFER_BYTES = 32L * 1024 * 1024; // 32 MB
+    public static final int ATLAS_UV_ENTRY_BYTES = 32; // vec2 uvMin, vec2 uvMax, vec4 tint (std430)
+    public static final int MAX_ATLAS_SPRITES = 65536;
+    private static final int COPY_BATCH_LIMIT = 512; // Keeps VkBufferCopy array well within LWJGL 64KB MemoryStack
 
     public static class AllocatedBuffer {
         public final long buffer;
@@ -69,10 +72,12 @@ public class VkMegaBuffer implements AutoCloseable {
     private AllocatedBuffer visibleChunkIdBuffer;
     private AllocatedBuffer globalQuadIndexBuffer;
     private AllocatedBuffer stagingBuffer;
+    private AllocatedBuffer atlasUvBuffer;
 
     // Persistent mapped pointers
     private ByteBuffer chunkMetaMapped;
     private ByteBuffer stagingMapped;
+    private ByteBuffer atlasUvMapped;
     private long stagingHead = 0;
 
     // Free-list vertex sub-allocator
@@ -83,6 +88,7 @@ public class VkMegaBuffer implements AutoCloseable {
     private final Map<Long, Integer> sectionKeyToSlot = new HashMap<>();
     private final Map<Integer, SectionAlloc> slotAllocations = new HashMap<>();
     private final BitSet freeSlots = new BitSet(MAX_CHUNKS);
+    private int highestUsedSlot = -1;
 
     // Pending GPU transfers
     private final List<PendingTransfer> pendingTransfers = new ArrayList<>();
@@ -159,7 +165,8 @@ public class VkMegaBuffer implements AutoCloseable {
         drawCountBuffer = createVmaBuffer(
                 vma,
                 4L,
-                VK10.VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK10.VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                        | VK10.VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                 Vma.VMA_MEMORY_USAGE_GPU_ONLY,
                 0
         );
@@ -188,6 +195,17 @@ public class VkMegaBuffer implements AutoCloseable {
         stagingMapped = mapBuffer(vma, stagingBuffer);
         stagingHead = 0;
 
+        // 8. Atlas UV Table SSBO (2 MB, Host Visible Coherent Mapped)
+        long atlasUvBytes = (long) MAX_ATLAS_SPRITES * ATLAS_UV_ENTRY_BYTES;
+        atlasUvBuffer = createVmaBuffer(
+                vma,
+                atlasUvBytes,
+                VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                Vma.VMA_MEMORY_USAGE_CPU_TO_GPU,
+                Vma.VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | Vma.VMA_ALLOCATION_CREATE_MAPPED_BIT
+        );
+        atlasUvMapped = mapBuffer(vma, atlasUvBuffer);
+
         initialized = true;
         LOGGER.info("[Valkyrie] VkMegaBuffer successfully initialized.");
     }
@@ -214,15 +232,15 @@ public class VkMegaBuffer implements AutoCloseable {
         ByteBuffer stagingMap = mapBuffer(vma, indexStaging);
         IntBuffer intBuf = stagingMap.asIntBuffer();
 
-        // Populate indices with pattern 0,1,2, 2,1,3 per quad
+        // Populate indices with consistent CCW pattern (0, 1, 2, 0, 2, 3) per quad
         // Quad q uses vertices 4*q + (0, 1, 2, 3)
         for (int q = 0; q < MAX_QUADS; q++) {
             int base = q * 4;
             intBuf.put(base + 0);
             intBuf.put(base + 1);
             intBuf.put(base + 2);
+            intBuf.put(base + 0);
             intBuf.put(base + 2);
-            intBuf.put(base + 1);
             intBuf.put(base + 3);
         }
 
@@ -276,6 +294,9 @@ public class VkMegaBuffer implements AutoCloseable {
             }
             freeSlots.clear(slot);
             sectionKeyToSlot.put(sectionKey, slot);
+            if (slot > highestUsedSlot) {
+                highestUsedSlot = slot;
+            }
         }
 
         // Empty section (no geometry)
@@ -296,10 +317,9 @@ public class VkMegaBuffer implements AutoCloseable {
 
         long byteSize = (long) vertexCount * 8L;
 
-        // Ensure staging ring buffer fit
+        // Ensure staging ring buffer fit; flush immediately if full within a single frame
         if (stagingHead + byteSize > STAGING_BUFFER_BYTES) {
-            // Wrap around ring buffer to 0
-            stagingHead = 0;
+            flushPendingTransfersNow();
         }
 
         long srcOffset = stagingHead;
@@ -335,7 +355,38 @@ public class VkMegaBuffer implements AutoCloseable {
             }
             writeChunkMeta(slot, 0, 0, 0, 0, 0, 0, 0);
             freeSlots.set(slot);
+            if (slot == highestUsedSlot) {
+                while (highestUsedSlot >= 0 && freeSlots.get(highestUsedSlot)) {
+                    highestUsedSlot--;
+                }
+            }
         }
+    }
+
+    /**
+     * Uploads the Atlas UV + tint table into the mapped AtlasUVSSBO.
+     */
+    public synchronized void uploadAtlasUvTable(ByteBuffer uvTableData) {
+        if (!initialized || atlasUvMapped == null || uvTableData == null) {
+            return;
+        }
+        ByteBuffer src = uvTableData.duplicate();
+        src.position(0);
+        int copyBytes = Math.min(src.remaining(), MAX_ATLAS_SPRITES * ATLAS_UV_ENTRY_BYTES);
+        src.limit(copyBytes);
+        atlasUvMapped.position(0);
+        atlasUvMapped.put(src);
+        atlasUvMapped.position(0);
+    }
+
+    private void flushPendingTransfersNow() {
+        if (!pendingTransfers.isEmpty()) {
+            VkContext ctx = VkContext.getInstance();
+            VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
+            recordPendingTransfers(cmd);
+            ctx.endSingleTimeCommands(cmd);
+        }
+        stagingHead = 0;
     }
 
     /**
@@ -343,23 +394,27 @@ public class VkMegaBuffer implements AutoCloseable {
      */
     public synchronized void recordPendingTransfers(VkCommandBuffer cmd) {
         if (!initialized || pendingTransfers.isEmpty()) {
+            stagingHead = 0;
             return;
         }
 
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            int count = pendingTransfers.size();
-            VkBufferCopy.Buffer copyRegions = VkBufferCopy.calloc(count, stack);
-
-            for (int i = 0; i < count; i++) {
-                PendingTransfer pt = pendingTransfers.get(i);
-                copyRegions.get(i)
-                        .srcOffset(pt.srcOffset)
-                        .dstOffset(pt.dstOffset)
-                        .size(pt.size);
+        int total = pendingTransfers.size();
+        for (int start = 0; start < total; start += COPY_BATCH_LIMIT) {
+            int batchCount = Math.min(COPY_BATCH_LIMIT, total - start);
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                VkBufferCopy.Buffer copyRegions = VkBufferCopy.calloc(batchCount, stack);
+                for (int i = 0; i < batchCount; i++) {
+                    PendingTransfer pt = pendingTransfers.get(start + i);
+                    copyRegions.get(i)
+                            .srcOffset(pt.srcOffset)
+                            .dstOffset(pt.dstOffset)
+                            .size(pt.size);
+                }
+                VK10.vkCmdCopyBuffer(cmd, stagingBuffer.buffer, megaVertexBuffer.buffer, copyRegions);
             }
+        }
 
-            VK10.vkCmdCopyBuffer(cmd, stagingBuffer.buffer, megaVertexBuffer.buffer, copyRegions);
-
+        try (MemoryStack stack = MemoryStack.stackPush()) {
             // Buffer memory barrier: transfer write -> shader read
             VkBufferMemoryBarrier.Buffer barrier = VkBufferMemoryBarrier.calloc(1, stack)
                     .sType(VK10.VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER)
@@ -383,6 +438,7 @@ public class VkMegaBuffer implements AutoCloseable {
         }
 
         pendingTransfers.clear();
+        stagingHead = 0;
     }
 
     private void writeChunkMeta(int slot, int x, int y, int z, int vertexOffset, int quadCount, int aabbPacked, int flags) {
@@ -505,8 +561,20 @@ public class VkMegaBuffer implements AutoCloseable {
         return stagingBuffer;
     }
 
+    public AllocatedBuffer getAtlasUvBuffer() {
+        return atlasUvBuffer;
+    }
+
     public synchronized int getActiveSectionCount() {
         return sectionKeyToSlot.size();
+    }
+
+    /**
+     * Returns the upper bound (exclusive) of allocated ChunkDrawMeta slots to dispatch
+     * in chunk_cull.comp, accounting for sparse freed slots.
+     */
+    public synchronized int getSlotDispatchLimit() {
+        return highestUsedSlot + 1;
     }
 
     public synchronized void clearAllSections() {
@@ -520,6 +588,8 @@ public class VkMegaBuffer implements AutoCloseable {
         }
         sectionKeyToSlot.clear();
         pendingTransfers.clear();
+        stagingHead = 0;
+        highestUsedSlot = -1;
     }
 
     public boolean isInitialized() {
@@ -541,6 +611,13 @@ public class VkMegaBuffer implements AutoCloseable {
         long vma = ctx.getVmaAllocator();
 
         if (vma != 0) {
+            if (atlasUvBuffer != null) {
+                Vma.vmaUnmapMemory(vma, atlasUvBuffer.allocation);
+                Vma.vmaDestroyBuffer(vma, atlasUvBuffer.buffer, atlasUvBuffer.allocation);
+                atlasUvBuffer = null;
+                atlasUvMapped = null;
+            }
+
             if (stagingBuffer != null) {
                 Vma.vmaUnmapMemory(vma, stagingBuffer.allocation);
                 Vma.vmaDestroyBuffer(vma, stagingBuffer.buffer, stagingBuffer.allocation);

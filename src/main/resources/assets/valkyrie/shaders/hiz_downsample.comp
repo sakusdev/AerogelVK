@@ -1,0 +1,56 @@
+#version 460
+
+// ValkyrieRender - Hi-Z Occlusion Pyramid Downsample Compute Shader (Reversed-Z)
+// Mip 0 copies from uDepthBuffer; Mip k > 0 takes min of 2x2 texels from Mip k-1.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 1, binding = 2) uniform sampler2D uDepthBuffer;
+layout(set = 1, binding = 3) uniform sampler2D uHiZPyramid;
+layout(set = 1, binding = 7, r32f) uniform writeonly image2D uHiZMips[16];
+
+layout(push_constant) uniform HiZPushConstants {
+    uint dstMip;
+    uint srcWidth;
+    uint srcHeight;
+    uint dstWidth;
+} pc;
+
+void main() {
+    ivec2 dstCoord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dstSize = imageSize(uHiZMips[pc.dstMip]);
+    if (dstCoord.x >= dstSize.x || dstCoord.y >= dstSize.y) {
+        return;
+    }
+
+    float minDepth;
+    if (pc.dstMip == 0u) {
+        minDepth = texelFetch(uDepthBuffer, dstCoord, 0).r;
+    } else {
+        int srcMip = int(pc.dstMip - 1u);
+        ivec2 srcBase = dstCoord * 2;
+        ivec2 maxSrc = ivec2(int(pc.srcWidth) - 1, int(pc.srcHeight) - 1);
+
+        float d00 = texelFetch(uHiZPyramid, clamp(srcBase + ivec2(0, 0), ivec2(0), maxSrc), srcMip).r;
+        float d10 = texelFetch(uHiZPyramid, clamp(srcBase + ivec2(1, 0), ivec2(0), maxSrc), srcMip).r;
+        float d01 = texelFetch(uHiZPyramid, clamp(srcBase + ivec2(0, 1), ivec2(0), maxSrc), srcMip).r;
+        float d11 = texelFetch(uHiZPyramid, clamp(srcBase + ivec2(1, 1), ivec2(0), maxSrc), srcMip).r;
+
+        // Reversed-Z conservative occluder depth is the minimum (furthest) depth in the 2x2 footprint
+        minDepth = min(min(d00, d10), min(d01, d11));
+
+        // Handle odd source dimensions conservatively by checking extra edge texel if present
+        if ((int(pc.srcWidth) & 1) != 0 && srcBase.x + 2 <= maxSrc.x) {
+            float dx0 = texelFetch(uHiZPyramid, clamp(srcBase + ivec2(2, 0), ivec2(0), maxSrc), srcMip).r;
+            float dx1 = texelFetch(uHiZPyramid, clamp(srcBase + ivec2(2, 1), ivec2(0), maxSrc), srcMip).r;
+            minDepth = min(minDepth, min(dx0, dx1));
+        }
+        if ((int(pc.srcHeight) & 1) != 0 && srcBase.y + 2 <= maxSrc.y) {
+            float dy0 = texelFetch(uHiZPyramid, clamp(srcBase + ivec2(0, 2), ivec2(0), maxSrc), srcMip).r;
+            float dy1 = texelFetch(uHiZPyramid, clamp(srcBase + ivec2(1, 2), ivec2(0), maxSrc), srcMip).r;
+            minDepth = min(minDepth, min(dy0, dy1));
+        }
+    }
+
+    imageStore(uHiZMips[pc.dstMip], dstCoord, vec4(minDepth, 0.0, 0.0, 0.0));
+}
