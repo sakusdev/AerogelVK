@@ -1,22 +1,23 @@
 {
   "schemaVersion": 1,
-  "id": "valkyrie",
+  "id": "aerogelvk",
   "version": "${version}",
-  "name": "ValkyrieRender",
+  "name": "AerogelVK",
   "description": "Vulkan GPU-Driven Voxel Deferred Renderer for Minecraft 1.21.1",
   "authors": [
-    "Valkyrie Team"
+    "sakus"
   ],
   "contact": {},
-  "license": "MIT",
+  "license": "LGPL-3.0-only",
+  "icon": "assets/aerogelvk/icon.png",
   "environment": "client",
   "entrypoints": {
     "client": [
-      "com.example.valkyrie.ValkyrieMod"
+      "org.sakus.aerogelvk.ValkyrieMod"
     ]
   },
   "mixins": [
-    "valkyrie.mixins.json"
+    "aerogelvk.mixins.json"
   ],
   "depends": {
     "fabricloader": ">=0.16.0",

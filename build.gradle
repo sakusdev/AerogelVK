@@ -145,10 +145,10 @@ sourceSets {
 
 loom {
     mods {
-        "valkyrie" {
+        "aerogelvk" {
             sourceSet sourceSets.main
         }
-        "valkyrie-smoke-test" {
+        "aerogelvk-smoke-test" {
             sourceSet sourceSets.testmod
         }
     }
@@ -162,10 +162,14 @@ loom {
     }
 }
 
+tasks.named('test', Test) {
+    failOnNoDiscoveredTests = false
+}
+
 tasks.register('verifyValkyrie', JavaExec) {
     group = 'verification'
     classpath = sourceSets.test.runtimeClasspath
-    mainClass = 'com.example.valkyrie.ValkyrieVerificationSuite'
+    mainClass = 'org.sakus.aerogelvk.ValkyrieVerificationSuite'
 }
 
 processResources {
@@ -260,7 +264,7 @@ tasks.register('runProdCompatSmokeClient', JavaExec) {
         }
 
         def modsCfg = configurations.detachedConfiguration(
-                ([dependencies.create("net.fabricmc.fabric-api:fabric-api:0.116.11+1.21.1")] +
+                ([dependencies.create("net.fabricmc.fabric-api:fabric-api:${project.fabric_version}")] +
                         prodModCoords.collect { coord ->
                             def d = dependencies.create(coord)
                             d.transitive = false
