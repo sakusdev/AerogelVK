@@ -432,6 +432,7 @@ public final class ShaderPackVerificationTest {
             shaderPackPipeline.updateBlockAtlas(atlasView, atlasSampler, null);
 
             int nonBlackPacks = 0;
+            Set<String> blackPackNames = new HashSet<>();
             for (Path srcPack : packsToRender) {
                 Path copiedPack = shaderpacksDir.resolve(srcPack.getFileName());
                 Files.copy(srcPack, copiedPack, StandardCopyOption.REPLACE_EXISTING);
@@ -483,6 +484,7 @@ public final class ShaderPackVerificationTest {
                 ByteBuffer mapped = MemoryUtil.memByteBuffer(ppMapped.get(0), totalReadbackBytes);
                 int drawCount = mapped.getInt(0);
                 int nonBlackPixels = 0;
+                double lumaSum = 0.0;
                 Set<Integer> distinctColors = new HashSet<>();
                 for (int i = 0; i < w * h; i++) {
                     int pxOff = colorOffset + i * 4;
@@ -493,8 +495,10 @@ public final class ShaderPackVerificationTest {
                     if (rgb != 0) {
                         nonBlackPixels++;
                     }
+                    lumaSum += 0.2126 * r + 0.7152 * g + 0.0722 * b;
                     distinctColors.add(rgb);
                 }
+                double avgLuma = lumaSum / (w * h);
                 int centerIdx = (32 * w + 32) * 4;
                 int cr = mapped.get(colorOffset + centerIdx) & 0xFF;
                 int cg = mapped.get(colorOffset + centerIdx + 1) & 0xFF;
@@ -508,15 +512,36 @@ public final class ShaderPackVerificationTest {
                 }
                 if (nonBlackPixels > 0) {
                     nonBlackPacks++;
+                } else {
+                    blackPackNames.add(copiedPack.getFileName().toString());
+                    traceBlackShaderPackPasses(
+                            ctx, device, shaderPackPipeline, offscreenColorImg, offscreenColorView, offscreenDepthImg,
+                            w, h, viewMatrix, glProj, camPos
+                    );
                 }
-                System.out.printf("  -> Live Vulkan 1.3 Shaderpack Render verified: %-42s [passes=%2d, drawCount=%d, nonBlack=%4d/%d, distinctColors=%4d, centerRGBA=(%3d,%3d,%3d,%3d), depth=%.4f]%n",
+                System.out.printf("  -> Live Vulkan 1.3 Shaderpack Render verified: %-42s [passes=%2d, drawCount=%d, nonBlack=%4d/%d, distinctColors=%4d, avgLuma=%.2f, centerRGBA=(%3d,%3d,%3d,%3d), depth=%.4f]%n",
                         copiedPack.getFileName(),
                         shaderPackPipeline.getCompiledPasses().size(),
-                        drawCount, nonBlackPixels, w * h, distinctColors.size(),
+                        drawCount, nonBlackPixels, w * h, distinctColors.size(), avgLuma,
                         cr, cg, cb, ca, centerDepth);
+
+                String packName = copiedPack.getFileName().toString();
+                int centerSum = cr + cg + cb;
+                if (packName.startsWith("Complementary")) {
+                    if (nonBlackPixels < 3500 || centerSum < 3 || avgLuma < 1.0) {
+                        throw new AssertionError("Regression in " + packName + ": nonBlack=" + nonBlackPixels
+                                + ", centerSum=" + centerSum + ", avgLuma=" + avgLuma);
+                    }
+                } else if (packName.startsWith("YoFPS")) {
+                    if (nonBlackPixels < 4000 || centerSum < 150 || avgLuma < 30.0) {
+                        throw new AssertionError("Regression in " + packName + ": nonBlack=" + nonBlackPixels
+                                + ", centerSum=" + centerSum + ", avgLuma=" + avgLuma);
+                    }
+                }
             }
-            if (nonBlackPacks == 0 || (packsToRender.size() >= 10 && nonBlackPacks < 10)) {
-                throw new AssertionError("Insufficient non-black shaderpack renders: " + nonBlackPacks + "/" + packsToRender.size());
+            if (nonBlackPacks != packsToRender.size()) {
+                throw new AssertionError("Black shaderpack renders detected (" + nonBlackPacks + "/" + packsToRender.size()
+                        + " non-black; black packs=" + blackPackNames + ")");
             }
 
             shaderPackPipeline.unloadPack();
@@ -524,7 +549,7 @@ public final class ShaderPackVerificationTest {
 
             benchmarkVulkan1280x720(
                     ctx, mega, shaderPackPipeline, tempGameDir, shaderpacksDir,
-                    packsToRender, camPos, target, viewMatrix
+                    packsToRender, blackPackNames, camPos, target, viewMatrix
             );
         } finally {
             ValkyrieConfig.get().disableShaderPack();
@@ -562,6 +587,7 @@ public final class ShaderPackVerificationTest {
             Path tempGameDir,
             Path shaderpacksDir,
             List<Path> packsToRender,
+            Set<String> blackPackNames,
             Vector3f camPos,
             Vector3f target,
             Matrix4f viewMatrix
@@ -592,6 +618,11 @@ public final class ShaderPackVerificationTest {
 
             shaderPackPipeline.resize(bw, bh);
             for (Path srcPack : packsToRender) {
+                String packFileName = srcPack.getFileName().toString();
+                if (blackPackNames.contains(packFileName)) {
+                    System.out.printf("  -> [1280x720 Vulkan GPU Benchmark] %-42s [SKIPPED: black frame 0/4096]%n", packFileName);
+                    continue;
+                }
                 Path copiedPack = shaderpacksDir.resolve(srcPack.getFileName());
                 if (!Files.exists(copiedPack)) {
                     Files.copy(srcPack, copiedPack, StandardCopyOption.REPLACE_EXISTING);
@@ -656,6 +687,157 @@ public final class ShaderPackVerificationTest {
                     .sorted(Comparator.comparing(p -> p.getFileName().toString()))
                     .toList();
         }
+    }
+
+    private static void traceBlackShaderPackPasses(
+            VkContext ctx,
+            VkDevice device,
+            VkShaderPackPipeline pipeline,
+            long offscreenColorImg,
+            long offscreenColorView,
+            long offscreenDepthImg,
+            int w,
+            int h,
+            Matrix4f viewMatrix,
+            Matrix4f glProj,
+            Vector3f camPos
+    ) {
+        final int maxPasses = 40;
+        final long maxBytesPerPass = (long) w * h * 8L;
+        final long totalTraceBytes = maxPasses * maxBytesPerPass;
+
+        record PassSnap(String name, long offset, int format, int bpp) {}
+        List<PassSnap> snaps = new ArrayList<>();
+
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkBufferCreateInfo bufInfo = VkBufferCreateInfo.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO)
+                    .size(totalTraceBytes)
+                    .usage(VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            LongBuffer pBuf = stack.mallocLong(1);
+            if (vkCreateBuffer(device, bufInfo, null, pBuf) != VK_SUCCESS) return;
+            long traceBuf = pBuf.get(0);
+
+            VkMemoryRequirements reqs = VkMemoryRequirements.malloc(stack);
+            vkGetBufferMemoryRequirements(device, traceBuf, reqs);
+            VkMemoryAllocateInfo allocInfo = VkMemoryAllocateInfo.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO)
+                    .allocationSize(reqs.size())
+                    .memoryTypeIndex(ctx.findMemoryType(reqs.memoryTypeBits(),
+                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT));
+            LongBuffer pMem = stack.mallocLong(1);
+            if (vkAllocateMemory(device, allocInfo, null, pMem) != VK_SUCCESS) {
+                vkDestroyBuffer(device, traceBuf, null);
+                return;
+            }
+            long traceMem = pMem.get(0);
+            vkBindBufferMemory(device, traceBuf, traceMem, 0);
+
+            final long[] cursor = {0L};
+            pipeline.setPassTraceListener((cmd, s, passName, img, fmt) -> {
+                if (snaps.size() >= maxPasses || img == VK_NULL_HANDLE) return;
+                int bpp = (fmt == VK_FORMAT_R16G16B16A16_SFLOAT) ? 8 : 4;
+                long off = cursor[0];
+                cursor[0] += (long) w * h * bpp;
+
+                VkShaderPackTargets.recordImageBarrier(cmd, img,
+                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1,
+                        VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, s);
+
+                VkBufferImageCopy.Buffer copy = VkBufferImageCopy.calloc(1, s)
+                        .bufferOffset(off).bufferRowLength(0).bufferImageHeight(0);
+                copy.imageSubresource().aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1);
+                copy.imageExtent().set(w, h, 1);
+                vkCmdCopyImageToBuffer(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, traceBuf, copy);
+
+                VkShaderPackTargets.recordImageBarrier(cmd, img,
+                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1,
+                        VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, s);
+
+                snaps.add(new PassSnap(passName, off, fmt, bpp));
+            });
+
+            try {
+                VkShaderPackPipeline.FrameParams params = new VkShaderPackPipeline.FrameParams();
+                params.viewMatrix.set(viewMatrix);
+                params.projMatrix.set(glProj);
+                params.cameraPos.set(camPos);
+                params.sunDirection.set(0.4f, 0.85f, 0.35f).normalize();
+                params.frameCounter = 1;
+                params.frameTime = 1.0f / 60.0f;
+                params.frameTimeCounter = 1.0f / 60.0f;
+
+                VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
+                pipeline.recordFrame(cmd, offscreenColorImg, offscreenColorView, offscreenDepthImg, w, h, params);
+                ctx.endSingleTimeCommands(cmd);
+
+                PointerBuffer ppMapped = stack.mallocPointer(1);
+                vkMapMemory(device, traceMem, 0, totalTraceBytes, 0, ppMapped);
+                ByteBuffer mapped = MemoryUtil.memByteBuffer(ppMapped.get(0), (int) totalTraceBytes);
+                System.out.println("  -> [PassTrace colortex0] Pack=" + pipeline.getActivePackName());
+                for (PassSnap snap : snaps) {
+                    int nonBlack = 0;
+                    Set<Integer> distinct = new HashSet<>();
+                    int centerR = 0, centerG = 0, centerB = 0;
+                    int centerIdx = 32 * w + 32;
+                    for (int i = 0; i < w * h; i++) {
+                        int off = (int) (snap.offset + (long) i * snap.bpp);
+                        int r, g, b;
+                        if (snap.format == VK_FORMAT_R16G16B16A16_SFLOAT) {
+                            float rf = halfToFloat(mapped.getShort(off));
+                            float gf = halfToFloat(mapped.getShort(off + 2));
+                            float bf = halfToFloat(mapped.getShort(off + 4));
+                            r = Math.max(0, Math.min(255, Math.round(rf * 255.0f)));
+                            g = Math.max(0, Math.min(255, Math.round(gf * 255.0f)));
+                            b = Math.max(0, Math.min(255, Math.round(bf * 255.0f)));
+                        } else {
+                            r = mapped.get(off) & 0xFF;
+                            g = mapped.get(off + 1) & 0xFF;
+                            b = mapped.get(off + 2) & 0xFF;
+                        }
+                        int rgb = (r << 16) | (g << 8) | b;
+                        if (rgb != 0) nonBlack++;
+                        distinct.add(rgb);
+                        if (i == centerIdx) {
+                            centerR = r;
+                            centerG = g;
+                            centerB = b;
+                        }
+                    }
+                    System.out.printf("     [pass=%-18s] nonBlack=%4d/%d, distinct=%4d, centerRGB=(%3d,%3d,%3d)%n",
+                            snap.name, nonBlack, w * h, distinct.size(), centerR, centerG, centerB);
+                }
+                vkUnmapMemory(device, traceMem);
+            } finally {
+                pipeline.setPassTraceListener(null);
+                vkDestroyBuffer(device, traceBuf, null);
+                vkFreeMemory(device, traceMem, null);
+            }
+        }
+    }
+
+    private static float halfToFloat(short hbits) {
+        int mant = hbits & 0x03FF;
+        int exp = hbits & 0x7C00;
+        if (exp == 0x7C00) exp = 0x3FC00;
+        else if (exp != 0) {
+            exp += 0x1C000;
+            if (mant == 0 && exp > 0x1C400) return Float.intBitsToFloat(((hbits & 0x8000) << 16) | (exp << 13));
+        } else if (mant != 0) {
+            exp = 0x1C400;
+            do {
+                mant <<= 1;
+                exp -= 0x400;
+            } while ((mant & 0x400) == 0);
+            mant &= 0x3FF;
+        }
+        return Float.intBitsToFloat(((hbits & 0x8000) << 16) | ((exp | mant) << 13));
     }
 
     private static Path pickPreferredPack(List<Path> packs, String preferredFileName) {

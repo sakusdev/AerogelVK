@@ -226,7 +226,7 @@ public final class GlslToVulkanTranspiler {
         derived.put("rainFactor", "vk_ubo.rainStrength");
         derived.put("inDry", "(1.0 - vk_ubo.rainStrength)");
         derived.put("inRainy", "vk_ubo.rainStrength");
-        derived.put("darknessLightFactor", "(1.0 - clamp(vk_ubo.darknessFactor, 0.0, 1.0))");
+        derived.put("darknessLightFactor", "clamp(vk_ubo.darknessFactor, 0.0, 1.0)");
         derived.put("maxBlindnessDarkness", "max(vk_ubo.blindness, vk_ubo.darknessFactor)");
         derived.put("effectFactor", "max(vk_ubo.blindness, vk_ubo.darknessFactor)");
         derived.put("blindFactor", "(clamp(vk_ubo.blindness * 2.0 - 1.0, 0.0, 1.0) * clamp(vk_ubo.blindness * 2.0 - 1.0, 0.0, 1.0))");

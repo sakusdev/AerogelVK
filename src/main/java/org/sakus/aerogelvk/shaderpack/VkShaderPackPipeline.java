@@ -296,6 +296,23 @@ public class VkShaderPackPipeline implements AutoCloseable {
     private ShaderPackProperties activeProperties = ShaderPackProperties.empty();
     private boolean initialized = false;
     private boolean packReady = false;
+    private PassTraceListener passTraceListener;
+
+    @FunctionalInterface
+    public interface PassTraceListener {
+        void onPassRecorded(VkCommandBuffer cmd, MemoryStack stack, String passName, long colortex0Image, int colortex0Format);
+    }
+
+    public void setPassTraceListener(PassTraceListener listener) {
+        this.passTraceListener = listener;
+    }
+
+    private void notifyPassTrace(VkCommandBuffer cmd, MemoryStack stack, String passName) {
+        PassTraceListener listener = this.passTraceListener;
+        if (listener != null && targets != null) {
+            listener.onPassRecorded(cmd, stack, passName, targets.getColorReadImage(0), targets.getColorFormat(0));
+        }
+    }
 
     public VkShaderPackPipeline() {
         this(VkContext.getInstance(), VkMegaBuffer.getInstance(), new VkShaderPackTargets());
@@ -825,6 +842,7 @@ public class VkShaderPackPipeline implements AutoCloseable {
                 }
                 long set1 = updateDescriptorSet1ForCurrentState(passSetSlot++);
                 recordFullscreenColorPass(cmd, stack, pass, set1, width, height);
+                notifyPassTrace(cmd, stack, pass.getName());
             }
 
             boolean hasWaterPass = (gbuffersWaterPass != null && gbuffersWaterPass.getPipeline() != VK_NULL_HANDLE);
@@ -842,6 +860,7 @@ public class VkShaderPackPipeline implements AutoCloseable {
                 dispatchShaderPackCull(cmd, stack, slotLimit, hasWaterPass ? 1 : 0);
                 long set1 = updateDescriptorSet1ForCurrentState(passSetSlot++);
                 recordGeometryPass(cmd, stack, gbuffersTerrainPass, set1, maxDrawCount, width, height, false);
+                notifyPassTrace(cmd, stack, "gbuffers_terrain");
             }
 
             // Copy solid terrain depth depthtex0 -> depthtex1 and depthtex2
@@ -853,6 +872,7 @@ public class VkShaderPackPipeline implements AutoCloseable {
                 dispatchShaderPackCull(cmd, stack, slotLimit, 2);
                 long set1 = updateDescriptorSet1ForCurrentState(passSetSlot++);
                 recordGeometryPass(cmd, stack, gbuffersWaterPass, set1, maxDrawCount, width, height, true);
+                notifyPassTrace(cmd, stack, "gbuffers_water");
             }
 
             // 6. Deferred fullscreen passes (deferred, deferred1..15)
@@ -862,6 +882,7 @@ public class VkShaderPackPipeline implements AutoCloseable {
                 }
                 long set1 = updateDescriptorSet1ForCurrentState(passSetSlot++);
                 recordFullscreenColorPass(cmd, stack, pass, set1, width, height);
+                notifyPassTrace(cmd, stack, pass.getName());
             }
 
             // 7. Composite fullscreen passes (composite, composite1..15)
@@ -871,6 +892,7 @@ public class VkShaderPackPipeline implements AutoCloseable {
                 }
                 long set1 = updateDescriptorSet1ForCurrentState(passSetSlot++);
                 recordFullscreenColorPass(cmd, stack, pass, set1, width, height);
+                notifyPassTrace(cmd, stack, pass.getName());
             }
 
             // 8. Final fullscreen pass -> writes directly into sharedColorImageView
