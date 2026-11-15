@@ -511,9 +511,17 @@ public final class VkPipelineManager implements AutoCloseable {
         long fragModule = VkShaderCompiler.compileResourceToModule(device, "/assets/aerogelvk/shaders/gbuffer.frag", VkShaderCompiler.STAGE_FRAGMENT);
 
         try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkSpecializationMapEntry.Buffer specEntries = VkSpecializationMapEntry.calloc(1, stack);
+            specEntries.get(0).constantID(0).offset(0).size(4);
+            ByteBuffer specData = stack.malloc(4);
+            specData.putInt(0, translucent ? 1 : 0);
+            VkSpecializationInfo fragSpecInfo = VkSpecializationInfo.calloc(stack)
+                    .pMapEntries(specEntries)
+                    .pData(specData);
+
             VkPipelineShaderStageCreateInfo.Buffer stages = VkPipelineShaderStageCreateInfo.calloc(2, stack);
             stages.get(0).sType(VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO).stage(VK_SHADER_STAGE_VERTEX_BIT).module(vertModule).pName(stack.UTF8("main"));
-            stages.get(1).sType(VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO).stage(VK_SHADER_STAGE_FRAGMENT_BIT).module(fragModule).pName(stack.UTF8("main"));
+            stages.get(1).sType(VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO).stage(VK_SHADER_STAGE_FRAGMENT_BIT).module(fragModule).pName(stack.UTF8("main")).pSpecializationInfo(fragSpecInfo);
 
             VkPipelineVertexInputStateCreateInfo vertexInput = VkPipelineVertexInputStateCreateInfo.calloc(stack)
                     .sType(VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO);

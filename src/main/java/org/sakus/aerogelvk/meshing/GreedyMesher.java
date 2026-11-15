@@ -393,8 +393,11 @@ public final class GreedyMesher {
         if (state.getBlock() == Blocks.GLASS) {
             return false; // Clear glass is binary alpha-cutout, not alpha-blended translucent
         }
-        return !state.getFluidState().isEmpty()
-                || state.getBlock() instanceof net.minecraft.world.level.block.TransparentBlock;
+        if (!state.getFluidState().isEmpty()) {
+            // Lava is opaque; water (and other non-lava fluids) are alpha-blended translucent
+            return !state.getFluidState().is(net.minecraft.tags.FluidTags.LAVA);
+        }
+        return state.getBlock() instanceof net.minecraft.world.level.block.TransparentBlock;
     }
 
     private static boolean isFullBoxShape(VoxelShape shape) {
@@ -459,8 +462,9 @@ public final class GreedyMesher {
                     if (isEntityAtlasBlock(state)) continue;
                     if (isOpaqueFullCube(state)) continue;
 
-                    VoxelShape shape = state.getShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
-                    if (!usesShapeOrModelPass(state, shape)) continue;
+                    boolean isFluid = !state.getFluidState().isEmpty();
+                    VoxelShape shape = isFluid ? null : state.getShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
+                    if (!isFluid && !usesShapeOrModelPass(state, shape)) continue;
 
                     boolean translucent = isTranslucentState(state);
                     if (translucent) hasTranslucent = true;
@@ -471,7 +475,9 @@ public final class GreedyMesher {
                     boolean wind = atlas.isWindWaving(state);
 
                     List<Long> targetVerts = translucent ? halfTranslucentVertices : halfOpaqueVertices;
-                    int added = emitShapeOrModelQuads(targetVerts, blocks, shape, x, y, z, state, tintRgb, bl, sl, mat, wind, atlas);
+                    int added = isFluid
+                            ? emitFluidQuads(targetVerts, blocks, x, y, z, state, tintRgb, bl, sl, mat, wind, atlas)
+                            : emitShapeOrModelQuads(targetVerts, blocks, shape, x, y, z, state, tintRgb, bl, sl, mat, wind, atlas);
                     if (added > 0) {
                         if (translucent) {
                             halfTranslucentQuadCount += added;
@@ -533,6 +539,9 @@ public final class GreedyMesher {
                         }
                         if (isEntityAtlasBlock(state)) {
                             continue; // Rendered by vanilla BlockEntityRenderer using entity atlas
+                        }
+                        if (!state.getFluidState().isEmpty()) {
+                            continue; // Already emitted by fluid pass in halfScale buffers
                         }
                         if (!isOpaqueFullCube(state)) {
                             VoxelShape shape = state.getShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
@@ -734,6 +743,154 @@ public final class GreedyMesher {
         } catch (Throwable ignored) {
             return null;
         }
+    }
+
+    private static boolean isSameFluid(BlockState[] blocks, int x, int y, int z,
+                                       net.minecraft.world.level.material.Fluid fluidType) {
+        if (x < -1 || x > 16 || y < -1 || y > 16 || z < -1 || z > 16) {
+            return false;
+        }
+        int idx = ((y + 1) * HALO_SIZE + (z + 1)) * HALO_SIZE + (x + 1);
+        BlockState neighbor = blocks[idx];
+        return neighbor != null && !neighbor.getFluidState().isEmpty()
+                && neighbor.getFluidState().getType().isSame(fluidType);
+    }
+
+    private static float computeFluidCornerHeight(BlockState[] blocks, int bx, int by, int bz,
+                                                  int cx, int cz,
+                                                  net.minecraft.world.level.material.Fluid fluidType) {
+        float sum = 0.0f;
+        int weight = 0;
+        for (int dz = -1; dz <= 0; dz++) {
+            for (int dx = -1; dx <= 0; dx++) {
+                int sx = bx + cx + dx;
+                int sz = bz + cz + dz;
+                if (isSameFluid(blocks, sx, by + 1, sz, fluidType)) {
+                    return 1.0f;
+                }
+                if (sx < -1 || sx > 16 || sz < -1 || sz > 16) {
+                    continue;
+                }
+                int idx = ((by + 1) * HALO_SIZE + (sz + 1)) * HALO_SIZE + (sx + 1);
+                BlockState b = blocks[idx];
+                if (b == null) {
+                    weight++;
+                    continue;
+                }
+                net.minecraft.world.level.material.FluidState fs = b.getFluidState();
+                if (!fs.isEmpty() && fs.getType().isSame(fluidType)) {
+                    if (fs.isSource()) {
+                        return 8.0f / 9.0f;
+                    }
+                    sum += fs.getOwnHeight();
+                    weight++;
+                } else if (!isOpaqueFullCube(b)) {
+                    weight++;
+                }
+            }
+        }
+        return (weight > 0) ? (sum / weight) : (8.0f / 9.0f);
+    }
+
+    private static void emitFluidQuad(List<Long> out, int baseX16, int baseY16, int baseZ16,
+                                      int dir, int bl, int sl, int mat, boolean wind, int spriteId,
+                                      int[][] verts256) {
+        for (int v = 0; v < 4; v++) {
+            int px = verts256[v][0];
+            int py = verts256[v][1];
+            int pz = verts256[v][2];
+            int u16 = verts256[v][3];
+            int v16 = verts256[v][4];
+            out.add(VkShapeVertex.packWord0(
+                    baseX16 + (px >> 4), baseY16 + (py >> 4), baseZ16 + (pz >> 4),
+                    dir, 3, bl, sl, mat, wind, u16, v16
+            ));
+            out.add(VkShapeVertex.packWord1(spriteId, px & 0xF, py & 0xF, pz & 0xF));
+        }
+    }
+
+    private static int emitFluidQuads(List<Long> out, BlockState[] blocks, int bx, int by, int bz,
+                                      BlockState state, int tintRgb, int bl, int sl, int mat, boolean wind,
+                                      AtlasUVTable atlas) {
+        net.minecraft.world.level.material.Fluid fluidType = state.getFluidState().getType();
+        boolean sameUp = isSameFluid(blocks, bx, by + 1, bz, fluidType);
+        boolean sameDown = isSameFluid(blocks, bx, by - 1, bz, fluidType);
+        boolean samePosX = isSameFluid(blocks, bx + 1, by, bz, fluidType);
+        boolean sameNegX = isSameFluid(blocks, bx - 1, by, bz, fluidType);
+        boolean samePosZ = isSameFluid(blocks, bx, by, bz + 1, fluidType);
+        boolean sameNegZ = isSameFluid(blocks, bx, by, bz - 1, fluidType);
+
+        int y00 = sameUp ? 256 : clamp256(computeFluidCornerHeight(blocks, bx, by, bz, 0, 0, fluidType));
+        int y10 = sameUp ? 256 : clamp256(computeFluidCornerHeight(blocks, bx, by, bz, 1, 0, fluidType));
+        int y01 = sameUp ? 256 : clamp256(computeFluidCornerHeight(blocks, bx, by, bz, 0, 1, fluidType));
+        int y11 = sameUp ? 256 : clamp256(computeFluidCornerHeight(blocks, bx, by, bz, 1, 1, fluidType));
+
+        int baseX16 = bx * 16;
+        int baseY16 = by * 16;
+        int baseZ16 = bz * 16;
+        int quads = 0;
+
+        if (!sameUp) {
+            int spriteId = atlas.getSpriteId(state, 2, tintRgb);
+            emitFluidQuad(out, baseX16, baseY16, baseZ16, 2, bl, sl, mat, wind, spriteId, new int[][]{
+                    {0, y01, 256, 0, 16},
+                    {256, y11, 256, 16, 16},
+                    {256, y10, 0, 16, 0},
+                    {0, y00, 0, 0, 0}
+            });
+            quads++;
+        }
+        if (!sameDown && !isSolidAt(blocks, bx, by - 1, bz)) {
+            int spriteId = atlas.getSpriteId(state, 3, tintRgb);
+            emitFluidQuad(out, baseX16, baseY16, baseZ16, 3, bl, sl, mat, wind, spriteId, new int[][]{
+                    {0, 0, 0, 0, 16},
+                    {256, 0, 0, 16, 16},
+                    {256, 0, 256, 16, 0},
+                    {0, 0, 256, 0, 0}
+            });
+            quads++;
+        }
+        if (!samePosX && !isSolidAt(blocks, bx + 1, by, bz)) {
+            int spriteId = atlas.getSpriteId(state, 0, tintRgb);
+            emitFluidQuad(out, baseX16, baseY16, baseZ16, 0, bl, sl, mat, wind, spriteId, new int[][]{
+                    {256, 0, 256, 0, 16},
+                    {256, 0, 0, 16, 16},
+                    {256, y10, 0, 16, 16 - (y10 >> 4)},
+                    {256, y11, 256, 0, 16 - (y11 >> 4)}
+            });
+            quads++;
+        }
+        if (!sameNegX && !isSolidAt(blocks, bx - 1, by, bz)) {
+            int spriteId = atlas.getSpriteId(state, 1, tintRgb);
+            emitFluidQuad(out, baseX16, baseY16, baseZ16, 1, bl, sl, mat, wind, spriteId, new int[][]{
+                    {0, 0, 0, 0, 16},
+                    {0, 0, 256, 16, 16},
+                    {0, y01, 256, 16, 16 - (y01 >> 4)},
+                    {0, y00, 0, 0, 16 - (y00 >> 4)}
+            });
+            quads++;
+        }
+        if (!samePosZ && !isSolidAt(blocks, bx, by, bz + 1)) {
+            int spriteId = atlas.getSpriteId(state, 4, tintRgb);
+            emitFluidQuad(out, baseX16, baseY16, baseZ16, 4, bl, sl, mat, wind, spriteId, new int[][]{
+                    {0, 0, 256, 0, 16},
+                    {256, 0, 256, 16, 16},
+                    {256, y11, 256, 16, 16 - (y11 >> 4)},
+                    {0, y01, 256, 0, 16 - (y01 >> 4)}
+            });
+            quads++;
+        }
+        if (!sameNegZ && !isSolidAt(blocks, bx, by, bz - 1)) {
+            int spriteId = atlas.getSpriteId(state, 5, tintRgb);
+            emitFluidQuad(out, baseX16, baseY16, baseZ16, 5, bl, sl, mat, wind, spriteId, new int[][]{
+                    {256, 0, 0, 0, 16},
+                    {0, 0, 0, 16, 16},
+                    {0, y00, 0, 16, 16 - (y00 >> 4)},
+                    {256, y10, 0, 0, 16 - (y10 >> 4)}
+            });
+            quads++;
+        }
+        return quads;
     }
 
     private static int emitShapeOrModelQuads(List<Long> out, BlockState[] blocks, VoxelShape shape, int bx, int by, int bz,

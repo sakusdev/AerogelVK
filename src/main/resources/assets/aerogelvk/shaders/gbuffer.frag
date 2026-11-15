@@ -1,5 +1,7 @@
 #version 460
 
+layout(constant_id = 0) const uint IS_TRANSLUCENT = 0u;
+
 // ValkyrieRender - Phase 4 G-Buffer Fragment Shader
 // Outputs RT0 (Albedo + Packed Material/Roughness) and RT1 (Octahedral Normal + Packed Light/AO/Emissive).
 
@@ -80,23 +82,29 @@ void main() {
         default: roughness4 = 13u; break; // Matte
     }
 
-    // Pack material mask (4 bits) and roughness (4 bits) into 8-bit alpha channel
+    // Pack material mask (4 bits) and roughness (4 bits) into 8-bit alpha channel for opaque pass.
+    // Translucent pass uses RT0 alpha blending (SRC_ALPHA / ONE_MINUS_SRC_ALPHA), so output texture alpha
+    // and store translucent/water flags in outRT1.g bits 10..11.
     uint packedMatRough = ((vMaterialMask & 0xFu) << 4) | (roughness4 & 0xFu);
-    float alphaOut = float(packedMatRough) / 255.0;
+    float alphaOut = (IS_TRANSLUCENT != 0u) ? albedo.a : (float(packedMatRough) / 255.0);
     outRT0 = vec4(albedo.rgb, alphaOut);
 
     // Normal encoding (16-bit Octahedral)
     uint packedNormal = encodeOctNormal16(vWorldNormal);
 
-    // Pack light levels: blockLight(4), skyLight(4), ao(4), emissive(4)
+    // Pack light levels: blockLight(4), skyLight(4), ao(2), translucentFlags(2), emissive(4)
     uint bl = uint(clamp(vLightAO.x + 0.5, 0.0, 15.0));
     uint sl = uint(clamp(vLightAO.y + 0.5, 0.0, 15.0));
     uint ao = uint(clamp(vLightAO.z + 0.5, 0.0, 3.0));
+    uint translucentFlags = (IS_TRANSLUCENT != 0u)
+                          ? ((vMaterialMask == 1u) ? 0x3u : 0x2u)
+                          : 0u;
     uint emissive = (vMaterialMask == 3u) ? 15u : 0u;
 
     uint packedLight = (bl & 0xFu)
                      | ((sl & 0xFu) << 4)
-                     | ((ao & 0xFu) << 8)
+                     | ((ao & 0x3u) << 8)
+                     | ((translucentFlags & 0x3u) << 10)
                      | ((emissive & 0xFu) << 12);
 
     outRT1 = uvec2(packedNormal, packedLight);
