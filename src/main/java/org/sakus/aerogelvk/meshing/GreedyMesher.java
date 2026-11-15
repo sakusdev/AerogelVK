@@ -16,6 +16,8 @@ import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.lighting.LayerLightEventListener;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.shapes.VoxelShape;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -26,6 +28,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public final class GreedyMesher {
+    private static final Logger LOGGER = LoggerFactory.getLogger(GreedyMesher.class);
+    private static final int SHAPE_BOX_WARN_CAP = 64;
     public static final int SECTION_SIZE = 16;
     public static final int HALO_SIZE = 18;
 
@@ -257,6 +261,9 @@ public final class GreedyMesher {
     }
     
     private static boolean isTranslucentState(BlockState state) {
+        if (state.getBlock() == Blocks.GLASS) {
+            return false; // Clear glass is binary alpha-cutout, not alpha-blended translucent
+        }
         return !state.getFluidState().isEmpty()
                 || state.getBlock() instanceof net.minecraft.world.level.block.TransparentBlock;
     }
@@ -323,7 +330,7 @@ public final class GreedyMesher {
                     boolean wind = atlas.isWindWaving(state);
 
                     List<Long> targetVerts = translucent ? halfTranslucentVertices : halfOpaqueVertices;
-                    int added = emitShapeBoxes(targetVerts, shape, x, y, z, state, tintRgb, bl, sl, mat, wind, atlas);
+                    int added = emitShapeBoxes(targetVerts, blocks, shape, x, y, z, state, tintRgb, bl, sl, mat, wind, atlas);
                     if (added > 0) {
                         if (translucent) {
                             halfTranslucentQuadCount += added;
@@ -551,38 +558,150 @@ public final class GreedyMesher {
         return arr;
     }
 
-    private static int emitShapeBoxes(List<Long> out, VoxelShape shape, int bx, int by, int bz,
+    private static int clamp16(double v) {
+        int q = (int) Math.round(v * 16.0);
+        return Math.max(0, Math.min(16, q));
+    }
+
+    private static int emitShapeBoxes(List<Long> out, BlockState[] blocks, VoxelShape shape, int bx, int by, int bz,
                                       BlockState state, int tintRgb, int bl, int sl, int mat, boolean wind,
                                       AtlasUVTable atlas) {
-        int quads = 0;
         List<AABB> boxes = shape.toAabbs();
-        int maxBoxes = Math.min(boxes.size(), 6);
-        for (int bi = 0; bi < maxBoxes; bi++) {
-            AABB box = boxes.get(bi);
-            int x0 = bx * 2 + Math.max(0, Math.min(2, Math.round((float) box.minX * 2.0f)));
-            int x1 = bx * 2 + Math.max(0, Math.min(2, Math.round((float) box.maxX * 2.0f)));
-            int y0 = by * 2 + Math.max(0, Math.min(2, Math.round((float) box.minY * 2.0f)));
-            int y1 = by * 2 + Math.max(0, Math.min(2, Math.round((float) box.maxY * 2.0f)));
-            int z0 = bz * 2 + Math.max(0, Math.min(2, Math.round((float) box.minZ * 2.0f)));
-            int z1 = bz * 2 + Math.max(0, Math.min(2, Math.round((float) box.maxZ * 2.0f)));
-            if (x1 == x0) { if (x0 < bx * 2 + 2) x1 = x0 + 1; else x0 = x1 - 1; }
-            if (y1 == y0) { if (y0 < by * 2 + 2) y1 = y0 + 1; else y0 = y1 - 1; }
-            if (z1 == z0) { if (z0 < bz * 2 + 2) z1 = z0 + 1; else z0 = z1 - 1; }
+        int boxCount = boxes.size();
+        if (boxCount == 0) {
+            return 0;
+        }
+        if (boxCount > SHAPE_BOX_WARN_CAP) {
+            LOGGER.warn("[Valkyrie] Shape block {} at section-local ({}, {}, {}) has {} AABBs (exceeds soft cap {}); emitting all without truncation.",
+                    state.getBlock(), bx, by, bz, boxCount, SHAPE_BOX_WARN_CAP);
+        }
 
-            // Emit 6 faces of quantized half-scale box (coords in 0..32)
+        // Quantize all boxes to 1/16 block grid [0..16]
+        int[] qx0 = new int[boxCount];
+        int[] qy0 = new int[boxCount];
+        int[] qz0 = new int[boxCount];
+        int[] qx1 = new int[boxCount];
+        int[] qy1 = new int[boxCount];
+        int[] qz1 = new int[boxCount];
+        boolean[] valid = new boolean[boxCount];
+        for (int i = 0; i < boxCount; i++) {
+            AABB box = boxes.get(i);
+            qx0[i] = clamp16(box.minX);
+            qx1[i] = clamp16(box.maxX);
+            qy0[i] = clamp16(box.minY);
+            qy1[i] = clamp16(box.maxY);
+            qz0[i] = clamp16(box.minZ);
+            qz1[i] = clamp16(box.maxZ);
+            valid[i] = qx0[i] < qx1[i] && qy0[i] < qy1[i] && qz0[i] < qz1[i];
+        }
+
+        // Precompute neighbor opaque full-cube occlusion on the 6 block boundaries
+        boolean[] neighborOpaque = {
+                isSolidAt(blocks, bx + 1, by, bz),
+                isSolidAt(blocks, bx - 1, by, bz),
+                isSolidAt(blocks, bx, by + 1, bz),
+                isSolidAt(blocks, bx, by - 1, bz),
+                isSolidAt(blocks, bx, by, bz + 1),
+                isSolidAt(blocks, bx, by, bz - 1)
+        };
+        int[] aoBuf = new int[4];
+        int baseX16 = bx * 16;
+        int baseY16 = by * 16;
+        int baseZ16 = bz * 16;
+
+        int quads = 0;
+        for (int i = 0; i < boxCount; i++) {
+            if (!valid[i]) continue;
+            int x0 = qx0[i], y0 = qy0[i], z0 = qz0[i];
+            int x1 = qx1[i], y1 = qy1[i], z1 = qz1[i];
+
             for (int dir = 0; dir < 6; dir++) {
-                int spriteId = atlas.getSpriteId(state, dir, tintRgb);
-                int[][] c;
-                switch (dir) {
-                    case 0 -> c = new int[][]{{x1, y0, z0, 3}, {x1, y1, z0, 0}, {x1, y1, z1, 1}, {x1, y0, z1, 2}}; // +X
-                    case 1 -> c = new int[][]{{x0, y0, z0, 3}, {x0, y0, z1, 2}, {x0, y1, z1, 1}, {x0, y1, z0, 0}}; // -X
-                    case 2 -> c = new int[][]{{x0, y1, z0, 3}, {x0, y1, z1, 0}, {x1, y1, z1, 1}, {x1, y1, z0, 2}}; // +Y
-                    case 3 -> c = new int[][]{{x0, y0, z0, 3}, {x1, y0, z0, 2}, {x1, y0, z1, 1}, {x0, y0, z1, 0}}; // -Y
-                    case 4 -> c = new int[][]{{x0, y0, z1, 3}, {x1, y0, z1, 2}, {x1, y1, z1, 1}, {x0, y1, z1, 0}}; // +Z
-                    default -> c = new int[][]{{x0, y0, z0, 3}, {x0, y1, z0, 0}, {x1, y1, z0, 1}, {x1, y0, z0, 2}}; // -Z
+                // 1. Cull faces flush with an adjacent opaque full cube
+                boolean onOuterBoundary = switch (dir) {
+                    case 0 -> x1 == 16;
+                    case 1 -> x0 == 0;
+                    case 2 -> y1 == 16;
+                    case 3 -> y0 == 0;
+                    case 4 -> z1 == 16;
+                    default -> z0 == 0;
+                };
+                if (onOuterBoundary && neighborOpaque[dir]) {
+                    continue;
                 }
+
+                // 2. Cull internal faces completely covered by another box of the same block
+                boolean internalOccluded = false;
+                for (int j = 0; j < boxCount; j++) {
+                    if (j == i || !valid[j]) continue;
+                    switch (dir) {
+                        case 0 -> internalOccluded = qx0[j] <= x1 && qx1[j] > x1 && qy0[j] <= y0 && qy1[j] >= y1 && qz0[j] <= z0 && qz1[j] >= z1;
+                        case 1 -> internalOccluded = qx1[j] >= x0 && qx0[j] < x0 && qy0[j] <= y0 && qy1[j] >= y1 && qz0[j] <= z0 && qz1[j] >= z1;
+                        case 2 -> internalOccluded = qy0[j] <= y1 && qy1[j] > y1 && qx0[j] <= x0 && qx1[j] >= x1 && qz0[j] <= z0 && qz1[j] >= z1;
+                        case 3 -> internalOccluded = qy1[j] >= y0 && qy0[j] < y0 && qx0[j] <= x0 && qx1[j] >= x1 && qz0[j] <= z0 && qz1[j] >= z1;
+                        case 4 -> internalOccluded = qz0[j] <= z1 && qz1[j] > z1 && qx0[j] <= x0 && qx1[j] >= x1 && qy0[j] <= y0 && qy1[j] >= y1;
+                        default -> internalOccluded = qz1[j] >= z0 && qz0[j] < z0 && qx0[j] <= x0 && qx1[j] >= x1 && qy0[j] <= y0 && qy1[j] >= y1;
+                    }
+                    if (internalOccluded) break;
+                }
+                if (internalOccluded) {
+                    continue;
+                }
+
+                if (onOuterBoundary) {
+                    computeAO(blocks, bx, by, bz, dir, aoBuf);
+                } else {
+                    aoBuf[0] = aoBuf[1] = aoBuf[2] = aoBuf[3] = 3;
+                }
+
+                int spriteId = atlas.getSpriteId(state, dir, tintRgb);
+                // Strict CCW vertex order matching emitQuad: {x16, y16, z16, u16, v16, aoIdx}
+                int[][] verts;
+                switch (dir) {
+                    case 0 -> verts = new int[][]{ // +X: right=-Z, up=+Y
+                            {x1, y0, z1, 16 - z1, 16 - y0, 1},
+                            {x1, y0, z0, 16 - z0, 16 - y0, 0},
+                            {x1, y1, z0, 16 - z0, 16 - y1, 3},
+                            {x1, y1, z1, 16 - z1, 16 - y1, 2}
+                    };
+                    case 1 -> verts = new int[][]{ // -X: right=+Z, up=+Y
+                            {x0, y0, z0, z0, 16 - y0, 0},
+                            {x0, y0, z1, z1, 16 - y0, 1},
+                            {x0, y1, z1, z1, 16 - y1, 2},
+                            {x0, y1, z0, z0, 16 - y1, 3}
+                    };
+                    case 2 -> verts = new int[][]{ // +Y: right=+X, up=-Z
+                            {x0, y1, z1, x0, z1, 3},
+                            {x1, y1, z1, x1, z1, 2},
+                            {x1, y1, z0, x1, z0, 1},
+                            {x0, y1, z0, x0, z0, 0}
+                    };
+                    case 3 -> verts = new int[][]{ // -Y: right=+X, up=+Z
+                            {x0, y0, z0, x0, 16 - z0, 0},
+                            {x1, y0, z0, x1, 16 - z0, 1},
+                            {x1, y0, z1, x1, 16 - z1, 2},
+                            {x0, y0, z1, x0, 16 - z1, 3}
+                    };
+                    case 4 -> verts = new int[][]{ // +Z: right=+X, up=+Y
+                            {x0, y0, z1, x0, 16 - y0, 0},
+                            {x1, y0, z1, x1, 16 - y0, 1},
+                            {x1, y1, z1, x1, 16 - y1, 2},
+                            {x0, y1, z1, x0, 16 - y1, 3}
+                    };
+                    default -> verts = new int[][]{ // -Z: right=-X, up=+Y
+                            {x1, y0, z0, 16 - x1, 16 - y0, 1},
+                            {x0, y0, z0, 16 - x0, 16 - y0, 0},
+                            {x0, y1, z0, 16 - x0, 16 - y1, 3},
+                            {x1, y1, z0, 16 - x1, 16 - y1, 2}
+                    };
+                }
+
                 for (int v = 0; v < 4; v++) {
-                    out.add(VertexPacker.pack(c[v][0], c[v][1], c[v][2], dir, 3, bl, sl, wind, spriteId, 1, 1, c[v][3], mat));
+                    int[] vt = verts[v];
+                    out.add(VkShapeVertex.packWord0(
+                            baseX16 + vt[0], baseY16 + vt[1], baseZ16 + vt[2],
+                            dir, aoBuf[vt[5]], bl, sl, mat, wind, vt[3], vt[4]
+                    ));
+                    out.add(VkShapeVertex.packWord1(spriteId));
                 }
                 quads++;
             }

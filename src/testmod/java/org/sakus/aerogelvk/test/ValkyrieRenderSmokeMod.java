@@ -4,6 +4,7 @@ import org.sakus.aerogelvk.ValkyrieRenderer;
 import org.sakus.aerogelvk.compat.CompatManager;
 import org.sakus.aerogelvk.config.ValkyrieConfig;
 import org.sakus.aerogelvk.meshing.AtlasUVTable;
+import org.sakus.aerogelvk.meshing.GreedyMesher;
 import org.sakus.aerogelvk.vulkan.VkInteropManager;
 import org.sakus.aerogelvk.vulkan.VkMegaBuffer;
 import com.mojang.blaze3d.platform.NativeImage;
@@ -15,11 +16,22 @@ import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.Screenshot;
 import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.sounds.SoundSource;
 import net.minecraft.world.Difficulty;
 import net.minecraft.world.level.GameRules;
 import net.minecraft.world.level.GameType;
 import net.minecraft.world.level.LevelSettings;
 import net.minecraft.world.level.WorldDataConfiguration;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.DoorBlock;
+import net.minecraft.world.level.block.SlabBlock;
+import net.minecraft.world.level.block.StairBlock;
+import net.minecraft.world.level.block.state.properties.DoubleBlockHalf;
+import net.minecraft.world.level.block.state.properties.SlabType;
 import net.minecraft.world.level.levelgen.WorldOptions;
 import net.minecraft.world.level.levelgen.presets.WorldPresets;
 import org.lwjgl.opengl.GL11;
@@ -60,6 +72,9 @@ public final class ValkyrieRenderSmokeMod implements ClientModInitializer {
     private long lastInWorldFrameNanos = 0L;
     private boolean finished = false;
     private boolean noonSet = false;
+    private boolean shapeShowcaseBuilt = false;
+    private volatile boolean shapeShowcaseServerDone = false;
+    private int shapeShowcaseSettleTicks = 0;
 
     private boolean sweepMode = false;
     private boolean configGuiOpened = false;
@@ -132,7 +147,9 @@ public final class ValkyrieRenderSmokeMod implements ClientModInitializer {
                     sweepMode = Files.exists(Path.of("shaderpacks/.smoke_sweep"));
                     mc.options.onboardAccessibility = false;
                     mc.options.pauseOnLostFocus = false;
-                    mc.options.renderDistance().set(4);
+                    mc.options.renderDistance().set(Boolean.getBoolean("aerogelvk.smoke.shapeShowcase") ? 2 : 4);
+                    mc.options.getSoundSourceOptionInstance(SoundSource.MASTER).set(0.0);
+                    mc.options.getSoundSourceOptionInstance(SoundSource.MUSIC).set(0.0);
                     mc.options.save();
                     mc.execute(() -> launchFreshSmokeWorld(mc));
                 } else if (overlayWaitTicks >= MAX_TOTAL_TICKS) {
@@ -158,6 +175,44 @@ public final class ValkyrieRenderSmokeMod implements ClientModInitializer {
                 }
                 // Tilt camera slightly downward so both terrain and sky occupy the viewport
                 mc.player.setXRot(22.0f);
+
+                if (Boolean.getBoolean("aerogelvk.smoke.shapeShowcase")) {
+                    VkMegaBuffer mega = VkMegaBuffer.getInstance();
+                    int activeSections = mega.isInitialized() ? mega.getActiveSectionCount() : 0;
+                    if (!shapeShowcaseBuilt && mc.getSingleplayerServer() != null) {
+                        shapeShowcaseBuilt = true;
+                        mc.getSingleplayerServer().execute(() -> {
+                            ServerLevel overworld = mc.getSingleplayerServer().overworld();
+                            buildShapeShowcase(overworld);
+                            for (var sp : mc.getSingleplayerServer().getPlayerList().getPlayers()) {
+                                sp.getAbilities().flying = true;
+                                sp.onUpdateAbilities();
+                                sp.teleportTo(overworld, 8.0, 162.0, -1.5, 0.0f, 28.0f);
+                            }
+                        });
+                    } else if (shapeShowcaseBuilt && shapeShowcaseServerDone) {
+                        mc.player.getAbilities().flying = true;
+                        mc.player.setYRot(0.0f);
+                        mc.player.setXRot(28.0f);
+                        mc.player.yRotO = 0.0f;
+                        mc.player.xRotO = 28.0f;
+                        if (activeSections > 0
+                                && GreedyMesher.SectionSnapshot.capture(mc.level, 0, 10, 0) != null) {
+                            shapeShowcaseSettleTicks++;
+                        }
+                        if (shapeShowcaseSettleTicks % 5 == 0 && shapeShowcaseSettleTicks > 0) {
+                            LOGGER.info("[ValkyrieSmoke] shapeShowcase settle={}/15 activeSections={}",
+                                    shapeShowcaseSettleTicks, activeSections);
+                        }
+                        if (shapeShowcaseSettleTicks >= 15) {
+                            logShapeShowcaseSectionMetrics(mc);
+                            finished = true;
+                            captureAndValidate(mc, activeSections);
+                            return;
+                        }
+                    }
+                    return;
+                }
 
                 VkMegaBuffer mega = VkMegaBuffer.getInstance();
                 VkInteropManager interop = VkInteropManager.getInstance();
@@ -384,7 +439,8 @@ public final class ValkyrieRenderSmokeMod implements ClientModInitializer {
     }
 
     private void captureAndValidate(Minecraft mc, int activeSections) {
-        Path out = Path.of("build/render-smoke-test.png").toAbsolutePath();
+        String customOut = System.getProperty("aerogelvk.smoke.screenshotOut", "build/render-smoke-test.png");
+        Path out = Path.of(customOut).toAbsolutePath();
         try (NativeImage img = Screenshot.takeScreenshot(mc.getMainRenderTarget())) {
             Files.createDirectories(out.getParent());
             img.writeToFile(out);
@@ -554,5 +610,61 @@ public final class ValkyrieRenderSmokeMod implements ClientModInitializer {
             return;
         }
         mc.stop();
+    }
+
+    private void buildShapeShowcase(ServerLevel level) {
+        // Build aerial stone platform in section (0, 10, 0): x=1..14, y=159, z=1..14
+        for (int x = 1; x <= 14; x++) {
+            for (int z = 1; z <= 14; z++) {
+                level.setBlock(new BlockPos(x, 159, z), Blocks.STONE.defaultBlockState(), Block.UPDATE_ALL);
+                for (int y = 160; y <= 165; y++) {
+                    level.setBlock(new BlockPos(x, y, z), Blocks.AIR.defaultBlockState(), Block.UPDATE_ALL);
+                }
+            }
+        }
+        // Row 1 (z = 3): single fence, connected fences, glass pane, iron bars, door
+        level.setBlock(new BlockPos(2, 160, 3), Blocks.OAK_FENCE.defaultBlockState(), Block.UPDATE_ALL);
+        level.setBlock(new BlockPos(4, 160, 3), Blocks.OAK_FENCE.defaultBlockState(), Block.UPDATE_ALL);
+        level.setBlock(new BlockPos(5, 160, 3), Blocks.OAK_FENCE.defaultBlockState(), Block.UPDATE_ALL);
+        level.setBlock(new BlockPos(7, 160, 3), Blocks.GLASS_PANE.defaultBlockState(), Block.UPDATE_ALL);
+        level.setBlock(new BlockPos(8, 160, 3), Blocks.GLASS_PANE.defaultBlockState(), Block.UPDATE_ALL);
+        level.setBlock(new BlockPos(10, 160, 3), Blocks.IRON_BARS.defaultBlockState(), Block.UPDATE_ALL);
+        level.setBlock(new BlockPos(11, 160, 3), Blocks.IRON_BARS.defaultBlockState(), Block.UPDATE_ALL);
+        level.setBlock(new BlockPos(13, 160, 3),
+                Blocks.OAK_DOOR.defaultBlockState().setValue(DoorBlock.FACING, Direction.NORTH).setValue(DoorBlock.HALF, DoubleBlockHalf.LOWER),
+                Block.UPDATE_ALL);
+        level.setBlock(new BlockPos(13, 161, 3),
+                Blocks.OAK_DOOR.defaultBlockState().setValue(DoorBlock.FACING, Direction.NORTH).setValue(DoorBlock.HALF, DoubleBlockHalf.UPPER),
+                Block.UPDATE_ALL);
+
+        // Row 2 (z = 7): cobblestone wall (2 connected), glass block, oak stairs, oak slab
+        level.setBlock(new BlockPos(3, 160, 7), Blocks.COBBLESTONE_WALL.defaultBlockState(), Block.UPDATE_ALL);
+        level.setBlock(new BlockPos(4, 160, 7), Blocks.COBBLESTONE_WALL.defaultBlockState(), Block.UPDATE_ALL);
+        level.setBlock(new BlockPos(6, 160, 7), Blocks.GLASS.defaultBlockState(), Block.UPDATE_ALL);
+        level.setBlock(new BlockPos(8, 160, 7),
+                Blocks.OAK_STAIRS.defaultBlockState().setValue(StairBlock.FACING, Direction.NORTH),
+                Block.UPDATE_ALL);
+        level.setBlock(new BlockPos(10, 160, 7),
+                Blocks.OAK_SLAB.defaultBlockState().setValue(SlabBlock.TYPE, SlabType.BOTTOM),
+                Block.UPDATE_ALL);
+        shapeShowcaseServerDone = true;
+        LOGGER.info("[ValkyrieSmoke] Built shape showcase platform in section (0, 10, 0)");
+    }
+
+    private void logShapeShowcaseSectionMetrics(Minecraft mc) {
+        if (mc.level == null) return;
+        GreedyMesher.SectionSnapshot snap = GreedyMesher.SectionSnapshot.capture(mc.level, 0, 10, 0);
+        if (snap == null) {
+            LOGGER.warn("[ValkyrieSmoke] Shape showcase snapshot (0,10,0) was null");
+            return;
+        }
+        GreedyMesher.MeshedSectionResult res = GreedyMesher.mesh(snap);
+        int cubeOpaqueQuads = res.quadCount();
+        int cubeTransQuads = res.translucentQuadCount();
+        int shapeOpaqueQuads = res.halfScaleOpaqueQuadCount();
+        int shapeTransQuads = res.halfScaleTranslucentQuadCount();
+        int totalQuads = cubeOpaqueQuads + cubeTransQuads + shapeOpaqueQuads + shapeTransQuads;
+        LOGGER.info("[ValkyrieSmoke] SHAPE_METRICS section=(0,10,0) cubeOpaqueQ={} cubeTransQ={} shapeOpaqueQ={} shapeTransQ={} totalQuads={} totalVerts={}",
+                cubeOpaqueQuads, cubeTransQuads, shapeOpaqueQuads, shapeTransQuads, totalQuads, totalQuads * 4);
     }
 }

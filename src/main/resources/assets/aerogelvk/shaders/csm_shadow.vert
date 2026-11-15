@@ -66,17 +66,28 @@ void main() {
         }
     }
 
-    uvec2 packedVertex = vertices[gl_VertexIndex];
-    uint dataLow = packedVertex.x;
+    vec3 localPos;
+    uint windWaving;
+    if ((meta.flags & 4u) != 0u) {
+        uint localVert = uint(gl_VertexIndex) - meta.vertexOffset;
+        uint baseIdx = meta.vertexOffset + localVert * 2u;
+        uvec2 w0 = vertices[baseIdx];
+        uint posX16 = w0.x & 0x1FFu;
+        uint posY16 = (w0.x >> 9) & 0x1FFu;
+        uint posZ16 = (w0.x >> 18) & 0x1FFu;
+        windWaving  = (w0.y >> 12) & 0x1u;
+        localPos = vec3(float(posX16), float(posY16), float(posZ16)) * (1.0 / 16.0);
+    } else {
+        uvec2 packedVertex = vertices[gl_VertexIndex];
+        uint dataLow = packedVertex.x;
+        uint posX  = dataLow & 0x3Fu;
+        uint posY  = (dataLow >> 6) & 0x3Fu;
+        uint posZ  = (dataLow >> 12) & 0x3Fu;
+        windWaving = (dataLow >> 31) & 0x1u;
+        localPos = vec3(float(posX), float(posY), float(posZ));
+    }
 
-    // Unpack vertex coordinates and wind flag
-    uint posX       = dataLow & 0x3Fu;
-    uint posY       = (dataLow >> 6) & 0x3Fu;
-    uint posZ       = (dataLow >> 12) & 0x3Fu;
-    uint windWaving = (dataLow >> 31) & 0x1u;
-
-    float posScale = ((meta.flags & 4u) != 0u) ? 0.5 : 1.0;
-    vec3 worldPos = sectionOrigin + vec3(float(posX), float(posY), float(posZ)) * posScale;
+    vec3 worldPos = sectionOrigin + localPos;
 
     // Dynamic wind sway (consistent with G-Buffer pass)
     if (windWaving == 1u) {

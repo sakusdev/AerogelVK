@@ -73,37 +73,71 @@ const vec3 FACE_NORMALS[6] = vec3[6](
 );
 
 void main() {
-    // Vertex pulling from MegaVertexSSBO
-    // gl_VertexIndex already includes vertexOffset specified in VkDrawIndexedIndirectCommand
-    uvec2 packedVertex = vertices[gl_VertexIndex];
-    uint dataLow = packedVertex.x;
-    uint dataHigh = packedVertex.y;
-
-    // Unpack dataLow (32 bits)
-    uint posX        = dataLow & 0x3Fu;
-    uint posY        = (dataLow >> 6) & 0x3Fu;
-    uint posZ        = (dataLow >> 12) & 0x3Fu;
-    uint normalEnum  = (dataLow >> 18) & 0x7u;
-    uint aoLevel     = (dataLow >> 21) & 0x3u;
-    uint blockLight  = (dataLow >> 23) & 0xFu;
-    uint skyLight    = (dataLow >> 27) & 0xFu;
-    uint windWaving  = (dataLow >> 31) & 0x1u;
-
-    // Unpack dataHigh (32 bits)
-    uint spriteId     = dataHigh & 0xFFFFu;
-    uint quadWidth    = (dataHigh >> 16) & 0x1Fu;
-    uint quadHeight   = (dataHigh >> 21) & 0x1Fu;
-    uint cornerIndex  = (dataHigh >> 26) & 0x3u;
-    uint materialMask = (dataHigh >> 28) & 0xFu;
-
     // Lookup chunk metadata from instance index
     uint chunkIdx = instanceToChunkIdx[gl_InstanceIndex];
     ChunkDrawMeta meta = chunks[chunkIdx];
-
-    // Compute world-space position (half-scale 0.5 for non-full VoxelShape sub-meshes)
-    float posScale = ((meta.flags & 4u) != 0u) ? 0.5 : 1.0;
     vec3 sectionOrigin = vec3(meta.chunkPos) * 16.0;
-    vec3 worldPos = sectionOrigin + vec3(float(posX), float(posY), float(posZ)) * posScale;
+
+    vec3 localPos;
+    uint normalEnum;
+    uint aoLevel;
+    uint blockLight;
+    uint skyLight;
+    uint windWaving;
+    uint spriteId;
+    uint materialMask;
+    vec2 tiledUV;
+
+    if ((meta.flags & 4u) != 0u) {
+        // Dedicated 1/16-block precision VoxelShape vertex stream (128-bit = 2 uvec2 slots per vertex)
+        uint localVert = uint(gl_VertexIndex) - meta.vertexOffset;
+        uint baseIdx = meta.vertexOffset + localVert * 2u;
+        uvec2 w0 = vertices[baseIdx];
+        uvec2 w1 = vertices[baseIdx + 1u];
+
+        uint posX16 = w0.x & 0x1FFu;
+        uint posY16 = (w0.x >> 9) & 0x1FFu;
+        uint posZ16 = (w0.x >> 18) & 0x1FFu;
+        normalEnum  = (w0.x >> 27) & 0x7u;
+        aoLevel     = (w0.x >> 30) & 0x3u;
+
+        blockLight   = w0.y & 0xFu;
+        skyLight     = (w0.y >> 4) & 0xFu;
+        materialMask = (w0.y >> 8) & 0xFu;
+        windWaving   = (w0.y >> 12) & 0x1u;
+        uint u16     = (w0.y >> 13) & 0x1Fu;
+        uint v16     = (w0.y >> 18) & 0x1Fu;
+        spriteId     = w1.x;
+
+        localPos = vec3(float(posX16), float(posY16), float(posZ16)) * (1.0 / 16.0);
+        tiledUV  = vec2(float(u16), float(v16)) * (1.0 / 16.0);
+    } else {
+        // Cube greedy-meshed vertex stream (64-bit = 1 uvec2 slot per vertex)
+        uvec2 packedVertex = vertices[gl_VertexIndex];
+        uint dataLow = packedVertex.x;
+        uint dataHigh = packedVertex.y;
+
+        uint posX    = dataLow & 0x3Fu;
+        uint posY    = (dataLow >> 6) & 0x3Fu;
+        uint posZ    = (dataLow >> 12) & 0x3Fu;
+        normalEnum   = (dataLow >> 18) & 0x7u;
+        aoLevel      = (dataLow >> 21) & 0x3u;
+        blockLight   = (dataLow >> 23) & 0xFu;
+        skyLight     = (dataLow >> 27) & 0xFu;
+        windWaving   = (dataLow >> 31) & 0x1u;
+
+        spriteId        = dataHigh & 0xFFFFu;
+        uint quadWidth  = (dataHigh >> 16) & 0x1Fu;
+        uint quadHeight = (dataHigh >> 21) & 0x1Fu;
+        uint cornerIndex = (dataHigh >> 26) & 0x3u;
+        materialMask    = (dataHigh >> 28) & 0xFu;
+
+        localPos = vec3(float(posX), float(posY), float(posZ));
+        vec2 cornerUV = CORNER_UVS[cornerIndex];
+        tiledUV = vec2(cornerUV.x * float(quadWidth), cornerUV.y * float(quadHeight));
+    }
+
+    vec3 worldPos = sectionOrigin + localPos;
 
     // Subtle wind displacement for foliage/leaves/water
     if (windWaving == 1u) {
@@ -117,10 +151,6 @@ void main() {
 
     // World normal
     vec3 worldNormal = (normalEnum < 6u) ? FACE_NORMALS[normalEnum] : vec3(0.0, 1.0, 0.0);
-
-    // Compute tiled local UV (cornerU * quadWidth, cornerV * quadHeight)
-    vec2 cornerUV = CORNER_UVS[cornerIndex];
-    vec2 tiledUV = vec2(cornerUV.x * float(quadWidth), cornerUV.y * float(quadHeight));
 
     // Output interpolants
     vWorldPos = worldPos;
