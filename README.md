@@ -8,7 +8,7 @@
 
 - **Mod ID:** `aerogelvk`
 - **Java Package:** `org.sakus.aerogelvk`
-- **Target:** Minecraft `~1.21.1`, Fabric Loader `>=0.16.0`, Java `>=21`
+- **Target:** Minecraft `~1.21.1`, Fabric Loader `>=0.16.0`, Java `>=21` , Cloth Config API
 - **License:** [LGPL-3.0-only](LICENSE)
 
 ---
