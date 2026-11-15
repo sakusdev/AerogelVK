@@ -577,6 +577,16 @@ public final class ValkyrieRenderer {
                 && vkMegaBuffer.getSlotDispatchLimit() > 0;
         List<Integer> csmCascadesToUpdate = collectCsmCascadesToUpdate(useBuiltinCsm);
 
+        int dimFlags = 0;
+        if (level != null) {
+            if (level.dimension() == net.minecraft.world.level.Level.END) {
+                dimFlags |= 16;
+            } else if (!level.dimensionType().hasSkyLight()) {
+                dimFlags |= 32;
+            }
+        }
+        vkPipelineManager.setDimensionRenderFlags(dimFlags);
+
         // Update Frame Uniform Buffer (UBO) for this frame slot
         vkPipelineManager.updateFrameUbo(
                 viewMatrix,

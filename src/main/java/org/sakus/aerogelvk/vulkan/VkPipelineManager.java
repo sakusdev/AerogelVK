@@ -194,6 +194,12 @@ public final class VkPipelineManager implements AutoCloseable {
     // Frame UBO Update
     // ------------------------------------------------------------------------
 
+    private volatile int dimensionRenderFlags = 0;
+
+    public void setDimensionRenderFlags(int flags) {
+        this.dimensionRenderFlags = flags;
+    }
+
     public void updateFrameUbo(
             Matrix4f view,
             Matrix4f proj,
@@ -283,6 +289,7 @@ public final class VkPipelineManager implements AutoCloseable {
         if (!vanillaLighting && config.isFastShadowPcf()) renderFlags |= 2;
         if (!vanillaLighting && config.isSsrEnabled()) renderFlags |= 4;
         if (vanillaLighting) renderFlags |= 8;
+        renderFlags |= (dimensionRenderFlags & 0x30);
         frameUboHostBuffer.putInt(560, renderFlags);
         frameUboHostBuffer.putInt(564, config.getCsmCascades());
         frameUboHostBuffer.putFloat(568, config.getMaxShadowDistance());
