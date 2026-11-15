@@ -47,12 +47,15 @@ public final class ValkyrieConfig {
     private boolean irisCompatEnabled = true;
     private String shaderPack = "off";
     private boolean shaderPackEnabled = false;
+    private float shaderPackRenderScale = 1.0f;
+    private int shaderPackShadowResolutionCap = 0;
 
     private static final Set<String> KNOWN_KEYS = Set.of(
             "csmEnabled", "csmResolution", "csmCascades", "csmUpdateInterval",
             "fastShadowPcf", "ssrEnabled", "fxaaEnabled", "hiZOcclusionEnabled",
             "exposure", "sodiumCompatEnabled", "dhCompatEnabled", "irisCompatEnabled",
-            "shaderPack", "shaderPackEnabled"
+            "shaderPack", "shaderPackEnabled",
+            "shaderPackRenderScale", "shaderPackShadowResolutionCap"
     );
 
     private final Map<String, String> unknownProperties = new LinkedHashMap<>();
@@ -138,6 +141,8 @@ public final class ValkyrieConfig {
             props.setProperty("irisCompatEnabled", Boolean.toString(irisCompatEnabled));
             props.setProperty("shaderPack", shaderPack);
             props.setProperty("shaderPackEnabled", Boolean.toString(shaderPackEnabled));
+            props.setProperty("shaderPackRenderScale", Float.toString(shaderPackRenderScale));
+            props.setProperty("shaderPackShadowResolutionCap", Integer.toString(shaderPackShadowResolutionCap));
             try (OutputStream out = Files.newOutputStream(configPath)) {
                 props.store(out, "ValkyrieRender Configuration (Presets: LOW/MEDIUM/HIGH)");
             }
@@ -179,6 +184,8 @@ public final class ValkyrieConfig {
         if (shaderPackEnabled && isOffToken(shaderPack)) {
             shaderPack = "auto";
         }
+        shaderPackRenderScale = sanitizeRenderScale(parseFloat(props.getProperty("shaderPackRenderScale"), shaderPackRenderScale));
+        shaderPackShadowResolutionCap = sanitizeShadowResolutionCap(parseInt(props.getProperty("shaderPackShadowResolutionCap"), shaderPackShadowResolutionCap));
     }
 
     public synchronized void applyPreset(Preset preset) {
@@ -384,6 +391,36 @@ public final class ValkyrieConfig {
 
     public synchronized String getShaderPack() {
         return shaderPack;
+    }
+
+    public float getShaderPackRenderScale() {
+        return shaderPackRenderScale;
+    }
+
+    public synchronized void setShaderPackRenderScale(float scale) {
+        this.shaderPackRenderScale = sanitizeRenderScale(scale);
+    }
+
+    public int getShaderPackShadowResolutionCap() {
+        return shaderPackShadowResolutionCap;
+    }
+
+    public synchronized void setShaderPackShadowResolutionCap(int cap) {
+        this.shaderPackShadowResolutionCap = sanitizeShadowResolutionCap(cap);
+    }
+
+    private static float sanitizeRenderScale(float scale) {
+        if (!Float.isFinite(scale)) {
+            return 1.0f;
+        }
+        return Math.max(0.5f, Math.min(1.0f, scale));
+    }
+
+    private static int sanitizeShadowResolutionCap(int cap) {
+        if (cap <= 0) {
+            return 0;
+        }
+        return clampInt(cap, 256, 8192);
     }
 
     public synchronized void setShaderPack(String shaderPack) {

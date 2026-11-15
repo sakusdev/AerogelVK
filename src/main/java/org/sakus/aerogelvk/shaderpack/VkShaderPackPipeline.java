@@ -292,6 +292,10 @@ public class VkShaderPackPipeline implements AutoCloseable {
     private float frameClearB = 0.95f;
 
     private int finalColorFormat = VK_FORMAT_R8G8B8A8_UNORM;
+    private int displayWidth = 1;
+    private int displayHeight = 1;
+    private float activeRenderScale = 1.0f;
+    private int activeShadowCap = 0;
     private String activePackName = "OFF";
     private ShaderPackProperties activeProperties = ShaderPackProperties.empty();
     private boolean initialized = false;
@@ -357,7 +361,13 @@ public class VkShaderPackPipeline implements AutoCloseable {
             megaBuffer.init();
         }
         if (!targets.isInitialized()) {
-            targets.init(Math.max(1, width), Math.max(1, height), ShaderPackProperties.empty());
+            this.displayWidth = Math.max(1, width);
+            this.displayHeight = Math.max(1, height);
+            this.activeRenderScale = org.sakus.aerogelvk.config.ValkyrieConfig.get().getShaderPackRenderScale();
+            this.activeShadowCap = org.sakus.aerogelvk.config.ValkyrieConfig.get().getShaderPackShadowResolutionCap();
+            int scaledW = computeScaledDim(this.displayWidth, this.activeRenderScale);
+            int scaledH = computeScaledDim(this.displayHeight, this.activeRenderScale);
+            targets.init(scaledW, scaledH, ShaderPackProperties.empty());
         }
 
         createUboBuffer();
@@ -443,7 +453,13 @@ public class VkShaderPackPipeline implements AutoCloseable {
         this.activeProperties = programs.getProperties() != null
                 ? programs.getProperties()
                 : ShaderPackProperties.empty();
-        targets.reconfigure(Math.max(1, width), Math.max(1, height), activeProperties);
+        this.displayWidth = Math.max(1, width);
+        this.displayHeight = Math.max(1, height);
+        this.activeRenderScale = org.sakus.aerogelvk.config.ValkyrieConfig.get().getShaderPackRenderScale();
+        this.activeShadowCap = org.sakus.aerogelvk.config.ValkyrieConfig.get().getShaderPackShadowResolutionCap();
+        int scaledW = computeScaledDim(this.displayWidth, this.activeRenderScale);
+        int scaledH = computeScaledDim(this.displayHeight, this.activeRenderScale);
+        targets.reconfigure(scaledW, scaledH, activeProperties);
         updateDescriptorSet0();
 
         activePackName = programs.getPackName() != null ? programs.getPackName() : "shaderpack";
@@ -561,7 +577,17 @@ public class VkShaderPackPipeline implements AutoCloseable {
             init(width, height, finalColorFormat);
             return;
         }
-        targets.resize(Math.max(1, width), Math.max(1, height));
+        this.displayWidth = Math.max(1, width);
+        this.displayHeight = Math.max(1, height);
+        this.activeRenderScale = org.sakus.aerogelvk.config.ValkyrieConfig.get().getShaderPackRenderScale();
+        int scaledW = computeScaledDim(this.displayWidth, this.activeRenderScale);
+        int scaledH = computeScaledDim(this.displayHeight, this.activeRenderScale);
+        targets.resize(scaledW, scaledH);
+    }
+
+    private static int computeScaledDim(int dim, float scale) {
+        float clamped = Math.max(0.5f, Math.min(1.0f, Float.isFinite(scale) ? scale : 1.0f));
+        return Math.max(1, Math.round(dim * clamped));
     }
 
     /**
@@ -821,11 +847,26 @@ public class VkShaderPackPipeline implements AutoCloseable {
             throw new IllegalStateException("VkShaderPackPipeline is not initialized or no shaderpack is compiled");
         }
 
-        if (width != targets.getWidth() || height != targets.getHeight()) {
+        float desiredScale = org.sakus.aerogelvk.config.ValkyrieConfig.get().getShaderPackRenderScale();
+        int desiredShadowCap = org.sakus.aerogelvk.config.ValkyrieConfig.get().getShaderPackShadowResolutionCap();
+        int scaledWidth = computeScaledDim(width, desiredScale);
+        int scaledHeight = computeScaledDim(height, desiredScale);
+
+        if (desiredShadowCap != activeShadowCap) {
+            this.displayWidth = Math.max(1, width);
+            this.displayHeight = Math.max(1, height);
+            this.activeRenderScale = desiredScale;
+            this.activeShadowCap = desiredShadowCap;
+            targets.reconfigure(scaledWidth, scaledHeight, activeProperties);
+        } else if (scaledWidth != targets.getWidth() || scaledHeight != targets.getHeight()
+                || width != displayWidth || height != displayHeight
+                || Math.abs(desiredScale - activeRenderScale) > 1e-4f) {
             resize(width, height);
+            scaledWidth = targets.getWidth();
+            scaledHeight = targets.getHeight();
         }
 
-        updateUniforms(uniforms, width, height);
+        updateUniforms(uniforms, scaledWidth, scaledHeight);
         updateDescriptorSet0();
 
         try (MemoryStack stack = MemoryStack.stackPush()) {
@@ -846,7 +887,7 @@ public class VkShaderPackPipeline implements AutoCloseable {
                     continue;
                 }
                 long set1 = updateDescriptorSet1ForCurrentState(passSetSlot++);
-                recordFullscreenColorPass(cmd, stack, pass, set1, width, height);
+                recordFullscreenColorPass(cmd, stack, pass, set1, scaledWidth, scaledHeight);
                 notifyPassTrace(cmd, stack, pass.getName());
             }
 
@@ -864,7 +905,7 @@ public class VkShaderPackPipeline implements AutoCloseable {
             if (gbuffersTerrainPass != null && gbuffersTerrainPass.getPipeline() != VK_NULL_HANDLE) {
                 dispatchShaderPackCull(cmd, stack, slotLimit, hasWaterPass ? 1 : 0);
                 long set1 = updateDescriptorSet1ForCurrentState(passSetSlot++);
-                recordGeometryPass(cmd, stack, gbuffersTerrainPass, set1, maxDrawCount, width, height, false);
+                recordGeometryPass(cmd, stack, gbuffersTerrainPass, set1, maxDrawCount, scaledWidth, scaledHeight, false);
                 notifyPassTrace(cmd, stack, "gbuffers_terrain");
             }
 
@@ -876,7 +917,7 @@ public class VkShaderPackPipeline implements AutoCloseable {
             if (hasWaterPass && megaBuffer.hasTranslucentSections()) {
                 dispatchShaderPackCull(cmd, stack, slotLimit, 2);
                 long set1 = updateDescriptorSet1ForCurrentState(passSetSlot++);
-                recordGeometryPass(cmd, stack, gbuffersWaterPass, set1, maxDrawCount, width, height, true);
+                recordGeometryPass(cmd, stack, gbuffersWaterPass, set1, maxDrawCount, scaledWidth, scaledHeight, true);
                 notifyPassTrace(cmd, stack, "gbuffers_water");
             }
 
@@ -886,7 +927,7 @@ public class VkShaderPackPipeline implements AutoCloseable {
                     continue;
                 }
                 long set1 = updateDescriptorSet1ForCurrentState(passSetSlot++);
-                recordFullscreenColorPass(cmd, stack, pass, set1, width, height);
+                recordFullscreenColorPass(cmd, stack, pass, set1, scaledWidth, scaledHeight);
                 notifyPassTrace(cmd, stack, pass.getName());
             }
 
@@ -896,17 +937,17 @@ public class VkShaderPackPipeline implements AutoCloseable {
                     continue;
                 }
                 long set1 = updateDescriptorSet1ForCurrentState(passSetSlot++);
-                recordFullscreenColorPass(cmd, stack, pass, set1, width, height);
+                recordFullscreenColorPass(cmd, stack, pass, set1, scaledWidth, scaledHeight);
                 notifyPassTrace(cmd, stack, pass.getName());
             }
 
-            // 8. Final fullscreen pass -> writes directly into sharedColorImageView
+            // 8. Final fullscreen pass -> writes directly into full-resolution sharedColorImageView
             long finalSet1 = updateDescriptorSet1ForCurrentState(passSetSlot);
             recordFinalPass(cmd, stack, finalPass, finalSet1, sharedColorImage, sharedColorImageView, width, height);
 
-            // 9. Copy depthtex0 -> sharedDepthImage (leaves sharedDepthImage in VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+            // 9. Copy/blit depthtex0 -> sharedDepthImage (leaves sharedDepthImage in VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
             if (sharedDepthImage != VK_NULL_HANDLE) {
-                targets.recordCopyDepthToExternal(cmd, 0, sharedDepthImage, stack);
+                targets.recordCopyDepthToExternal(cmd, 0, sharedDepthImage, width, height, stack);
             }
         }
     }

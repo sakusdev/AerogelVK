@@ -136,7 +136,7 @@ public final class VkShaderPackTargets implements AutoCloseable {
             colorClearEnabled[i] = properties.isColorTexClearEnabled(i);
             colorClearColors[i] = properties.getColorTexClearColor(i);
         }
-        init(width, height, properties.getShadowMapResolution(), fmtNames, mipmaps);
+        init(width, height, resolveShadowResolution(properties.getShadowMapResolution()), fmtNames, mipmaps);
     }
 
     /**
@@ -144,7 +144,7 @@ public final class VkShaderPackTargets implements AutoCloseable {
      */
     public synchronized void reconfigure(int newWidth, int newHeight, ShaderPackProperties properties) {
         if (properties == null) {
-            reconfigure(newWidth, newHeight, DEFAULT_SHADOW_RES, null, null);
+            reconfigure(newWidth, newHeight, resolveShadowResolution(DEFAULT_SHADOW_RES), null, null);
             return;
         }
         String[] fmtNames = new String[MAX_COLORTEX];
@@ -155,7 +155,13 @@ public final class VkShaderPackTargets implements AutoCloseable {
             colorClearEnabled[i] = properties.isColorTexClearEnabled(i);
             colorClearColors[i] = properties.getColorTexClearColor(i);
         }
-        reconfigure(newWidth, newHeight, properties.getShadowMapResolution(), fmtNames, mipmaps);
+        reconfigure(newWidth, newHeight, resolveShadowResolution(properties.getShadowMapResolution()), fmtNames, mipmaps);
+    }
+
+    private static int resolveShadowResolution(int packShadowRes) {
+        int cap = org.sakus.aerogelvk.config.ValkyrieConfig.get().getShaderPackShadowResolutionCap();
+        int res = Math.max(1, packShadowRes);
+        return (cap > 0) ? Math.min(res, cap) : res;
     }
 
     /**
@@ -783,6 +789,17 @@ public final class VkShaderPackTargets implements AutoCloseable {
             long dstSharedDepthImage,
             MemoryStack stack
     ) {
+        recordCopyDepthToExternal(cmd, srcDepthIdx, dstSharedDepthImage, width, height, stack);
+    }
+
+    public void recordCopyDepthToExternal(
+            VkCommandBuffer cmd,
+            int srcDepthIdx,
+            long dstSharedDepthImage,
+            int dstWidth,
+            int dstHeight,
+            MemoryStack stack
+    ) {
         long srcImg = depthImages[srcDepthIdx];
 
         recordImageBarrier(cmd, srcImg,
@@ -797,15 +814,30 @@ public final class VkShaderPackTargets implements AutoCloseable {
                 0, VK_ACCESS_TRANSFER_WRITE_BIT,
                 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, stack);
 
-        VkImageCopy.Buffer region = VkImageCopy.calloc(1, stack);
-        region.srcSubresource().aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT).mipLevel(0).baseArrayLayer(0).layerCount(1);
-        region.dstSubresource().aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT).mipLevel(0).baseArrayLayer(0).layerCount(1);
-        region.extent().set(width, height, 1);
+        if (dstWidth == width && dstHeight == height) {
+            VkImageCopy.Buffer region = VkImageCopy.calloc(1, stack);
+            region.srcSubresource().aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT).mipLevel(0).baseArrayLayer(0).layerCount(1);
+            region.dstSubresource().aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT).mipLevel(0).baseArrayLayer(0).layerCount(1);
+            region.extent().set(width, height, 1);
 
-        vkCmdCopyImage(cmd,
-                srcImg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                dstSharedDepthImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                region);
+            vkCmdCopyImage(cmd,
+                    srcImg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    dstSharedDepthImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    region);
+        } else {
+            VkImageBlit.Buffer blit = VkImageBlit.calloc(1, stack);
+            blit.srcSubresource().aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT).mipLevel(0).baseArrayLayer(0).layerCount(1);
+            blit.srcOffsets(0).set(0, 0, 0);
+            blit.srcOffsets(1).set(width, height, 1);
+            blit.dstSubresource().aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT).mipLevel(0).baseArrayLayer(0).layerCount(1);
+            blit.dstOffsets(0).set(0, 0, 0);
+            blit.dstOffsets(1).set(Math.max(1, dstWidth), Math.max(1, dstHeight), 1);
+
+            vkCmdBlitImage(cmd,
+                    srcImg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    dstSharedDepthImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    blit, VK_FILTER_NEAREST);
+        }
 
         recordImageBarrier(cmd, srcImg,
                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,

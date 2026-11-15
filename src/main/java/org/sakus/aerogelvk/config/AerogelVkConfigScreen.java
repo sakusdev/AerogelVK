@@ -152,6 +152,26 @@ public final class AerogelVkConfigScreen {
                 .setSaveConsumer(v -> pendingPackName[0] = v)
                 .build());
 
+        int initialScalePct = Math.max(50, Math.min(100, Math.round(config.getShaderPackRenderScale() * 100.0f)));
+        shaderPackCat.addEntry(entryBuilder.startIntSlider(
+                        Component.translatable("config.aerogelvk.option.shaderPackRenderScale"),
+                        initialScalePct, 50, 100)
+                .setDefaultValue(100)
+                .setTextGetter(v -> Component.literal(v + "%"))
+                .setTooltip(Component.translatable("config.aerogelvk.tooltip.shaderPackRenderScale"))
+                .setSaveConsumer(v -> config.setShaderPackRenderScale(v / 100.0f))
+                .build());
+
+        shaderPackCat.addEntry(entryBuilder.startIntField(
+                        Component.translatable("config.aerogelvk.option.shaderPackShadowResolutionCap"),
+                        config.getShaderPackShadowResolutionCap())
+                .setDefaultValue(0)
+                .setMin(0)
+                .setMax(8192)
+                .setTooltip(Component.translatable("config.aerogelvk.tooltip.shaderPackShadowResolutionCap"))
+                .setSaveConsumer(config::setShaderPackShadowResolutionCap)
+                .build());
+
         // 4. Compatibility
         ConfigCategory compat = builder.getOrCreateCategory(
                 Component.translatable("config.aerogelvk.category.compat"));
