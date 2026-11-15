@@ -63,8 +63,8 @@ public final class AtlasUVTable {
             Object2IntOpenHashMap<BlockState> stateDirTintedMask
     ) {}
 
-    /** (spriteName, tintRgb) -> spriteId (mutated only under synchronized rebuild) */
-    private final Map<SpriteKey, Integer> spriteIdLookup = new HashMap<>(1024);
+    /** (spriteName, tintRgb) -> spriteId */
+    private final Map<SpriteKey, Integer> spriteIdLookup = new ConcurrentHashMap<>(1024);
     private final ConcurrentHashMap<Long, Integer> tintedVariantCache = new ConcurrentHashMap<>(512);
     private final AtomicInteger publishedSpriteCount = new AtomicInteger(0);
     private volatile SpriteLookup lookup = new SpriteLookup(Map.of(), new Object2IntOpenHashMap<>(), new Object2IntOpenHashMap<>());
@@ -345,6 +345,42 @@ public final class AtlasUVTable {
             return cached;
         }
         return registerTintedVariant(baseId, rgb, cacheKey);
+    }
+
+    /**
+     * Thread-safe lookup or runtime registration of a TextureAtlasSprite + tint combination
+     * for BakedModel shape quads.
+     */
+    public int getOrRegisterSpriteId(TextureAtlasSprite sprite, int tintRgb) {
+        if (sprite == null || sprite.contents() == null) {
+            return 0;
+        }
+        int rgb = tintRgb & 0xFFFFFF;
+        SpriteKey key = new SpriteKey(sprite.contents().name(), rgb);
+        Integer existing = spriteIdLookup.get(key);
+        if (existing != null) {
+            return existing & 0xFFFF;
+        }
+        return registerRuntimeSprite(sprite, rgb, key);
+    }
+
+    private synchronized int registerRuntimeSprite(TextureAtlasSprite sprite, int rgb, SpriteKey key) {
+        Integer existing = spriteIdLookup.get(key);
+        if (existing != null) {
+            return existing & 0xFFFF;
+        }
+        if (uvTableBuffer == null || spriteCount >= MAX_SPRITES - 1) {
+            return 0;
+        }
+        int newId = spriteCount++;
+        uvTableBuffer.limit(spriteCount * ENTRY_BYTES);
+        uvTableBuffer.position(newId * ENTRY_BYTES);
+        appendEntry(new float[]{sprite.getU0(), sprite.getV0(), sprite.getU1(), sprite.getV1()}, rgb);
+        uvTableBuffer.position(0);
+        spriteIdLookup.put(key, newId);
+        publishedSpriteCount.set(spriteCount);
+        dirty = true;
+        return newId;
     }
 
     private synchronized int registerTintedVariant(int baseId, int rgb, long cacheKey) {

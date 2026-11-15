@@ -30,6 +30,8 @@ import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.DoorBlock;
 import net.minecraft.world.level.block.SlabBlock;
 import net.minecraft.world.level.block.StairBlock;
+import net.minecraft.world.level.block.StandingSignBlock;
+import net.minecraft.world.level.block.entity.SignBlockEntity;
 import net.minecraft.world.level.block.state.properties.DoubleBlockHalf;
 import net.minecraft.world.level.block.state.properties.SlabType;
 import net.minecraft.world.level.levelgen.WorldOptions;
@@ -197,6 +199,7 @@ public final class ValkyrieRenderSmokeMod implements ClientModInitializer {
                         mc.player.yRotO = 0.0f;
                         mc.player.xRotO = 28.0f;
                         if (activeSections > 0
+                                && renderedFramesInWorld >= 4
                                 && GreedyMesher.SectionSnapshot.capture(mc.level, 0, 10, 0) != null) {
                             shapeShowcaseSettleTicks++;
                         }
@@ -647,6 +650,13 @@ public final class ValkyrieRenderSmokeMod implements ClientModInitializer {
         level.setBlock(new BlockPos(10, 160, 7),
                 Blocks.OAK_SLAB.defaultBlockState().setValue(SlabBlock.TYPE, SlabType.BOTTOM),
                 Block.UPDATE_ALL);
+        level.setBlock(new BlockPos(12, 160, 7),
+                Blocks.OAK_SIGN.defaultBlockState().setValue(StandingSignBlock.ROTATION, 8),
+                Block.UPDATE_ALL);
+        if (level.getBlockEntity(new BlockPos(12, 160, 7)) instanceof SignBlockEntity signBe) {
+            signBe.updateText(text -> text.setMessage(0, net.minecraft.network.chat.Component.literal("AerogelVK")), true);
+            signBe.setChanged();
+        }
         shapeShowcaseServerDone = true;
         LOGGER.info("[ValkyrieSmoke] Built shape showcase platform in section (0, 10, 0)");
     }

@@ -4,12 +4,25 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.color.block.BlockColors;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.BiomeColors;
+import net.minecraft.client.renderer.block.model.BakedQuad;
+import net.minecraft.client.renderer.texture.TextureAtlasSprite;
+import net.minecraft.client.resources.model.BakedModel;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.core.SectionPos;
+import net.minecraft.util.RandomSource;
 import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.LightLayer;
+import net.minecraft.world.level.block.AbstractBannerBlock;
+import net.minecraft.world.level.block.AbstractChestBlock;
+import net.minecraft.world.level.block.AbstractSkullBlock;
+import net.minecraft.world.level.block.BedBlock;
+import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.DecoratedPotBlock;
 import net.minecraft.world.level.block.RenderShape;
+import net.minecraft.world.level.block.ShulkerBoxBlock;
+import net.minecraft.world.level.block.SignBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.LevelChunkSection;
@@ -30,6 +43,15 @@ import java.util.concurrent.Executors;
 public final class GreedyMesher {
     private static final Logger LOGGER = LoggerFactory.getLogger(GreedyMesher.class);
     private static final int SHAPE_BOX_WARN_CAP = 64;
+    private static final Direction[] DIR_ENUM = {
+            Direction.EAST,  // 0: +X
+            Direction.WEST,  // 1: -X
+            Direction.UP,    // 2: +Y
+            Direction.DOWN,  // 3: -Y
+            Direction.SOUTH, // 4: +Z
+            Direction.NORTH  // 5: -Z
+    };
+    private static final ThreadLocal<RandomSource> MODEL_RANDOM = ThreadLocal.withInitial(() -> RandomSource.create(42L));
     public static final int SECTION_SIZE = 16;
     public static final int HALO_SIZE = 18;
 
@@ -260,6 +282,17 @@ public final class GreedyMesher {
         return CompletableFuture.supplyAsync(() -> mesh(snapshot), ensureExecutor());
     }
     
+    private static boolean isEntityAtlasBlock(BlockState state) {
+        Block b = state.getBlock();
+        return b instanceof SignBlock
+                || b instanceof AbstractBannerBlock
+                || b instanceof BedBlock
+                || b instanceof AbstractChestBlock<?>
+                || b instanceof AbstractSkullBlock
+                || b instanceof ShulkerBoxBlock
+                || b instanceof DecoratedPotBlock;
+    }
+
     private static boolean isTranslucentState(BlockState state) {
         if (state.getBlock() == Blocks.GLASS) {
             return false; // Clear glass is binary alpha-cutout, not alpha-blended translucent
@@ -316,6 +349,7 @@ public final class GreedyMesher {
                     if (state == null || state.isAir()) continue;
                     if (state.getRenderShape() == RenderShape.ENTITYBLOCK_ANIMATED) continue;
                     if (state.getRenderShape() == RenderShape.INVISIBLE && state.getFluidState().isEmpty()) continue;
+                    if (isEntityAtlasBlock(state)) continue;
                     if (isOpaqueFullCube(state)) continue;
 
                     VoxelShape shape = state.getShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
@@ -330,7 +364,7 @@ public final class GreedyMesher {
                     boolean wind = atlas.isWindWaving(state);
 
                     List<Long> targetVerts = translucent ? halfTranslucentVertices : halfOpaqueVertices;
-                    int added = emitShapeBoxes(targetVerts, blocks, shape, x, y, z, state, tintRgb, bl, sl, mat, wind, atlas);
+                    int added = emitShapeOrModelQuads(targetVerts, blocks, shape, x, y, z, state, tintRgb, bl, sl, mat, wind, atlas);
                     if (added > 0) {
                         if (translucent) {
                             halfTranslucentQuadCount += added;
@@ -389,6 +423,9 @@ public final class GreedyMesher {
                         }
                         if (state.getRenderShape() == RenderShape.INVISIBLE && state.getFluidState().isEmpty()) {
                             continue; // Skip barriers, structure void, and invisible light blocks
+                        }
+                        if (isEntityAtlasBlock(state)) {
+                            continue; // Rendered by vanilla BlockEntityRenderer using entity atlas
                         }
                         if (!isOpaqueFullCube(state)) {
                             VoxelShape shape = state.getShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
@@ -561,6 +598,177 @@ public final class GreedyMesher {
     private static int clamp16(double v) {
         int q = (int) Math.round(v * 16.0);
         return Math.max(0, Math.min(16, q));
+    }
+
+    private static int directionToInt(Direction dir) {
+        if (dir == null) return 2;
+        return switch (dir) {
+            case EAST -> 0;
+            case WEST -> 1;
+            case UP -> 2;
+            case DOWN -> 3;
+            case SOUTH -> 4;
+            case NORTH -> 5;
+        };
+    }
+
+    private static BakedModel getBakedModelSafe(BlockState state) {
+        try {
+            Minecraft mc = Minecraft.getInstance();
+            if (mc == null || mc.getBlockRenderer() == null) {
+                return null;
+            }
+            return mc.getBlockRenderer().getBlockModel(state);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static int emitShapeOrModelQuads(List<Long> out, BlockState[] blocks, VoxelShape shape, int bx, int by, int bz,
+                                             BlockState state, int tintRgb, int bl, int sl, int mat, boolean wind,
+                                             AtlasUVTable atlas) {
+        BakedModel model = getBakedModelSafe(state);
+        if (model != null) {
+            return emitBakedModelQuads(out, blocks, model, bx, by, bz, state, tintRgb, bl, sl, mat, wind, atlas);
+        }
+        return emitShapeBoxes(out, blocks, shape, bx, by, bz, state, tintRgb, bl, sl, mat, wind, atlas);
+    }
+
+    private static int emitBakedModelQuads(List<Long> out, BlockState[] blocks, BakedModel model,
+                                           int bx, int by, int bz, BlockState state,
+                                           int tintRgb, int bl, int sl, int mat, boolean wind,
+                                           AtlasUVTable atlas) {
+        boolean[] neighborOpaque = {
+                isSolidAt(blocks, bx + 1, by, bz),
+                isSolidAt(blocks, bx - 1, by, bz),
+                isSolidAt(blocks, bx, by + 1, bz),
+                isSolidAt(blocks, bx, by - 1, bz),
+                isSolidAt(blocks, bx, by, bz + 1),
+                isSolidAt(blocks, bx, by, bz - 1)
+        };
+
+        RandomSource random = MODEL_RANDOM.get();
+        int[] aoBuf = new int[4];
+        boolean[] aoComputed = new boolean[6];
+        int[][] aoCached = new int[6][4];
+        int baseX16 = bx * 16;
+        int baseY16 = by * 16;
+        int baseZ16 = bz * 16;
+
+        int quads = 0;
+        int[] px = new int[4];
+        int[] py = new int[4];
+        int[] pz = new int[4];
+        float[] vu = new float[4];
+        float[] vv = new float[4];
+
+        for (int cullIdx = 0; cullIdx < 7; cullIdx++) {
+            if (cullIdx < 6 && neighborOpaque[cullIdx]) {
+                continue;
+            }
+            Direction cullFace = (cullIdx < 6) ? DIR_ENUM[cullIdx] : null;
+            random.setSeed(42L);
+            List<BakedQuad> modelQuads;
+            try {
+                modelQuads = model.getQuads(state, cullFace, random);
+            } catch (Throwable ignored) {
+                continue;
+            }
+            if (modelQuads == null || modelQuads.isEmpty()) {
+                continue;
+            }
+
+            for (int qi = 0; qi < modelQuads.size(); qi++) {
+                BakedQuad quad = modelQuads.get(qi);
+                if (quad == null) continue;
+                int[] verts = quad.getVertices();
+                if (verts == null || verts.length < 32) continue;
+                int stride = verts.length / 4;
+
+                int dir = directionToInt(quad.getDirection());
+                for (int v = 0; v < 4; v++) {
+                    int off = v * stride;
+                    px[v] = clamp16(Float.intBitsToFloat(verts[off]));
+                    py[v] = clamp16(Float.intBitsToFloat(verts[off + 1]));
+                    pz[v] = clamp16(Float.intBitsToFloat(verts[off + 2]));
+                    vu[v] = Float.intBitsToFloat(verts[off + 4]);
+                    vv[v] = Float.intBitsToFloat(verts[off + 5]);
+                }
+
+                // Skip degenerate zero-area quads
+                if ((px[0] == px[2] && py[0] == py[2] && pz[0] == pz[2])
+                        || (px[1] == px[3] && py[1] == py[3] && pz[1] == pz[3])) {
+                    continue;
+                }
+
+                boolean onOuterBoundary = switch (dir) {
+                    case 0 -> px[0] == 16 && px[1] == 16 && px[2] == 16 && px[3] == 16;
+                    case 1 -> px[0] == 0 && px[1] == 0 && px[2] == 0 && px[3] == 0;
+                    case 2 -> py[0] == 16 && py[1] == 16 && py[2] == 16 && py[3] == 16;
+                    case 3 -> py[0] == 0 && py[1] == 0 && py[2] == 0 && py[3] == 0;
+                    case 4 -> pz[0] == 16 && pz[1] == 16 && pz[2] == 16 && pz[3] == 16;
+                    default -> pz[0] == 0 && pz[1] == 0 && pz[2] == 0 && pz[3] == 0;
+                };
+
+                // Cull non-cullface quads that sit flush against an adjacent opaque full cube
+                if (cullIdx == 6 && onOuterBoundary && neighborOpaque[dir]) {
+                    continue;
+                }
+
+                if (onOuterBoundary) {
+                    if (!aoComputed[dir]) {
+                        computeAO(blocks, bx, by, bz, dir, aoCached[dir]);
+                        aoComputed[dir] = true;
+                    }
+                    System.arraycopy(aoCached[dir], 0, aoBuf, 0, 4);
+                } else {
+                    aoBuf[0] = aoBuf[1] = aoBuf[2] = aoBuf[3] = 3;
+                }
+
+                TextureAtlasSprite sprite = quad.getSprite();
+                int spriteId;
+                float u0 = 0.0f, du = 0.0f, v0 = 0.0f, dv = 0.0f;
+                if (sprite != null) {
+                    int effTint = 0xFFFFFF;
+                    if (quad.isTinted()) {
+                        effTint = (tintRgb >= 0) ? (tintRgb & 0xFFFFFF) : 0x7CBD52;
+                    }
+                    spriteId = atlas.getOrRegisterSpriteId(sprite, effTint);
+                    u0 = sprite.getU0();
+                    du = sprite.getU1() - u0;
+                    v0 = sprite.getV0();
+                    dv = sprite.getV1() - v0;
+                } else {
+                    spriteId = atlas.getSpriteId(state, dir, quad.isTinted() ? tintRgb : -1);
+                }
+
+                for (int v = 0; v < 4; v++) {
+                    int u16 = (Math.abs(du) > 1e-6f) ? clamp16((vu[v] - u0) / du) : ((v == 1 || v == 2) ? 16 : 0);
+                    int v16 = (Math.abs(dv) > 1e-6f) ? clamp16((vv[v] - v0) / dv) : ((v == 0 || v == 1) ? 16 : 0);
+                    int aoVal = aoBuf[v];
+                    if (onOuterBoundary) {
+                        int ca = (dir <= 1) ? pz[v] : px[v];
+                        int cb = (dir == 2 || dir == 3) ? pz[v] : py[v];
+                        int aBit = (ca >= 8) ? 1 : 0;
+                        int bBit = (cb >= 8) ? 1 : 0;
+                        int aoIdx = (bBit == 0) ? aBit : (3 - aBit);
+                        aoVal = aoBuf[aoIdx];
+                    }
+                    out.add(VkShapeVertex.packWord0(
+                            baseX16 + px[v], baseY16 + py[v], baseZ16 + pz[v],
+                            dir, aoVal, bl, sl, mat, wind, u16, v16
+                    ));
+                    out.add(VkShapeVertex.packWord1(spriteId));
+                }
+                quads++;
+            }
+        }
+
+        if (quads > SHAPE_BOX_WARN_CAP) {
+            LOGGER.warn("[Valkyrie] BakedModel block {} at section-local ({}, {}, {}) emitted {} quads (exceeds soft cap {}); emitting all without truncation.",
+                    state.getBlock(), bx, by, bz, quads, SHAPE_BOX_WARN_CAP);
+        }
+        return quads;
     }
 
     private static int emitShapeBoxes(List<Long> out, BlockState[] blocks, VoxelShape shape, int bx, int by, int bz,
