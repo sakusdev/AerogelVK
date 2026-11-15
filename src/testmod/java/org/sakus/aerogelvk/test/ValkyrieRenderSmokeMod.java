@@ -201,17 +201,22 @@ public final class ValkyrieRenderSmokeMod implements ClientModInitializer {
                             }
                             if ("night".equals(reproMode)) {
                                 targetLevel.setDayTime(18000L);
+                            } else if ("walk".equals(reproMode)) {
+                                targetLevel.setDayTime(2000L);
                             } else {
                                 targetLevel.setDayTime(6000L);
                             }
                             final ServerLevel finalLevel = targetLevel;
                             for (var sp : mc.getSingleplayerServer().getPlayerList().getPlayers()) {
-                                sp.getAbilities().flying = true;
+                                boolean walkMode = "walk".equals(reproMode);
+                                sp.getAbilities().flying = !walkMode;
                                 sp.onUpdateAbilities();
                                 if ("end".equals(reproMode)) {
                                     sp.teleportTo(finalLevel, 0.0, 72.0, -35.0, java.util.Set.of(), 0.0f, 15.0f);
                                 } else if ("redstone".equals(reproMode)) {
                                     sp.teleportTo(finalLevel, 7.5, 162.5, 1.5, java.util.Set.of(), 0.0f, 38.0f);
+                                } else if (walkMode) {
+                                    sp.teleportTo(finalLevel, 8.0, 160.0, 2.0, java.util.Set.of(), 0.0f, 10.0f);
                                 } else {
                                     sp.teleportTo(finalLevel, 8.0, 162.0, -1.5, java.util.Set.of(), 0.0f, 24.0f);
                                 }
@@ -219,13 +224,18 @@ public final class ValkyrieRenderSmokeMod implements ClientModInitializer {
                             shapeShowcaseServerDone = true;
                         });
                     } else if (shapeShowcaseBuilt && shapeShowcaseServerDone) {
-                        mc.player.getAbilities().flying = true;
+                        boolean walkMode = "walk".equals(reproMode);
+                        mc.player.getAbilities().flying = !walkMode;
                         if ("night".equals(reproMode)) {
                             mc.level.setDayTime(18000L);
+                        } else if (walkMode) {
+                            mc.level.setDayTime(2000L);
+                            mc.options.bobView().set(true);
+                            mc.options.keyUp.setDown(true);
                         }
                         if (!"end".equals(reproMode)) {
                             mc.player.setYRot(0.0f);
-                            mc.player.setXRot("redstone".equals(reproMode) ? 38.0f : 24.0f);
+                            mc.player.setXRot("redstone".equals(reproMode) ? 38.0f : (walkMode ? 10.0f : 24.0f));
                             mc.player.yRotO = 0.0f;
                             mc.player.xRotO = mc.player.getXRot();
                         }
@@ -731,12 +741,13 @@ public final class ValkyrieRenderSmokeMod implements ClientModInitializer {
                 level.setBlock(new BlockPos(12, 161, 6), Blocks.REDSTONE_WIRE.defaultBlockState(), Block.UPDATE_ALL);
                 level.setBlock(new BlockPos(13, 160, 6), Blocks.REDSTONE_BLOCK.defaultBlockState(), Block.UPDATE_ALL);
             }
-            case "day", "night" -> {
-                // Simple terrain + pillar + torch for day/night comparison
-                for (int y = 160; y <= 162; y++) {
-                    level.setBlock(new BlockPos(8, y, 6), Blocks.OAK_LOG.defaultBlockState(), Block.UPDATE_ALL);
+            case "day", "night", "walk" -> {
+                // Simple terrain + pillar + torch for day/night/walk comparison
+                for (int y = 160; y <= 164; y++) {
+                    level.setBlock(new BlockPos(8, y, 8), Blocks.OAK_LOG.defaultBlockState(), Block.UPDATE_ALL);
+                    level.setBlock(new BlockPos(5, y, 10), Blocks.STONE_BRICKS.defaultBlockState(), Block.UPDATE_ALL);
                 }
-                level.setBlock(new BlockPos(7, 160, 6), Blocks.TORCH.defaultBlockState(), Block.UPDATE_ALL);
+                level.setBlock(new BlockPos(7, 160, 8), Blocks.TORCH.defaultBlockState(), Block.UPDATE_ALL);
             }
             default -> {
             }

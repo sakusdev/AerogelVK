@@ -167,10 +167,11 @@ void main() {
 
     // Sky Background handling (Reversed-Z: far plane depth <= 0.00001)
     if (depth <= 0.00001) {
-        // Reconstruct background ray at mid-frustum depth (z=0.5) to avoid w=0 at infinity
-        vec4 clipPos = vec4(uv.x * 2.0 - 1.0, uv.y * 2.0 - 1.0, 0.5, 1.0);
-        vec4 worldRayH = FrameUBO.invViewProj * clipPos;
-        vec3 rayDir = normalize(worldRayH.xyz / worldRayH.w - FrameUBO.cameraPos.xyz);
+        // Reconstruct ray from two depths so view-bobbing/camera translation cancels out identically
+        vec2 ndc = uv * 2.0 - 1.0;
+        vec4 pNear = FrameUBO.invViewProj * vec4(ndc, 0.9, 1.0);
+        vec4 pFar  = FrameUBO.invViewProj * vec4(ndc, 0.1, 1.0);
+        vec3 rayDir = normalize(pFar.xyz / pFar.w - pNear.xyz / pNear.w);
 
         imageStore(uHdrColorImg, pixelCoord, vec4(evaluateSky(rayDir, L), 1.0));
         return;
