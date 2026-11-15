@@ -859,7 +859,7 @@ public class VkInteropManager implements AutoCloseable {
                         vkLayoutToGlExtLayout(vkExportedColorLayout),
                         vkLayoutToGlExtLayout(vkExportedDepthLayout)
                 );
-                EXTSemaphore.glWaitSemaphoreEXT(glVkRenderCompleteSemaphore, null, textures, layouts);
+                EXTSemaphore.glWaitSemaphoreEXT(glVkRenderCompleteSemaphore, stack.ints(), textures, layouts);
             }
         } else if (interopMode == InteropMode.STAGING_READBACK) {
             VkContext ctx = VkContext.getInstance();
@@ -956,7 +956,7 @@ public class VkInteropManager implements AutoCloseable {
                 try (MemoryStack stack = MemoryStack.stackPush()) {
                     IntBuffer textures = stack.ints(glSharedColorTex, glSharedDepthTex);
                     IntBuffer layouts = stack.ints(EXTSemaphore.GL_LAYOUT_GENERAL_EXT, EXTSemaphore.GL_LAYOUT_GENERAL_EXT);
-                    EXTSemaphore.glSignalSemaphoreEXT(glReadySemaphore, null, textures, layouts);
+                    EXTSemaphore.glSignalSemaphoreEXT(glReadySemaphore, stack.ints(), textures, layouts);
                     glSemaphoreSignaled = true;
                 }
             } else if (interopMode == InteropMode.ZERO_COPY_FENCE) {
