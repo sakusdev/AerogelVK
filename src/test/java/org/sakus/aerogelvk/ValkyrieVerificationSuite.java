@@ -236,21 +236,22 @@ public class ValkyrieVerificationSuite {
         GreedyMesher.MeshedSectionResult barrierRes = GreedyMesher.mesh(new GreedyMesher.SectionSnapshot(0, 0, 0, blocks, bl, sl));
         assertEq("barrierQuadCount", 0, barrierRes.quadCount());
 
-        // Adjacent same-fluid blocks cull shared internal face & greedy merge to 6 translucent quads (B6 split)
+        // Adjacent same-fluid blocks cull shared internal face & emit sloped quads in halfScaleTranslucent buffer (10 quads for 2 blocks)
         Arrays.fill(blocks, Blocks.AIR.defaultBlockState());
         blocks[((2 + 1) * halo + (2 + 1)) * halo + (2 + 1)] = Blocks.WATER.defaultBlockState();
         blocks[((2 + 1) * halo + (2 + 1)) * halo + (3 + 1)] = Blocks.WATER.defaultBlockState();
         GreedyMesher.MeshedSectionResult waterPoolRes = GreedyMesher.mesh(new GreedyMesher.SectionSnapshot(0, 0, 0, blocks, bl, sl));
         assertEq("waterPoolOpaqueQuadCount", 0, waterPoolRes.quadCount());
-        assertEq("waterPoolTranslucentQuadCount", 6, waterPoolRes.translucentQuadCount());
+        assertEq("waterPoolTranslucentQuadCount", 0, waterPoolRes.translucentQuadCount());
+        assertEq("waterPoolHalfScaleTranslucentQuadCount", 10, waterPoolRes.halfScaleTranslucentQuadCount());
 
-        // Stone adjacent to translucent water: stone keeps 6 opaque faces, water culls stone-facing face (5 translucent faces)
+        // Stone adjacent to translucent water: stone keeps 6 opaque faces, water culls stone-facing face (5 half-scale translucent faces)
         Arrays.fill(blocks, Blocks.AIR.defaultBlockState());
         blocks[((2 + 1) * halo + (2 + 1)) * halo + (2 + 1)] = Blocks.STONE.defaultBlockState();
         blocks[((2 + 1) * halo + (2 + 1)) * halo + (3 + 1)] = Blocks.WATER.defaultBlockState();
         GreedyMesher.MeshedSectionResult stoneWaterRes = GreedyMesher.mesh(new GreedyMesher.SectionSnapshot(0, 0, 0, blocks, bl, sl));
         assertEq("stoneWaterOpaqueQuadCount", 6, stoneWaterRes.quadCount());
-        assertEq("stoneWaterTranslucentQuadCount", 5, stoneWaterRes.translucentQuadCount());
+        assertEq("stoneWaterHalfScaleTranslucentQuadCount", 5, stoneWaterRes.halfScaleTranslucentQuadCount());
 
         // Non-full VoxelShape block (e.g. OAK_SLAB) emits half-scale opaque quads (B5)
         Arrays.fill(blocks, Blocks.AIR.defaultBlockState());
