@@ -449,8 +449,8 @@ public final class ValkyrieRenderer {
         float partialTicks = deltaTracker != null ? deltaTracker.getGameTimeDeltaPartialTick(true) : 0f;
         float timeOfDay = (level != null) ? level.getTimeOfDay(partialTicks) : 0.25f;
 
-        float sunAngle = (timeOfDay - 0.25f) * (float) (Math.PI * 2.0);
-        Vector3f sunDir = new Vector3f((float) Math.cos(sunAngle), (float) Math.sin(sunAngle), 0.25f).normalize();
+        float sunAngle = timeOfDay * (float) (Math.PI * 2.0);
+        Vector3f sunDir = new Vector3f((float) -Math.sin(sunAngle), (float) Math.cos(sunAngle), 0.25f).normalize();
 
         // frustumMatrix from GameRenderer already holds camera rotation inverse (world -> view rotation)
         Matrix4f viewMatrix = new Matrix4f(frustumMatrix).translate(-cameraPos.x, -cameraPos.y, -cameraPos.z);
