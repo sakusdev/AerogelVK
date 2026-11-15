@@ -36,9 +36,14 @@ import java.nio.ByteBuffer;
 import java.nio.IntBuffer;
 import java.nio.LongBuffer;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import static org.lwjgl.vulkan.VK10.*;
 import static org.lwjgl.vulkan.VK12.vkCmdDrawIndexedIndirectCount;
@@ -81,12 +86,19 @@ public final class ValkyrieRenderer {
 
     private static final int FRAMES_IN_FLIGHT = 2;
     private static final int MAX_SECTION_CAPTURES_PER_FRAME = 256;
+    private static final int RECORD_WORKER_COUNT = Math.max(1, Math.min(3,
+            Runtime.getRuntime().availableProcessors() - Math.max(1, Runtime.getRuntime().availableProcessors() / 2)));
+    private static final int MAX_PARALLEL_CMDS_PER_WORKER = 4;
 
     private final Set<Long> dirtySections = ConcurrentHashMap.newKeySet();
 
     private final VkCommandBuffer[] commandBuffers = new VkCommandBuffer[FRAMES_IN_FLIGHT];
+    private final VkCommandBuffer[] postCommandBuffers = new VkCommandBuffer[FRAMES_IN_FLIGHT];
     private final VkCommandBuffer[] transferCommandBuffers = new VkCommandBuffer[FRAMES_IN_FLIGHT];
     private final long[] transferCompleteSemaphores = new long[FRAMES_IN_FLIGHT];
+    private final long[][] workerCommandPools = new long[RECORD_WORKER_COUNT][FRAMES_IN_FLIGHT];
+    private final VkCommandBuffer[][][] workerCommandBuffers = new VkCommandBuffer[RECORD_WORKER_COUNT][FRAMES_IN_FLIGHT][MAX_PARALLEL_CMDS_PER_WORKER];
+    private ExecutorService recordExecutor;
     private final long[] frameFences = new long[FRAMES_IN_FLIGHT];
     private final boolean[] fenceWaited = new boolean[FRAMES_IN_FLIGHT];
     private int currentFrameSlot = 0;
@@ -189,6 +201,7 @@ public final class ValkyrieRenderer {
             LongBuffer pSem = stack.mallocLong(1);
             for (int i = 0; i < FRAMES_IN_FLIGHT; i++) {
                 this.commandBuffers[i] = vkContext.allocateCommandBuffer();
+                this.postCommandBuffers[i] = vkContext.allocateCommandBuffer();
                 this.transferCommandBuffers[i] = vkContext.allocateTransferCommandBuffer();
                 int semRes = vkCreateSemaphore(vkContext.getVkDevice(), semInfo, null, pSem);
                 if (semRes != VK_SUCCESS) {
@@ -202,6 +215,44 @@ public final class ValkyrieRenderer {
                 }
                 this.frameFences[i] = pFence.get(0);
                 this.fenceWaited[i] = true;
+            }
+
+            // Stage B: Per-worker, per-slot VkCommandPools & pre-allocated primary command buffers
+            VkCommandPoolCreateInfo workerPoolInfo = VkCommandPoolCreateInfo.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO)
+                    .flags(VK_COMMAND_POOL_CREATE_TRANSIENT_BIT)
+                    .queueFamilyIndex(vkContext.getQueueFamilyIndex());
+            LongBuffer pPool = stack.mallocLong(1);
+            PointerBuffer pWorkerCmds = stack.mallocPointer(MAX_PARALLEL_CMDS_PER_WORKER);
+            for (int w = 0; w < RECORD_WORKER_COUNT; w++) {
+                for (int i = 0; i < FRAMES_IN_FLIGHT; i++) {
+                    int poolRes = vkCreateCommandPool(vkContext.getVkDevice(), workerPoolInfo, null, pPool);
+                    if (poolRes != VK_SUCCESS) {
+                        throw new RuntimeException("Failed to create worker command pool[" + w + "][" + i + "]: " + poolRes);
+                    }
+                    long pool = pPool.get(0);
+                    workerCommandPools[w][i] = pool;
+
+                    VkCommandBufferAllocateInfo allocInfo = VkCommandBufferAllocateInfo.calloc(stack)
+                            .sType(VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO)
+                            .commandPool(pool)
+                            .level(VK_COMMAND_BUFFER_LEVEL_PRIMARY)
+                            .commandBufferCount(MAX_PARALLEL_CMDS_PER_WORKER);
+                    int allocRes = vkAllocateCommandBuffers(vkContext.getVkDevice(), allocInfo, pWorkerCmds);
+                    if (allocRes != VK_SUCCESS) {
+                        throw new RuntimeException("Failed to allocate worker command buffers[" + w + "][" + i + "]: " + allocRes);
+                    }
+                    for (int k = 0; k < MAX_PARALLEL_CMDS_PER_WORKER; k++) {
+                        workerCommandBuffers[w][i][k] = new VkCommandBuffer(pWorkerCmds.get(k), vkContext.getVkDevice());
+                    }
+                }
+            }
+            if (RECORD_WORKER_COUNT > 1 && (this.recordExecutor == null || this.recordExecutor.isShutdown())) {
+                this.recordExecutor = Executors.newFixedThreadPool(RECORD_WORKER_COUNT, r -> {
+                    Thread t = new Thread(r, "valkyrie-cmd-recorder");
+                    t.setDaemon(true);
+                    return t;
+                });
             }
         }
 
@@ -301,6 +352,11 @@ public final class ValkyrieRenderer {
             }
         }
         vkResetFences(device, frameFences[slot]);
+        for (int w = 0; w < RECORD_WORKER_COUNT; w++) {
+            if (workerCommandPools[w][slot] != VK_NULL_HANDLE) {
+                vkResetCommandPool(device, workerCommandPools[w][slot], 0);
+            }
+        }
         vkMegaBuffer.beginFrameSlot(slot, FRAMES_IN_FLIGHT);
 
         // 1b. Drain deduplicated dirty section coordinates and capture non-empty snapshots
@@ -415,9 +471,9 @@ public final class ValkyrieRenderer {
             }
         }
 
-        // 5b. Record Graphics Command Buffer (single-queue fallback records transfers inline to avoid same-queue semaphore deadlock)
-        VkCommandBuffer activeCmd = commandBuffers[slot];
-        recordFrameCommands(activeCmd, width, height, shaderPackUniforms, slot, asyncTransferSubmitted);
+        // 5b. Record Graphics Command Buffer(s) (Stage B: multi-threaded independent primary CBs for builtin PBR when >= 2 passes, else serial)
+        List<VkCommandBuffer> submittedCmds = recordFrameCommands(
+                slot, width, height, shaderPackUniforms, asyncTransferSubmitted);
 
         // B4: Track actual final Vulkan image layouts before GL waitSemaphoreEXT acquires them
         vkInteropManager.setVkExportedLayouts(
@@ -425,9 +481,12 @@ public final class ValkyrieRenderer {
                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
         );
 
-        // 6. Submit Graphics Command Buffer (using external/transfer semaphores when active, else fence sync in composite)
+        // 6. Submit Command Buffer(s) (using external/transfer semaphores when active, else fence sync in composite)
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            PointerBuffer pCmd = stack.pointers(activeCmd);
+            PointerBuffer pCmd = stack.mallocPointer(submittedCmds.size());
+            for (int i = 0; i < submittedCmds.size(); i++) {
+                pCmd.put(i, submittedCmds.get(i).address());
+            }
 
             VkSubmitInfo submitInfo = VkSubmitInfo.calloc(stack)
                     .sType(VK_STRUCTURE_TYPE_SUBMIT_INFO)
@@ -474,7 +533,152 @@ public final class ValkyrieRenderer {
         frameIndex++;
     }
 
-    private void recordFrameCommands(
+    private List<VkCommandBuffer> recordFrameCommands(
+            int frameSlot,
+            int width,
+            int height,
+            ShaderUniformLayout.UniformData shaderPackUniforms,
+            boolean asyncTransferSubmitted
+    ) {
+        int activeSections = vkMegaBuffer.getActiveSectionCount();
+        int slotDispatchLimit = vkMegaBuffer.getSlotDispatchLimit();
+        boolean useShaderPack = shaderPackUniforms != null && isShaderPackActive();
+
+        // Stage B: Parallelize independent CSM cascades + Opaque GBuffer into per-worker primary CBs
+        if (activeSections > 0 && slotDispatchLimit > 0 && !useShaderPack && RECORD_WORKER_COUNT > 1 && recordExecutor != null) {
+            ValkyrieConfig config = ValkyrieConfig.get();
+            List<Integer> csmCascades = new ArrayList<>(VkPipelineManager.CSM_CASCADE_COUNT);
+            if (config.isCsmEnabled()) {
+                int activeCascades = Math.min(config.getCsmCascades(), VkPipelineManager.CSM_CASCADE_COUNT);
+                for (int c = 0; c < activeCascades; c++) {
+                    if (vkPipelineManager.shouldUpdateCascade(c, frameIndex, dirtyShadow)) {
+                        csmCascades.add(c);
+                    }
+                }
+            }
+            // Only dispatch to worker threads when there are >= 2 independent passes
+            int totalParallelPasses = csmCascades.size() + 1; // cascades + opaque GBuffer
+            if (totalParallelPasses >= 2) {
+                return recordBuiltinPbrParallel(
+                        frameSlot, width, height, slotDispatchLimit,
+                        csmCascades, asyncTransferSubmitted);
+            }
+        }
+
+        // Serial fallback (shaderpack, phase2 fallback, or <2 independent passes)
+        VkCommandBuffer commandBuffer = commandBuffers[frameSlot];
+        recordFrameCommandsSerial(commandBuffer, width, height, shaderPackUniforms, frameSlot, asyncTransferSubmitted);
+        return List.of(commandBuffer);
+    }
+
+    private List<VkCommandBuffer> recordBuiltinPbrParallel(
+            int frameSlot,
+            int width,
+            int height,
+            int slotDispatchLimit,
+            List<Integer> csmCascades,
+            boolean asyncTransferSubmitted
+    ) {
+        ValkyrieConfig config = ValkyrieConfig.get();
+        boolean useHiZ = hasPreviousFrameHiZ && config.isHiZOcclusionEnabled();
+        boolean hasTranslucent = vkMegaBuffer.hasTranslucentSections();
+        long sharedColorImage = vkInteropManager.getSharedColorImage();
+        long sharedDepthImage = vkInteropManager.getSharedDepthImage();
+        long sharedDepthImageView = vkInteropManager.getSharedDepthImageView();
+
+        logActivePipelineIfChanged("builtin-pbr");
+
+        // 1. Pre-pass CB on main thread: transfer/acquire + opaque chunk cull
+        VkCommandBuffer preCmd = commandBuffers[frameSlot];
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            vkResetCommandBuffer(preCmd, 0);
+            VkCommandBufferBeginInfo beginInfo = VkCommandBufferBeginInfo.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
+                    .flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
+            vkBeginCommandBuffer(preCmd, beginInfo);
+
+            if (asyncTransferSubmitted) {
+                vkMegaBuffer.recordTransferAcquireBarrier(preCmd);
+            } else {
+                vkMegaBuffer.recordPendingTransfersForSlot(frameSlot, preCmd, false);
+            }
+
+            long pipeLayout = vkPipelineManager.getPipelineLayout();
+            LongBuffer pSets = stack.longs(vkPipelineManager.getDescriptorSet0(frameSlot), vkPipelineManager.getDescriptorSet1());
+            dispatchChunkCull(preCmd, pipeLayout, pSets, slotDispatchLimit, useHiZ, 1, stack);
+            vkEndCommandBuffer(preCmd);
+        }
+
+        // 2. Build ordered independent pass descriptors (CSM cascades + Opaque GBuffer)
+        int totalTasks = csmCascades.size() + 1;
+        VkCommandBuffer[] orderedParallelCmds = new VkCommandBuffer[totalTasks];
+        int usedWorkers = Math.min(RECORD_WORKER_COUNT, totalTasks);
+        List<CompletableFuture<Void>> futures = new ArrayList<>(usedWorkers);
+
+        for (int w = 0; w < usedWorkers; w++) {
+            final int workerIdx = w;
+            futures.add(CompletableFuture.runAsync(() -> {
+                int localCmdIdx = 0;
+                for (int t = workerIdx; t < totalTasks; t += usedWorkers) {
+                    VkCommandBuffer wCmd = workerCommandBuffers[workerIdx][frameSlot][localCmdIdx++];
+                    orderedParallelCmds[t] = wCmd;
+                    try (MemoryStack stack = MemoryStack.stackPush()) {
+                        VkCommandBufferBeginInfo beginInfo = VkCommandBufferBeginInfo.calloc(stack)
+                                .sType(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
+                                .flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
+                        vkBeginCommandBuffer(wCmd, beginInfo);
+                        if (t < csmCascades.size()) {
+                            renderCsmCascade(wCmd, csmCascades.get(t), slotDispatchLimit, frameSlot, stack);
+                        } else {
+                            renderGBuffer(wCmd, width, height, slotDispatchLimit, frameSlot, false, !hasTranslucent, stack);
+                        }
+                        vkEndCommandBuffer(wCmd);
+                    }
+                }
+            }, recordExecutor));
+        }
+
+        // 3. While workers record CSM + Opaque GBuffer, record post-GBuffer passes on main thread
+        VkCommandBuffer postCmd = postCommandBuffers[frameSlot];
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            vkResetCommandBuffer(postCmd, 0);
+            VkCommandBufferBeginInfo beginInfo = VkCommandBufferBeginInfo.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
+                    .flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
+            vkBeginCommandBuffer(postCmd, beginInfo);
+
+            long pipeLayout = vkPipelineManager.getPipelineLayout();
+            LongBuffer pSets = stack.longs(vkPipelineManager.getDescriptorSet0(frameSlot), vkPipelineManager.getDescriptorSet1());
+            if (hasTranslucent) {
+                dispatchChunkCull(postCmd, pipeLayout, pSets, slotDispatchLimit, useHiZ, 2, stack);
+                renderGBuffer(postCmd, width, height, slotDispatchLimit, frameSlot, true, true, stack);
+            }
+            renderDeferredLighting(postCmd, width, height, frameSlot, stack);
+            if (config.isHiZOcclusionEnabled()) {
+                renderHiZPyramid(postCmd, width, height, stack);
+                hasPreviousFrameHiZ = true;
+            } else {
+                hasPreviousFrameHiZ = false;
+            }
+            renderPostComposite(postCmd, width, height, sharedColorImage, frameSlot, stack);
+            renderDepthConvert(postCmd, width, height, sharedDepthImage, sharedDepthImageView, frameSlot, stack);
+            vkEndCommandBuffer(postCmd);
+        }
+
+        for (CompletableFuture<Void> f : futures) {
+            f.join();
+        }
+
+        List<VkCommandBuffer> result = new ArrayList<>(totalTasks + 2);
+        result.add(preCmd);
+        for (VkCommandBuffer c : orderedParallelCmds) {
+            result.add(c);
+        }
+        result.add(postCmd);
+        return result;
+    }
+
+    private void recordFrameCommandsSerial(
             VkCommandBuffer commandBuffer,
             int width,
             int height,
@@ -1793,12 +1997,32 @@ public final class ValkyrieRenderer {
                     vkContext.freeCommandBuffer(commandBuffers[i]);
                     commandBuffers[i] = null;
                 }
+                if (postCommandBuffers[i] != null) {
+                    vkContext.freeCommandBuffer(postCommandBuffers[i]);
+                    postCommandBuffers[i] = null;
+                }
                 if (transferCommandBuffers[i] != null) {
                     vkContext.freeTransferCommandBuffer(transferCommandBuffers[i]);
                     transferCommandBuffers[i] = null;
                 }
                 fenceWaited[i] = false;
             }
+            for (int w = 0; w < RECORD_WORKER_COUNT; w++) {
+                for (int i = 0; i < FRAMES_IN_FLIGHT; i++) {
+                    if (workerCommandPools[w][i] != VK_NULL_HANDLE) {
+                        vkDestroyCommandPool(device, workerCommandPools[w][i], null);
+                        workerCommandPools[w][i] = VK_NULL_HANDLE;
+                    }
+                    for (int k = 0; k < MAX_PARALLEL_CMDS_PER_WORKER; k++) {
+                        workerCommandBuffers[w][i][k] = null;
+                    }
+                }
+            }
+        }
+
+        if (recordExecutor != null) {
+            recordExecutor.shutdownNow();
+            recordExecutor = null;
         }
 
         if (greedyMesher != null) {
