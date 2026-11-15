@@ -15,16 +15,20 @@ import java.nio.FloatBuffer;
 import java.nio.IntBuffer;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Core Vulkan 1.3 Context and Resource Manager for ValkyrieRender.
- * Manages VkInstance, VkPhysicalDevice, VkDevice, graphics/compute VkQueue,
+ * Manages VkInstance, VkPhysicalDevice, VkDevice, graphics/transfer/compute VkQueues,
  * command pools, VMA allocator, and memory type queries.
  */
 public class VkContext implements AutoCloseable {
     public static final int FRAMES_IN_FLIGHT = 2;
+    private static final String VALIDATION_LAYER_NAME = "VK_LAYER_KHRONOS_validation";
     private static final Logger LOGGER = LoggerFactory.getLogger(VkContext.class);
     private static VkContext instance;
 
@@ -32,14 +36,28 @@ public class VkContext implements AutoCloseable {
     private VkPhysicalDevice physicalDevice;
     private VkDevice vkDevice;
     private VkQueue graphicsQueue;
+    private VkQueue transferQueue;
+    private VkQueue computeQueue;
     private int queueFamilyIndex = -1;
+    private int transferQueueFamilyIndex = -1;
+    private int transferQueueIndex = 0;
+    private int computeQueueFamilyIndex = -1;
+    private int computeQueueIndex = 0;
+    private boolean dedicatedTransferQueue = false;
+    private boolean dedicatedComputeQueue = false;
     private long commandPool;
+    private long transferCommandPool;
+    private long computeCommandPool;
     private long vmaAllocator;
     private VkPhysicalDeviceMemoryProperties memoryProperties;
     private String deviceName = "Unknown";
     private byte[] deviceUuid;
     private boolean externalMemorySupported = false;
     private boolean externalSemaphoreSupported = false;
+    private boolean validationEnabled = false;
+    private long debugMessenger = VK10.VK_NULL_HANDLE;
+    private VkDebugUtilsMessengerCallbackEXT debugCallback;
+    private final AtomicInteger validationErrorCount = new AtomicInteger(0);
     private boolean initialized = false;
 
     public static synchronized VkContext getInstance() {
@@ -100,6 +118,36 @@ public class VkContext implements AutoCloseable {
                 enabledExtensions.add(KHRExternalSemaphoreCapabilities.VK_KHR_EXTERNAL_SEMAPHORE_CAPABILITIES_EXTENSION_NAME);
             }
 
+            boolean wantValidation = Boolean.parseBoolean(
+                    System.getProperty("aerogelvk.vk.validation",
+                            System.getenv().getOrDefault("AEROGELVK_VK_VALIDATION", "false")));
+            List<String> enabledLayers = new ArrayList<>();
+            validationEnabled = false;
+            validationErrorCount.set(0);
+            if (wantValidation) {
+                IntBuffer layerCount = stack.mallocInt(1);
+                VK10.vkEnumerateInstanceLayerProperties(layerCount, null);
+                VkLayerProperties.Buffer availableLayers = VkLayerProperties.malloc(layerCount.get(0), stack);
+                VK10.vkEnumerateInstanceLayerProperties(layerCount, availableLayers);
+                boolean hasValidationLayer = false;
+                for (int i = 0; i < availableLayers.capacity(); i++) {
+                    if (VALIDATION_LAYER_NAME.equals(availableLayers.get(i).layerNameString())) {
+                        hasValidationLayer = true;
+                        break;
+                    }
+                }
+                if (hasValidationLayer) {
+                    enabledLayers.add(VALIDATION_LAYER_NAME);
+                    validationEnabled = true;
+                    if (supportedExtNames.contains(EXTDebugUtils.VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) {
+                        enabledExtensions.add(EXTDebugUtils.VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+                    }
+                    LOGGER.info("[Valkyrie] Enabling Vulkan Validation Layer: {}", VALIDATION_LAYER_NAME);
+                } else {
+                    LOGGER.warn("[Valkyrie] AEROGELVK_VK_VALIDATION=true requested, but {} is not installed.", VALIDATION_LAYER_NAME);
+                }
+            }
+
             PointerBuffer ppExtensions = stack.mallocPointer(enabledExtensions.size());
             for (String ext : enabledExtensions) {
                 LOGGER.info("[Valkyrie] Enabling Vulkan Instance extension: {}", ext);
@@ -107,10 +155,50 @@ public class VkContext implements AutoCloseable {
             }
             ppExtensions.flip();
 
+            PointerBuffer ppLayers = null;
+            if (!enabledLayers.isEmpty()) {
+                ppLayers = stack.mallocPointer(enabledLayers.size());
+                for (String layer : enabledLayers) {
+                    ppLayers.put(stack.UTF8(layer));
+                }
+                ppLayers.flip();
+            }
+
+            VkDebugUtilsMessengerCreateInfoEXT debugCreateInfo = null;
+            if (validationEnabled && enabledExtensions.contains(EXTDebugUtils.VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) {
+                debugCallback = VkDebugUtilsMessengerCallbackEXT.create((messageSeverity, messageTypes, pCallbackData, pUserData) -> {
+                    VkDebugUtilsMessengerCallbackDataEXT data = VkDebugUtilsMessengerCallbackDataEXT.create(pCallbackData);
+                    String msg = data.pMessageString();
+                    if ((messageSeverity & EXTDebugUtils.VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) != 0) {
+                        validationErrorCount.incrementAndGet();
+                        LOGGER.error("[VulkanValidation] {}", msg);
+                    } else if ((messageSeverity & EXTDebugUtils.VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) != 0) {
+                        LOGGER.warn("[VulkanValidation] {}", msg);
+                    } else {
+                        LOGGER.debug("[VulkanValidation] {}", msg);
+                    }
+                    return VK10.VK_FALSE;
+                });
+                debugCreateInfo = VkDebugUtilsMessengerCreateInfoEXT.calloc(stack)
+                        .sType(EXTDebugUtils.VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT)
+                        .messageSeverity(EXTDebugUtils.VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT
+                                | EXTDebugUtils.VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)
+                        .messageType(EXTDebugUtils.VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT
+                                | EXTDebugUtils.VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT
+                                | EXTDebugUtils.VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT)
+                        .pfnUserCallback(debugCallback);
+            }
+
             VkInstanceCreateInfo createInfo = VkInstanceCreateInfo.calloc(stack)
                     .sType(VK10.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO)
                     .pApplicationInfo(appInfo)
                     .ppEnabledExtensionNames(ppExtensions);
+            if (ppLayers != null) {
+                createInfo.ppEnabledLayerNames(ppLayers);
+            }
+            if (debugCreateInfo != null) {
+                createInfo.pNext(debugCreateInfo.address());
+            }
 
             PointerBuffer pInstance = stack.mallocPointer(1);
             int res = VK10.vkCreateInstance(createInfo, null, pInstance);
@@ -118,6 +206,13 @@ public class VkContext implements AutoCloseable {
                 throw new IllegalStateException("Failed to create Vulkan 1.3 Instance, error code: " + res);
             }
             vkInstance = new VkInstance(pInstance.get(0), createInfo);
+
+            if (debugCreateInfo != null) {
+                java.nio.LongBuffer pMessenger = stack.mallocLong(1);
+                if (EXTDebugUtils.vkCreateDebugUtilsMessengerEXT(vkInstance, debugCreateInfo, null, pMessenger) == VK10.VK_SUCCESS) {
+                    debugMessenger = pMessenger.get(0);
+                }
+            }
         }
     }
 
@@ -181,6 +276,7 @@ public class VkContext implements AutoCloseable {
 
             this.physicalDevice = bestDevice;
             this.queueFamilyIndex = bestQueueIndex;
+            selectAuxQueues(this.physicalDevice, this.queueFamilyIndex, stack);
 
             // Cache memory properties (calloc via MemoryUtil so close() can free() cleanly)
             this.memoryProperties = VkPhysicalDeviceMemoryProperties.calloc();
@@ -196,7 +292,94 @@ public class VkContext implements AutoCloseable {
             byte[] uuid = new byte[VK10.VK_UUID_SIZE];
             idProps.deviceUUID().get(uuid);
             this.deviceUuid = uuid;
-            LOGGER.info("[Valkyrie] Selected Physical Device: {} (Queue Family: {})", this.deviceName, queueFamilyIndex);
+            LOGGER.info("[Valkyrie] Selected Physical Device: {} (Graphics Family: {}, Transfer: {}/{} dedicated={}, Compute: {}/{} dedicated={})",
+                    this.deviceName, queueFamilyIndex,
+                    transferQueueFamilyIndex, transferQueueIndex, dedicatedTransferQueue,
+                    computeQueueFamilyIndex, computeQueueIndex, dedicatedComputeQueue);
+        }
+    }
+
+    private void selectAuxQueues(VkPhysicalDevice device, int gfxFamily, MemoryStack stack) {
+        IntBuffer pQueueCount = stack.mallocInt(1);
+        VK10.vkGetPhysicalDeviceQueueFamilyProperties(device, pQueueCount, null);
+        int count = pQueueCount.get(0);
+        VkQueueFamilyProperties.Buffer qProps = VkQueueFamilyProperties.malloc(count, stack);
+        VK10.vkGetPhysicalDeviceQueueFamilyProperties(device, pQueueCount, qProps);
+
+        // 1. Transfer queue: prefer dedicated TRANSFER-only family, else TRANSFER without GRAPHICS,
+        //    else second queue in graphics family, else fallback to graphicsQueue.
+        int bestTransferFamily = -1;
+        int bestTransferIdx = 0;
+        boolean foundDedicatedTransfer = false;
+        for (int i = 0; i < count; i++) {
+            int flags = qProps.get(i).queueFlags();
+            if ((flags & VK10.VK_QUEUE_TRANSFER_BIT) != 0
+                    && (flags & VK10.VK_QUEUE_GRAPHICS_BIT) == 0
+                    && (flags & VK10.VK_QUEUE_COMPUTE_BIT) == 0) {
+                bestTransferFamily = i;
+                foundDedicatedTransfer = true;
+                break;
+            }
+        }
+        if (!foundDedicatedTransfer) {
+            for (int i = 0; i < count; i++) {
+                int flags = qProps.get(i).queueFlags();
+                if ((flags & VK10.VK_QUEUE_TRANSFER_BIT) != 0 && (flags & VK10.VK_QUEUE_GRAPHICS_BIT) == 0) {
+                    bestTransferFamily = i;
+                    foundDedicatedTransfer = true;
+                    break;
+                }
+            }
+        }
+        if (!foundDedicatedTransfer && qProps.get(gfxFamily).queueCount() > 1) {
+            bestTransferFamily = gfxFamily;
+            bestTransferIdx = 1;
+            foundDedicatedTransfer = true;
+        }
+        if (foundDedicatedTransfer) {
+            this.transferQueueFamilyIndex = bestTransferFamily;
+            this.transferQueueIndex = bestTransferIdx;
+            this.dedicatedTransferQueue = true;
+        } else {
+            this.transferQueueFamilyIndex = gfxFamily;
+            this.transferQueueIndex = 0;
+            this.dedicatedTransferQueue = false;
+        }
+
+        // 2. Compute queue: prefer dedicated COMPUTE without GRAPHICS, else unused queue in graphics family,
+        //    else fallback to graphicsQueue.
+        int bestComputeFamily = -1;
+        int bestComputeIdx = 0;
+        boolean foundDedicatedCompute = false;
+        for (int i = 0; i < count; i++) {
+            int flags = qProps.get(i).queueFlags();
+            if ((flags & VK10.VK_QUEUE_COMPUTE_BIT) != 0 && (flags & VK10.VK_QUEUE_GRAPHICS_BIT) == 0) {
+                bestComputeFamily = i;
+                // If transfer also picked this same family at idx 0 and queueCount > 1, use idx 1
+                if (bestComputeFamily == transferQueueFamilyIndex && transferQueueIndex == 0 && qProps.get(i).queueCount() > 1) {
+                    bestComputeIdx = 1;
+                }
+                foundDedicatedCompute = true;
+                break;
+            }
+        }
+        if (!foundDedicatedCompute) {
+            int gfxCount = qProps.get(gfxFamily).queueCount();
+            int nextGfxIdx = (dedicatedTransferQueue && transferQueueFamilyIndex == gfxFamily) ? 2 : 1;
+            if (gfxCount > nextGfxIdx) {
+                bestComputeFamily = gfxFamily;
+                bestComputeIdx = nextGfxIdx;
+                foundDedicatedCompute = true;
+            }
+        }
+        if (foundDedicatedCompute) {
+            this.computeQueueFamilyIndex = bestComputeFamily;
+            this.computeQueueIndex = bestComputeIdx;
+            this.dedicatedComputeQueue = true;
+        } else {
+            this.computeQueueFamilyIndex = gfxFamily;
+            this.computeQueueIndex = 0;
+            this.dedicatedComputeQueue = false;
         }
     }
 
@@ -295,12 +478,25 @@ public class VkContext implements AutoCloseable {
             VkPhysicalDeviceFeatures supportedCore = VkPhysicalDeviceFeatures.calloc(stack);
             VK10.vkGetPhysicalDeviceFeatures(physicalDevice, supportedCore);
 
-            // Queue setup
-            FloatBuffer pQueuePriorities = stack.floats(1.0f);
-            VkDeviceQueueCreateInfo.Buffer queueCreateInfo = VkDeviceQueueCreateInfo.calloc(1, stack)
-                    .sType(VK10.VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO)
-                    .queueFamilyIndex(queueFamilyIndex)
-                    .pQueuePriorities(pQueuePriorities);
+            // Queue setup (unique families with required queue counts)
+            Map<Integer, Integer> familyQueueCounts = new LinkedHashMap<>();
+            familyQueueCounts.put(queueFamilyIndex, 1);
+            familyQueueCounts.merge(transferQueueFamilyIndex, transferQueueIndex + 1, Math::max);
+            familyQueueCounts.merge(computeQueueFamilyIndex, computeQueueIndex + 1, Math::max);
+
+            VkDeviceQueueCreateInfo.Buffer queueCreateInfos = VkDeviceQueueCreateInfo.calloc(familyQueueCounts.size(), stack);
+            int qi = 0;
+            for (Map.Entry<Integer, Integer> entry : familyQueueCounts.entrySet()) {
+                int qCount = entry.getValue();
+                FloatBuffer priorities = stack.mallocFloat(qCount);
+                for (int k = 0; k < qCount; k++) {
+                    priorities.put(k, 1.0f);
+                }
+                queueCreateInfos.get(qi++)
+                        .sType(VK10.VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO)
+                        .queueFamilyIndex(entry.getKey())
+                        .pQueuePriorities(priorities);
+            }
 
             // Enable Vulkan 1.2 and 1.3 features
             VkPhysicalDeviceVulkan13Features vk13Features = VkPhysicalDeviceVulkan13Features.calloc(stack)
@@ -325,7 +521,7 @@ public class VkContext implements AutoCloseable {
             VkDeviceCreateInfo deviceCreateInfo = VkDeviceCreateInfo.calloc(stack)
                     .sType(VK10.VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO)
                     .pNext(features2.address())
-                    .pQueueCreateInfos(queueCreateInfo)
+                    .pQueueCreateInfos(queueCreateInfos)
                     .ppEnabledExtensionNames(ppExtensions);
 
             PointerBuffer pDevice = stack.mallocPointer(1);
@@ -338,23 +534,45 @@ public class VkContext implements AutoCloseable {
             PointerBuffer pQueue = stack.mallocPointer(1);
             VK10.vkGetDeviceQueue(vkDevice, queueFamilyIndex, 0, pQueue);
             graphicsQueue = new VkQueue(pQueue.get(0), vkDevice);
+
+            if (transferQueueFamilyIndex == queueFamilyIndex && transferQueueIndex == 0) {
+                transferQueue = graphicsQueue;
+            } else {
+                VK10.vkGetDeviceQueue(vkDevice, transferQueueFamilyIndex, transferQueueIndex, pQueue);
+                transferQueue = new VkQueue(pQueue.get(0), vkDevice);
+            }
+
+            if (computeQueueFamilyIndex == queueFamilyIndex && computeQueueIndex == 0) {
+                computeQueue = graphicsQueue;
+            } else if (computeQueueFamilyIndex == transferQueueFamilyIndex && computeQueueIndex == transferQueueIndex) {
+                computeQueue = transferQueue;
+            } else {
+                VK10.vkGetDeviceQueue(vkDevice, computeQueueFamilyIndex, computeQueueIndex, pQueue);
+                computeQueue = new VkQueue(pQueue.get(0), vkDevice);
+            }
         }
     }
 
     private void createCommandPool() {
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkCommandPoolCreateInfo poolInfo = VkCommandPoolCreateInfo.calloc(stack)
-                    .sType(VK10.VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO)
-                    .flags(VK10.VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT)
-                    .queueFamilyIndex(queueFamilyIndex);
-
-            java.nio.LongBuffer pPool = stack.mallocLong(1);
-            int res = VK10.vkCreateCommandPool(vkDevice, poolInfo, null, pPool);
-            if (res != VK10.VK_SUCCESS) {
-                throw new IllegalStateException("Failed to create Vulkan Command Pool, error code: " + res);
-            }
-            commandPool = pPool.get(0);
+            commandPool = createCommandPoolForFamily(queueFamilyIndex, stack);
+            transferCommandPool = createCommandPoolForFamily(transferQueueFamilyIndex, stack);
+            computeCommandPool = createCommandPoolForFamily(computeQueueFamilyIndex, stack);
         }
+    }
+
+    private long createCommandPoolForFamily(int familyIdx, MemoryStack stack) {
+        VkCommandPoolCreateInfo poolInfo = VkCommandPoolCreateInfo.calloc(stack)
+                .sType(VK10.VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO)
+                .flags(VK10.VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT)
+                .queueFamilyIndex(familyIdx);
+
+        java.nio.LongBuffer pPool = stack.mallocLong(1);
+        int res = VK10.vkCreateCommandPool(vkDevice, poolInfo, null, pPool);
+        if (res != VK10.VK_SUCCESS) {
+            throw new IllegalStateException("Failed to create Vulkan Command Pool for family " + familyIdx + ", error code: " + res);
+        }
+        return pPool.get(0);
     }
 
     private void initVmaAllocator() {
@@ -454,6 +672,43 @@ public class VkContext implements AutoCloseable {
         throw new RuntimeException("Failed to find suitable Vulkan memory type! Filter: " + typeFilter + ", Properties: " + properties);
     }
 
+    public VkCommandBuffer allocateTransferCommandBuffer() {
+        return allocateCommandBufferFromPool(transferCommandPool);
+    }
+
+    public void freeTransferCommandBuffer(VkCommandBuffer cmd) {
+        if (cmd != null && vkDevice != null && transferCommandPool != 0) {
+            VK10.vkFreeCommandBuffers(vkDevice, transferCommandPool, cmd);
+        }
+    }
+
+    public VkCommandBuffer allocateComputeCommandBuffer() {
+        return allocateCommandBufferFromPool(computeCommandPool);
+    }
+
+    public void freeComputeCommandBuffer(VkCommandBuffer cmd) {
+        if (cmd != null && vkDevice != null && computeCommandPool != 0) {
+            VK10.vkFreeCommandBuffers(vkDevice, computeCommandPool, cmd);
+        }
+    }
+
+    private VkCommandBuffer allocateCommandBufferFromPool(long pool) {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkCommandBufferAllocateInfo allocInfo = VkCommandBufferAllocateInfo.calloc(stack)
+                    .sType(VK10.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO)
+                    .commandPool(pool)
+                    .level(VK10.VK_COMMAND_BUFFER_LEVEL_PRIMARY)
+                    .commandBufferCount(1);
+
+            PointerBuffer pCmd = stack.mallocPointer(1);
+            int res = VK10.vkAllocateCommandBuffers(vkDevice, allocInfo, pCmd);
+            if (res != VK10.VK_SUCCESS) {
+                throw new RuntimeException("Failed to allocate command buffer: " + res);
+            }
+            return new VkCommandBuffer(pCmd.get(0), vkDevice);
+        }
+    }
+
     public VkInstance getVkInstance() {
         return vkInstance;
     }
@@ -470,8 +725,40 @@ public class VkContext implements AutoCloseable {
         return graphicsQueue;
     }
 
+    public VkQueue getTransferQueue() {
+        return transferQueue;
+    }
+
+    public VkQueue getComputeQueue() {
+        return computeQueue;
+    }
+
     public int getQueueFamilyIndex() {
         return queueFamilyIndex;
+    }
+
+    public int getTransferQueueFamilyIndex() {
+        return transferQueueFamilyIndex;
+    }
+
+    public int getComputeQueueFamilyIndex() {
+        return computeQueueFamilyIndex;
+    }
+
+    public boolean hasDedicatedTransferQueue() {
+        return dedicatedTransferQueue;
+    }
+
+    public boolean hasSeparateTransferQueueFamily() {
+        return dedicatedTransferQueue && transferQueueFamilyIndex != queueFamilyIndex;
+    }
+
+    public boolean hasDedicatedComputeQueue() {
+        return dedicatedComputeQueue;
+    }
+
+    public boolean hasSeparateComputeQueueFamily() {
+        return dedicatedComputeQueue && computeQueueFamilyIndex != queueFamilyIndex;
     }
 
     public long getCommandPool() {
@@ -502,6 +789,14 @@ public class VkContext implements AutoCloseable {
         return externalSemaphoreSupported;
     }
 
+    public boolean isValidationEnabled() {
+        return validationEnabled;
+    }
+
+    public int getValidationErrorCount() {
+        return validationErrorCount.get();
+    }
+
     public boolean isInitialized() {
         return initialized;
     }
@@ -526,6 +821,16 @@ public class VkContext implements AutoCloseable {
             vmaAllocator = 0;
         }
 
+        if (computeCommandPool != 0) {
+            VK10.vkDestroyCommandPool(vkDevice, computeCommandPool, null);
+            computeCommandPool = 0;
+        }
+
+        if (transferCommandPool != 0) {
+            VK10.vkDestroyCommandPool(vkDevice, transferCommandPool, null);
+            transferCommandPool = 0;
+        }
+
         if (commandPool != 0) {
             VK10.vkDestroyCommandPool(vkDevice, commandPool, null);
             commandPool = 0;
@@ -534,6 +839,15 @@ public class VkContext implements AutoCloseable {
         if (vkDevice != null) {
             VK10.vkDestroyDevice(vkDevice, null);
             vkDevice = null;
+        }
+
+        if (debugMessenger != VK10.VK_NULL_HANDLE && vkInstance != null) {
+            EXTDebugUtils.vkDestroyDebugUtilsMessengerEXT(vkInstance, debugMessenger, null);
+            debugMessenger = VK10.VK_NULL_HANDLE;
+        }
+        if (debugCallback != null) {
+            debugCallback.free();
+            debugCallback = null;
         }
 
         if (vkInstance != null) {

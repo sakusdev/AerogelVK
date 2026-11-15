@@ -64,6 +64,8 @@ public class VkMegaBuffer implements AutoCloseable {
     private record SectionAlloc(int vertexOffset, int vertexCount) {}
     private record RetiredAlloc(int vertexOffset, int vertexCount, long retiredFrame) {}
     private record PendingTransfer(long srcOffset, long dstOffset, long size) {}
+    private record DeferredUpload(int sectionX, int sectionY, int sectionZ, int subKind,
+                                  long[] packedVertices, int quadCount, int aabbPacked, int flags) {}
 
     // Allocated VMA buffers
     private AllocatedBuffer megaVertexBuffer;
@@ -72,14 +74,15 @@ public class VkMegaBuffer implements AutoCloseable {
     private AllocatedBuffer drawCountBuffer;
     private AllocatedBuffer visibleChunkIdBuffer;
     private AllocatedBuffer globalQuadIndexBuffer;
-    private AllocatedBuffer stagingBuffer;
+    private final AllocatedBuffer[] stagingBuffers = new AllocatedBuffer[VkContext.FRAMES_IN_FLIGHT];
     private AllocatedBuffer atlasUvBuffer;
 
     // Persistent mapped pointers
     private ByteBuffer chunkMetaMapped;
-    private ByteBuffer stagingMapped;
+    private final ByteBuffer[] stagingMapped = new ByteBuffer[VkContext.FRAMES_IN_FLIGHT];
     private ByteBuffer atlasUvMapped;
-    private long stagingHead = 0;
+    private final long[] stagingHeads = new long[VkContext.FRAMES_IN_FLIGHT];
+    private int activeWriteSlot = 0;
 
     // Free-list vertex sub-allocator
     private final int totalVertexCapacity;
@@ -93,7 +96,9 @@ public class VkMegaBuffer implements AutoCloseable {
     private int highestUsedSlot = -1;
 
     // Pending GPU transfers & frame-delayed vertex retirement
-    private final List<PendingTransfer> pendingTransfers = new ArrayList<>();
+    @SuppressWarnings("unchecked")
+    private final List<PendingTransfer>[] pendingTransfersBySlot = new List[VkContext.FRAMES_IN_FLIGHT];
+    private final Deque<DeferredUpload> deferredUploads = new ArrayDeque<>();
     private final List<RetiredAlloc> retiredAllocations = new ArrayList<>();
     private long currentUploadFrame = 0;
     private boolean initialized = false;
@@ -129,8 +134,36 @@ public class VkMegaBuffer implements AutoCloseable {
         }
     }
 
+    /**
+     * Begins a frame slot: selects the slot-local staging ring, advances retired vertex reclamation,
+     * and drains any uploads deferred from a previous frame's staging ring overflow.
+     */
+    public synchronized void beginFrameSlot(int frameSlot, int framesInFlight) {
+        this.activeWriteSlot = Math.floorMod(frameSlot, VkContext.FRAMES_IN_FLIGHT);
+        this.stagingHeads[this.activeWriteSlot] = 0;
+        advanceFrameAndReclaim(framesInFlight);
+        drainDeferredUploads();
+    }
+
+    private void drainDeferredUploads() {
+        while (!deferredUploads.isEmpty()) {
+            DeferredUpload du = deferredUploads.peekFirst();
+            long byteSize = du.packedVertices() != null ? (long) du.packedVertices().length * 8L : 0L;
+            if (byteSize > 0 && stagingHeads[activeWriteSlot] + byteSize > STAGING_BUFFER_BYTES) {
+                break; // Still full for this slot; leave remaining uploads for next frame
+            }
+            deferredUploads.pollFirst();
+            uploadSectionSubMeshInternal(
+                    du.sectionX(), du.sectionY(), du.sectionZ(), du.subKind(),
+                    du.packedVertices(), du.quadCount(), du.aabbPacked(), du.flags(), false);
+        }
+    }
+
     public VkMegaBuffer() {
         this.totalVertexCapacity = (int) (DEFAULT_VERTEX_BUFFER_BYTES / 8L);
+        for (int i = 0; i < VkContext.FRAMES_IN_FLIGHT; i++) {
+            this.pendingTransfersBySlot[i] = new ArrayList<>();
+        }
     }
 
     public synchronized void init() {
@@ -208,16 +241,19 @@ public class VkMegaBuffer implements AutoCloseable {
         // 6. Global Quad Index Buffer (1,048,576 quads * 6 indices * 4 bytes = ~24 MB, Device-Local)
         initGlobalQuadIndexBuffer(ctx, vma);
 
-        // 7. Staging Ring Buffer (32 MB, Host Visible Coherent Mapped)
-        stagingBuffer = createVmaBuffer(
-                vma,
-                STAGING_BUFFER_BYTES,
-                VK10.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                Vma.VMA_MEMORY_USAGE_CPU_TO_GPU,
-                Vma.VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | Vma.VMA_ALLOCATION_CREATE_MAPPED_BIT
-        );
-        stagingMapped = mapBuffer(vma, stagingBuffer);
-        stagingHead = 0;
+        // 7. Per-slot Staging Ring Buffers (32 MB each, Host Visible Coherent Mapped)
+        for (int i = 0; i < VkContext.FRAMES_IN_FLIGHT; i++) {
+            stagingBuffers[i] = createVmaBuffer(
+                    vma,
+                    STAGING_BUFFER_BYTES,
+                    VK10.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                    Vma.VMA_MEMORY_USAGE_CPU_TO_GPU,
+                    Vma.VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | Vma.VMA_ALLOCATION_CREATE_MAPPED_BIT
+            );
+            stagingMapped[i] = mapBuffer(vma, stagingBuffers[i]);
+            stagingHeads[i] = 0;
+        }
+        activeWriteSlot = 0;
 
         // 8. Atlas UV Table SSBO (2 MB, Host Visible Coherent Mapped)
         long atlasUvBytes = (long) MAX_ATLAS_SPRITES * ATLAS_UV_ENTRY_BYTES;
@@ -305,15 +341,40 @@ public class VkMegaBuffer implements AutoCloseable {
     public synchronized int uploadSectionSubMesh(int sectionX, int sectionY, int sectionZ, int subKind,
                                                  long[] packedVertices, int quadCount,
                                                  int aabbPacked, int flags) {
+        return uploadSectionSubMeshInternal(sectionX, sectionY, sectionZ, subKind, packedVertices, quadCount, aabbPacked, flags, true);
+    }
+
+    private int uploadSectionSubMeshInternal(int sectionX, int sectionY, int sectionZ, int subKind,
+                                             long[] packedVertices, int quadCount,
+                                             int aabbPacked, int flags, boolean allowDefer) {
         if (!initialized) {
             throw new IllegalStateException("VkMegaBuffer not initialized!");
+        }
+
+        boolean hasGeometry = quadCount > 0 && packedVertices != null && packedVertices.length > 0;
+        if (hasGeometry) {
+            long byteSize = (long) packedVertices.length * 8L;
+            if (byteSize > STAGING_BUFFER_BYTES) {
+                LOGGER.error("[Valkyrie] Section ({}, {}, {}) subKind={} exceeds staging ring capacity ({} > {} bytes); skipping.",
+                        sectionX, sectionY, sectionZ, subKind, byteSize, STAGING_BUFFER_BYTES);
+                return -1;
+            }
+            // C8 fix: if the current slot's staging ring is full, defer to next frame WITHOUT vkQueueWaitIdle.
+            // Un-uploaded sections are never published to ChunkDrawMeta until their transfer is actually queued.
+            if (stagingHeads[activeWriteSlot] + byteSize > STAGING_BUFFER_BYTES) {
+                if (allowDefer) {
+                    deferredUploads.addLast(new DeferredUpload(
+                            sectionX, sectionY, sectionZ, subKind, packedVertices, quadCount, aabbPacked, flags));
+                }
+                return -1;
+            }
         }
 
         long sectionKey = packSectionKey(sectionX, sectionY, sectionZ, subKind);
         Integer existingSlot = sectionKeyToSlot.get(sectionKey);
 
         // Do not allocate a new slot for an empty companion sub-mesh (translucent/half-scale)
-        if (existingSlot == null && subKind != 0 && (quadCount <= 0 || packedVertices == null || packedVertices.length == 0)) {
+        if (existingSlot == null && subKind != 0 && !hasGeometry) {
             return -1;
         }
 
@@ -339,7 +400,7 @@ public class VkMegaBuffer implements AutoCloseable {
         }
 
         // Empty section (no geometry)
-        if (quadCount <= 0 || packedVertices == null || packedVertices.length == 0) {
+        if (!hasGeometry) {
             translucentSlotBits.clear(slot);
             writeChunkMeta(slot, sectionX, sectionY, sectionZ, 0, 0, aabbPacked, flags);
             slotAllocations.put(slot, new SectionAlloc(0, 0));
@@ -357,26 +418,21 @@ public class VkMegaBuffer implements AutoCloseable {
         }
 
         long byteSize = (long) vertexCount * 8L;
-
-        // Ensure staging ring buffer fit; flush immediately if full within a single frame
-        if (stagingHead + byteSize > STAGING_BUFFER_BYTES) {
-            flushPendingTransfersNow();
-        }
-
-        long srcOffset = stagingHead;
+        long srcOffset = stagingHeads[activeWriteSlot];
         long dstOffset = (long) vertexOffset * 8L;
 
-        // Copy vertices to persistently mapped staging buffer
-        stagingMapped.position((int) srcOffset);
-        stagingMapped.asLongBuffer().put(packedVertices);
+        // Copy vertices to persistently mapped slot staging buffer
+        ByteBuffer mapped = stagingMapped[activeWriteSlot];
+        mapped.position((int) srcOffset);
+        mapped.asLongBuffer().put(packedVertices);
 
         // Advance staging ring head (aligned to 64 bytes)
-        stagingHead = (srcOffset + byteSize + 63L) & ~63L;
+        stagingHeads[activeWriteSlot] = (srcOffset + byteSize + 63L) & ~63L;
 
-        // Record pending GPU copy
-        pendingTransfers.add(new PendingTransfer(srcOffset, dstOffset, byteSize));
+        // Record pending GPU copy for this frame slot
+        pendingTransfersBySlot[activeWriteSlot].add(new PendingTransfer(srcOffset, dstOffset, byteSize));
 
-        // Update ChunkDrawMeta SSBO
+        // Update ChunkDrawMeta SSBO only after staging copy is queued
         translucentSlotBits.set(slot, (flags & 1) != 0);
         writeChunkMeta(slot, sectionX, sectionY, sectionZ, vertexOffset, quadCount, aabbPacked, flags);
         slotAllocations.put(slot, new SectionAlloc(vertexOffset, vertexCount));
@@ -428,66 +484,138 @@ public class VkMegaBuffer implements AutoCloseable {
         atlasUvMapped.position(0);
     }
 
-    private void flushPendingTransfersNow() {
-        if (!pendingTransfers.isEmpty()) {
-            VkContext ctx = VkContext.getInstance();
-            VkCommandBuffer cmd = ctx.beginSingleTimeCommands();
-            recordPendingTransfers(cmd);
-            ctx.endSingleTimeCommands(cmd);
-        }
-        stagingHead = 0;
+    public synchronized boolean hasPendingTransfers(int frameSlot) {
+        int slot = Math.floorMod(frameSlot, VkContext.FRAMES_IN_FLIGHT);
+        return initialized && !pendingTransfersBySlot[slot].isEmpty();
+    }
+
+    public synchronized boolean hasDeferredUploads() {
+        return !deferredUploads.isEmpty();
     }
 
     /**
-     * Records all pending staging-to-device transfers and inserts a memory barrier for shaders.
+     * Records all pending staging-to-device transfers for the current active slot
+     * (single-command-buffer / headless convenience wrapper).
      */
     public synchronized void recordPendingTransfers(VkCommandBuffer cmd) {
-        if (!initialized || pendingTransfers.isEmpty()) {
-            stagingHead = 0;
-            return;
+        recordPendingTransfersForSlot(activeWriteSlot, cmd, false);
+    }
+
+    /**
+     * Records all pending staging-to-device transfers for {@code frameSlot}.
+     * When {@code releaseToGraphics} is true (dedicated transfer queue in a different family),
+     * emits a Queue Family Ownership Transfer release barrier instead of a shader-read barrier;
+     * the graphics command buffer must pair this with {@link #recordTransferAcquireBarrier(VkCommandBuffer)}.
+     */
+    public synchronized boolean recordPendingTransfersForSlot(int frameSlot, VkCommandBuffer cmd, boolean releaseToGraphics) {
+        int slot = Math.floorMod(frameSlot, VkContext.FRAMES_IN_FLIGHT);
+        List<PendingTransfer> list = pendingTransfersBySlot[slot];
+        if (!initialized || list.isEmpty()) {
+            stagingHeads[slot] = 0;
+            return false;
         }
 
-        int total = pendingTransfers.size();
+        AllocatedBuffer srcStaging = stagingBuffers[slot];
+        int total = list.size();
         for (int start = 0; start < total; start += COPY_BATCH_LIMIT) {
             int batchCount = Math.min(COPY_BATCH_LIMIT, total - start);
             try (MemoryStack stack = MemoryStack.stackPush()) {
                 VkBufferCopy.Buffer copyRegions = VkBufferCopy.calloc(batchCount, stack);
                 for (int i = 0; i < batchCount; i++) {
-                    PendingTransfer pt = pendingTransfers.get(start + i);
+                    PendingTransfer pt = list.get(start + i);
                     copyRegions.get(i)
                             .srcOffset(pt.srcOffset)
                             .dstOffset(pt.dstOffset)
                             .size(pt.size);
                 }
-                VK10.vkCmdCopyBuffer(cmd, stagingBuffer.buffer, megaVertexBuffer.buffer, copyRegions);
+                VK10.vkCmdCopyBuffer(cmd, srcStaging.buffer, megaVertexBuffer.buffer, copyRegions);
             }
         }
 
+        VkContext ctx = VkContext.getInstance();
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            // Buffer memory barrier: transfer write -> shader read
-            VkBufferMemoryBarrier.Buffer barrier = VkBufferMemoryBarrier.calloc(1, stack)
+            if (releaseToGraphics && ctx.hasSeparateTransferQueueFamily()) {
+                VkBufferMemoryBarrier.Buffer releaseBarrier = VkBufferMemoryBarrier.calloc(1, stack)
+                        .sType(VK10.VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER)
+                        .srcAccessMask(VK10.VK_ACCESS_TRANSFER_WRITE_BIT)
+                        .dstAccessMask(0)
+                        .srcQueueFamilyIndex(ctx.getTransferQueueFamilyIndex())
+                        .dstQueueFamilyIndex(ctx.getQueueFamilyIndex())
+                        .buffer(megaVertexBuffer.buffer)
+                        .offset(0)
+                        .size(VK10.VK_WHOLE_SIZE);
+
+                VK10.vkCmdPipelineBarrier(
+                        cmd,
+                        VK10.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK10.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                        0,
+                        null,
+                        releaseBarrier,
+                        null
+                );
+            } else {
+                // Same queue family: standard transfer write -> shader read barrier
+                VkBufferMemoryBarrier.Buffer barrier = VkBufferMemoryBarrier.calloc(1, stack)
+                        .sType(VK10.VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER)
+                        .srcAccessMask(VK10.VK_ACCESS_TRANSFER_WRITE_BIT)
+                        .dstAccessMask(VK10.VK_ACCESS_SHADER_READ_BIT)
+                        .srcQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                        .dstQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                        .buffer(megaVertexBuffer.buffer)
+                        .offset(0)
+                        .size(VK10.VK_WHOLE_SIZE);
+
+                VK10.vkCmdPipelineBarrier(
+                        cmd,
+                        VK10.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK10.VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK10.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        0,
+                        null,
+                        barrier,
+                        null
+                );
+            }
+        }
+
+        list.clear();
+        stagingHeads[slot] = 0;
+        return true;
+    }
+
+    /**
+     * Records the graphics-side Queue Family Ownership Transfer acquire barrier matching
+     * {@link #recordPendingTransfersForSlot(int, VkCommandBuffer, boolean)} with {@code releaseToGraphics=true}.
+     */
+    public synchronized void recordTransferAcquireBarrier(VkCommandBuffer graphicsCmd) {
+        if (!initialized || megaVertexBuffer == null) {
+            return;
+        }
+        VkContext ctx = VkContext.getInstance();
+        if (!ctx.hasSeparateTransferQueueFamily()) {
+            return;
+        }
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkBufferMemoryBarrier.Buffer acquireBarrier = VkBufferMemoryBarrier.calloc(1, stack)
                     .sType(VK10.VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER)
-                    .srcAccessMask(VK10.VK_ACCESS_TRANSFER_WRITE_BIT)
+                    .srcAccessMask(0)
                     .dstAccessMask(VK10.VK_ACCESS_SHADER_READ_BIT)
-                    .srcQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
-                    .dstQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                    .srcQueueFamilyIndex(ctx.getTransferQueueFamilyIndex())
+                    .dstQueueFamilyIndex(ctx.getQueueFamilyIndex())
                     .buffer(megaVertexBuffer.buffer)
                     .offset(0)
                     .size(VK10.VK_WHOLE_SIZE);
 
             VK10.vkCmdPipelineBarrier(
-                    cmd,
-                    VK10.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    graphicsCmd,
+                    VK10.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                     VK10.VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK10.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                     0,
                     null,
-                    barrier,
+                    acquireBarrier,
                     null
             );
         }
-
-        pendingTransfers.clear();
-        stagingHead = 0;
     }
 
     private void writeChunkMeta(int slot, int x, int y, int z, int vertexOffset, int quadCount, int aabbPacked, int flags) {
@@ -610,7 +738,7 @@ public class VkMegaBuffer implements AutoCloseable {
     }
 
     public AllocatedBuffer getStagingBuffer() {
-        return stagingBuffer;
+        return stagingBuffers[activeWriteSlot];
     }
 
     public AllocatedBuffer getAtlasUvBuffer() {
@@ -639,8 +767,11 @@ public class VkMegaBuffer implements AutoCloseable {
             freeSlots.set(slot);
         }
         sectionKeyToSlot.clear();
-        pendingTransfers.clear();
-        stagingHead = 0;
+        for (int i = 0; i < VkContext.FRAMES_IN_FLIGHT; i++) {
+            pendingTransfersBySlot[i].clear();
+            stagingHeads[i] = 0;
+        }
+        deferredUploads.clear();
         highestUsedSlot = -1;
     }
 
@@ -670,11 +801,14 @@ public class VkMegaBuffer implements AutoCloseable {
                 atlasUvMapped = null;
             }
 
-            if (stagingBuffer != null) {
-                Vma.vmaUnmapMemory(vma, stagingBuffer.allocation);
-                Vma.vmaDestroyBuffer(vma, stagingBuffer.buffer, stagingBuffer.allocation);
-                stagingBuffer = null;
-                stagingMapped = null;
+            for (int i = 0; i < VkContext.FRAMES_IN_FLIGHT; i++) {
+                if (stagingBuffers[i] != null) {
+                    Vma.vmaUnmapMemory(vma, stagingBuffers[i].allocation);
+                    Vma.vmaDestroyBuffer(vma, stagingBuffers[i].buffer, stagingBuffers[i].allocation);
+                    stagingBuffers[i] = null;
+                    stagingMapped[i] = null;
+                }
+                stagingHeads[i] = 0;
             }
 
             if (chunkMetaBuffer != null) {
@@ -714,7 +848,10 @@ public class VkMegaBuffer implements AutoCloseable {
         sectionKeyToSlot.clear();
         slotAllocations.clear();
         freeSlots.clear();
-        pendingTransfers.clear();
+        for (int i = 0; i < VkContext.FRAMES_IN_FLIGHT; i++) {
+            pendingTransfersBySlot[i].clear();
+        }
+        deferredUploads.clear();
 
         initialized = false;
         LOGGER.info("[Valkyrie] VkMegaBuffer destroyed cleanly.");

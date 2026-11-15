@@ -85,6 +85,8 @@ public final class ValkyrieRenderer {
     private final Set<Long> dirtySections = ConcurrentHashMap.newKeySet();
 
     private final VkCommandBuffer[] commandBuffers = new VkCommandBuffer[FRAMES_IN_FLIGHT];
+    private final VkCommandBuffer[] transferCommandBuffers = new VkCommandBuffer[FRAMES_IN_FLIGHT];
+    private final long[] transferCompleteSemaphores = new long[FRAMES_IN_FLIGHT];
     private final long[] frameFences = new long[FRAMES_IN_FLIGHT];
     private final boolean[] fenceWaited = new boolean[FRAMES_IN_FLIGHT];
     private int currentFrameSlot = 0;
@@ -175,15 +177,25 @@ public final class ValkyrieRenderer {
             reloadShaderPackLocked();
         }
 
-        // 8. Allocate Double-Buffered Command Buffers & Frame Synchronization Fences
+        // 8. Allocate Double-Buffered Command Buffers, Transfer Semaphores & Frame Synchronization Fences
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkFenceCreateInfo fenceInfo = VkFenceCreateInfo.calloc(stack)
                     .sType(VK_STRUCTURE_TYPE_FENCE_CREATE_INFO)
                     .flags(VK_FENCE_CREATE_SIGNALED_BIT);
+            VkSemaphoreCreateInfo semInfo = VkSemaphoreCreateInfo.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO);
 
             LongBuffer pFence = stack.mallocLong(1);
+            LongBuffer pSem = stack.mallocLong(1);
             for (int i = 0; i < FRAMES_IN_FLIGHT; i++) {
                 this.commandBuffers[i] = vkContext.allocateCommandBuffer();
+                this.transferCommandBuffers[i] = vkContext.allocateTransferCommandBuffer();
+                int semRes = vkCreateSemaphore(vkContext.getVkDevice(), semInfo, null, pSem);
+                if (semRes != VK_SUCCESS) {
+                    throw new RuntimeException("Failed to create transfer semaphore[" + i + "]: " + semRes);
+                }
+                this.transferCompleteSemaphores[i] = pSem.get(0);
+
                 int res = vkCreateFence(vkContext.getVkDevice(), fenceInfo, null, pFence);
                 if (res != VK_SUCCESS) {
                     throw new RuntimeException("Failed to create frame fence[" + i + "]: " + res);
@@ -289,7 +301,7 @@ public final class ValkyrieRenderer {
             }
         }
         vkResetFences(device, frameFences[slot]);
-        vkMegaBuffer.advanceFrameAndReclaim(FRAMES_IN_FLIGHT);
+        vkMegaBuffer.beginFrameSlot(slot, FRAMES_IN_FLIGHT);
 
         // 1b. Drain deduplicated dirty section coordinates and capture non-empty snapshots
         drainDirtySections(Minecraft.getInstance().level);
@@ -372,9 +384,40 @@ public final class ValkyrieRenderer {
             );
         }
 
-        // 5. Record Command Buffer
+        // 5. Stage A: Async Transfer Queue submission when dedicated transfer queue is available
+        boolean asyncTransferSubmitted = false;
+        if (vkContext.hasDedicatedTransferQueue() && vkMegaBuffer.hasPendingTransfers(slot)) {
+            VkCommandBuffer transferCmd = transferCommandBuffers[slot];
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                vkResetCommandBuffer(transferCmd, 0);
+                VkCommandBufferBeginInfo tBegin = VkCommandBufferBeginInfo.calloc(stack)
+                        .sType(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
+                        .flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
+                vkBeginCommandBuffer(transferCmd, tBegin);
+                boolean recorded = vkMegaBuffer.recordPendingTransfersForSlot(
+                        slot, transferCmd, vkContext.hasSeparateTransferQueueFamily());
+                vkEndCommandBuffer(transferCmd);
+
+                if (recorded) {
+                    PointerBuffer pTransferCmd = stack.pointers(transferCmd);
+                    LongBuffer pTransferSig = stack.longs(transferCompleteSemaphores[slot]);
+                    VkSubmitInfo tSubmit = VkSubmitInfo.calloc(stack)
+                            .sType(VK_STRUCTURE_TYPE_SUBMIT_INFO)
+                            .pCommandBuffers(pTransferCmd)
+                            .pSignalSemaphores(pTransferSig);
+                    int tRes = vkQueueSubmit(vkContext.getTransferQueue(), tSubmit, VK_NULL_HANDLE);
+                    if (tRes == VK_SUCCESS) {
+                        asyncTransferSubmitted = true;
+                    } else {
+                        LOGGER.error("[Valkyrie] Transfer queue submit failed: {}", tRes);
+                    }
+                }
+            }
+        }
+
+        // 5b. Record Graphics Command Buffer (single-queue fallback records transfers inline to avoid same-queue semaphore deadlock)
         VkCommandBuffer activeCmd = commandBuffers[slot];
-        recordFrameCommands(activeCmd, width, height, shaderPackUniforms, slot);
+        recordFrameCommands(activeCmd, width, height, shaderPackUniforms, slot, asyncTransferSubmitted);
 
         // B4: Track actual final Vulkan image layouts before GL waitSemaphoreEXT acquires them
         vkInteropManager.setVkExportedLayouts(
@@ -382,7 +425,7 @@ public final class ValkyrieRenderer {
                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
         );
 
-        // 6. Submit Command Buffer (using external semaphores when supported, else fence sync in composite)
+        // 6. Submit Graphics Command Buffer (using external/transfer semaphores when active, else fence sync in composite)
         try (MemoryStack stack = MemoryStack.stackPush()) {
             PointerBuffer pCmd = stack.pointers(activeCmd);
 
@@ -390,21 +433,31 @@ public final class ValkyrieRenderer {
                     .sType(VK_STRUCTURE_TYPE_SUBMIT_INFO)
                     .pCommandBuffers(pCmd);
 
+            boolean waitGl = vkInteropManager.usesExternalSemaphores() && vkInteropManager.consumeGlSemaphoreSignaled();
+            int waitCount = (asyncTransferSubmitted ? 1 : 0) + (waitGl ? 1 : 0);
+            if (waitCount > 0) {
+                LongBuffer pWaitSemaphores = stack.mallocLong(waitCount);
+                IntBuffer pWaitDstStageMask = stack.mallocInt(waitCount);
+                int idx = 0;
+                if (asyncTransferSubmitted) {
+                    pWaitSemaphores.put(idx, transferCompleteSemaphores[slot]);
+                    pWaitDstStageMask.put(idx, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                    idx++;
+                }
+                if (waitGl) {
+                    pWaitSemaphores.put(idx, vkInteropManager.getVkGlReadySemaphore());
+                    pWaitDstStageMask.put(idx, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                            | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                            | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT);
+                }
+                submitInfo.waitSemaphoreCount(waitCount)
+                        .pWaitSemaphores(pWaitSemaphores)
+                        .pWaitDstStageMask(pWaitDstStageMask);
+            }
+
             if (vkInteropManager.usesExternalSemaphores()) {
                 LongBuffer pSignalSemaphores = stack.longs(vkInteropManager.getVkRenderCompleteSemaphore());
                 submitInfo.pSignalSemaphores(pSignalSemaphores);
-
-                if (vkInteropManager.consumeGlSemaphoreSignaled()) {
-                    LongBuffer pWaitSemaphores = stack.longs(vkInteropManager.getVkGlReadySemaphore());
-                    IntBuffer pWaitDstStageMask = stack.ints(
-                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
-                                    | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
-                                    | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
-                    );
-                    submitInfo.waitSemaphoreCount(1)
-                            .pWaitSemaphores(pWaitSemaphores)
-                            .pWaitDstStageMask(pWaitDstStageMask);
-                }
             }
 
             int res = vkQueueSubmit(vkContext.getGraphicsQueue(), submitInfo, frameFences[slot]);
@@ -426,7 +479,8 @@ public final class ValkyrieRenderer {
             int width,
             int height,
             ShaderUniformLayout.UniformData shaderPackUniforms,
-            int frameSlot
+            int frameSlot,
+            boolean asyncTransferSubmitted
     ) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             vkResetCommandBuffer(commandBuffer, 0);
@@ -437,8 +491,12 @@ public final class ValkyrieRenderer {
 
             vkBeginCommandBuffer(commandBuffer, beginInfo);
 
-            // Staging ring -> Device Local SSBO copy
-            vkMegaBuffer.recordPendingTransfers(commandBuffer);
+            // Staging ring -> Device Local SSBO copy (either acquire from async transfer queue, or inline on single-queue fallback)
+            if (asyncTransferSubmitted) {
+                vkMegaBuffer.recordTransferAcquireBarrier(commandBuffer);
+            } else {
+                vkMegaBuffer.recordPendingTransfersForSlot(frameSlot, commandBuffer, false);
+            }
 
             int activeSections = vkMegaBuffer.getActiveSectionCount();
             int slotDispatchLimit = vkMegaBuffer.getSlotDispatchLimit();
@@ -1727,9 +1785,17 @@ public final class ValkyrieRenderer {
                     vkDestroyFence(device, frameFences[i], null);
                     frameFences[i] = VK_NULL_HANDLE;
                 }
+                if (transferCompleteSemaphores[i] != VK_NULL_HANDLE) {
+                    vkDestroySemaphore(device, transferCompleteSemaphores[i], null);
+                    transferCompleteSemaphores[i] = VK_NULL_HANDLE;
+                }
                 if (commandBuffers[i] != null) {
                     vkContext.freeCommandBuffer(commandBuffers[i]);
                     commandBuffers[i] = null;
+                }
+                if (transferCommandBuffers[i] != null) {
+                    vkContext.freeTransferCommandBuffer(transferCommandBuffers[i]);
+                    transferCommandBuffers[i] = null;
                 }
                 fenceWaited[i] = false;
             }
