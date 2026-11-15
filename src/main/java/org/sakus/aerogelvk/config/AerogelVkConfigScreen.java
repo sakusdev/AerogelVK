@@ -3,11 +3,17 @@ package org.sakus.aerogelvk.config;
 import me.shedaniel.clothconfig2.api.ConfigBuilder;
 import me.shedaniel.clothconfig2.api.ConfigCategory;
 import me.shedaniel.clothconfig2.api.ConfigEntryBuilder;
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
 import org.sakus.aerogelvk.ValkyrieRenderer;
 import org.sakus.aerogelvk.compat.CompatManager;
+import org.sakus.aerogelvk.shaderpack.ShaderPackManager;
 
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Locale;
 
 /**
@@ -128,9 +134,19 @@ public final class AerogelVkConfigScreen {
                 .setSaveConsumer(v -> pendingPackEnabled[0] = v)
                 .build());
 
-        shaderPackCat.addEntry(entryBuilder.startStrField(
+        String currentPack = config.getShaderPack();
+        if (currentPack == null || currentPack.isBlank()) {
+            currentPack = "off";
+        }
+        Minecraft mc = Minecraft.getInstance();
+        Path gameDir = (mc != null && mc.gameDirectory != null) ? mc.gameDirectory.toPath() : Path.of(".");
+        List<String> packOptions = buildShaderPackOptions(gameDir, currentPack);
+
+        shaderPackCat.addEntry(entryBuilder.startStringDropdownMenu(
                         Component.translatable("config.aerogelvk.option.shaderPack"),
-                        config.getShaderPack())
+                        currentPack)
+                .setSelections(packOptions)
+                .setSuggestionMode(false)
                 .setDefaultValue("off")
                 .setTooltip(Component.translatable("config.aerogelvk.tooltip.shaderPack"))
                 .setSaveConsumer(v -> pendingPackName[0] = v)
@@ -171,6 +187,19 @@ public final class AerogelVkConfigScreen {
         });
 
         return builder.build();
+    }
+
+    public static List<String> buildShaderPackOptions(Path gameDir, String currentPack) {
+        LinkedHashSet<String> options = new LinkedHashSet<>();
+        options.add("off");
+        options.add("auto");
+        if (gameDir != null) {
+            options.addAll(ShaderPackManager.listShaderPackNames(gameDir));
+        }
+        if (currentPack != null && !currentPack.isBlank() && !options.contains(currentPack)) {
+            options.add(currentPack);
+        }
+        return new ArrayList<>(options);
     }
 
     private static void applyShaderPackFields(ValkyrieConfig config, boolean enabled, String packName) {
