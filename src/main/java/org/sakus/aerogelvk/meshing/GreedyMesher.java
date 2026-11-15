@@ -707,6 +707,11 @@ public final class GreedyMesher {
         return Math.max(0, Math.min(16, q));
     }
 
+    private static int clamp256(double v) {
+        int q = (int) Math.round(v * 256.0);
+        return Math.max(0, Math.min(256, q));
+    }
+
     private static int directionToInt(Direction dir) {
         if (dir == null) return 2;
         return switch (dir) {
@@ -795,9 +800,9 @@ public final class GreedyMesher {
                 int dir = directionToInt(quad.getDirection());
                 for (int v = 0; v < 4; v++) {
                     int off = v * stride;
-                    px[v] = clamp16(Float.intBitsToFloat(verts[off]));
-                    py[v] = clamp16(Float.intBitsToFloat(verts[off + 1]));
-                    pz[v] = clamp16(Float.intBitsToFloat(verts[off + 2]));
+                    px[v] = clamp256(Float.intBitsToFloat(verts[off]));
+                    py[v] = clamp256(Float.intBitsToFloat(verts[off + 1]));
+                    pz[v] = clamp256(Float.intBitsToFloat(verts[off + 2]));
                     vu[v] = Float.intBitsToFloat(verts[off + 4]);
                     vv[v] = Float.intBitsToFloat(verts[off + 5]);
                 }
@@ -809,11 +814,11 @@ public final class GreedyMesher {
                 }
 
                 boolean onOuterBoundary = switch (dir) {
-                    case 0 -> px[0] == 16 && px[1] == 16 && px[2] == 16 && px[3] == 16;
+                    case 0 -> px[0] == 256 && px[1] == 256 && px[2] == 256 && px[3] == 256;
                     case 1 -> px[0] == 0 && px[1] == 0 && px[2] == 0 && px[3] == 0;
-                    case 2 -> py[0] == 16 && py[1] == 16 && py[2] == 16 && py[3] == 16;
+                    case 2 -> py[0] == 256 && py[1] == 256 && py[2] == 256 && py[3] == 256;
                     case 3 -> py[0] == 0 && py[1] == 0 && py[2] == 0 && py[3] == 0;
-                    case 4 -> pz[0] == 16 && pz[1] == 16 && pz[2] == 16 && pz[3] == 16;
+                    case 4 -> pz[0] == 256 && pz[1] == 256 && pz[2] == 256 && pz[3] == 256;
                     default -> pz[0] == 0 && pz[1] == 0 && pz[2] == 0 && pz[3] == 0;
                 };
 
@@ -854,18 +859,18 @@ public final class GreedyMesher {
                     int v16 = (Math.abs(dv) > 1e-6f) ? clamp16((vv[v] - v0) / dv) : ((v == 0 || v == 1) ? 16 : 0);
                     int aoVal = aoBuf[v];
                     if (onOuterBoundary) {
-                        int ca = (dir <= 1) ? pz[v] : px[v];
-                        int cb = (dir == 2 || dir == 3) ? pz[v] : py[v];
+                        int ca = (dir <= 1) ? (pz[v] >> 4) : (px[v] >> 4);
+                        int cb = (dir == 2 || dir == 3) ? (pz[v] >> 4) : (py[v] >> 4);
                         int aBit = (ca >= 8) ? 1 : 0;
                         int bBit = (cb >= 8) ? 1 : 0;
                         int aoIdx = (bBit == 0) ? aBit : (3 - aBit);
                         aoVal = aoBuf[aoIdx];
                     }
                     out.add(VkShapeVertex.packWord0(
-                            baseX16 + px[v], baseY16 + py[v], baseZ16 + pz[v],
+                            baseX16 + (px[v] >> 4), baseY16 + (py[v] >> 4), baseZ16 + (pz[v] >> 4),
                             dir, aoVal, bl, sl, mat, wind, u16, v16
                     ));
-                    out.add(VkShapeVertex.packWord1(spriteId));
+                    out.add(VkShapeVertex.packWord1(spriteId, px[v] & 0xF, py[v] & 0xF, pz[v] & 0xF));
                 }
                 quads++;
             }

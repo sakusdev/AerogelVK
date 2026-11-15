@@ -72,11 +72,19 @@ void main() {
         uint localVert = uint(gl_VertexIndex) - meta.vertexOffset;
         uint baseIdx = meta.vertexOffset + localVert * 2u;
         uvec2 w0 = vertices[baseIdx];
+        uvec2 w1 = vertices[baseIdx + 1u];
         uint posX16 = w0.x & 0x1FFu;
         uint posY16 = (w0.x >> 9) & 0x1FFu;
         uint posZ16 = (w0.x >> 18) & 0x1FFu;
         windWaving  = (w0.y >> 12) & 0x1u;
-        localPos = vec3(float(posX16), float(posY16), float(posZ16)) * (1.0 / 16.0);
+        uint subX4  = w1.y & 0xFu;
+        uint subY4  = (w1.y >> 4) & 0xFu;
+        uint subZ4  = (w1.y >> 8) & 0xFu;
+        localPos = vec3(
+                float((posX16 << 4) | subX4),
+                float((posY16 << 4) | subY4),
+                float((posZ16 << 4) | subZ4)
+        ) * (1.0 / 256.0);
     } else {
         uvec2 packedVertex = vertices[gl_VertexIndex];
         uint dataLow = packedVertex.x;

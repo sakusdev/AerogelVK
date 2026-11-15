@@ -23,7 +23,10 @@ package org.sakus.aerogelvk.meshing;
  *
  * Word 1 (high 64 bits -> second uvec2):
  *   w1.x [0..31]  : spriteId     (32-bit AtlasUVTable index)
- *   w1.y [0..31]  : reserved     (0)
+ *   w1.y [0..3]   : subX4        (0..15, 1/256-block fractional X)
+ *   w1.y [4..7]   : subY4        (0..15, 1/256-block fractional Y)
+ *   w1.y [8..11]  : subZ4        (0..15, 1/256-block fractional Z)
+ *   w1.y [12..31] : reserved     (0)
  * </pre>
  */
 public final class VkShapeVertex {
@@ -52,6 +55,11 @@ public final class VkShapeVertex {
     }
 
     public static long packWord1(int spriteId) {
-        return spriteId & 0xFFFFFFFFL;
+        return packWord1(spriteId, 0, 0, 0);
+    }
+
+    public static long packWord1(int spriteId, int subX4, int subY4, int subZ4) {
+        int hi = (subX4 & 0xF) | ((subY4 & 0xF) << 4) | ((subZ4 & 0xF) << 8);
+        return ((long) hi << 32) | (spriteId & 0xFFFFFFFFL);
     }
 }

@@ -108,8 +108,15 @@ void main() {
         uint u16     = (w0.y >> 13) & 0x1Fu;
         uint v16     = (w0.y >> 18) & 0x1Fu;
         spriteId     = w1.x;
+        uint subX4   = w1.y & 0xFu;
+        uint subY4   = (w1.y >> 4) & 0xFu;
+        uint subZ4   = (w1.y >> 8) & 0xFu;
 
-        localPos = vec3(float(posX16), float(posY16), float(posZ16)) * (1.0 / 16.0);
+        localPos = vec3(
+                float((posX16 << 4) | subX4),
+                float((posY16 << 4) | subY4),
+                float((posZ16 << 4) | subZ4)
+        ) * (1.0 / 256.0);
         tiledUV  = vec2(float(u16), float(v16)) * (1.0 / 16.0);
     } else {
         // Cube greedy-meshed vertex stream (64-bit = 1 uvec2 slot per vertex)
