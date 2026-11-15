@@ -7,6 +7,7 @@ import org.sakus.aerogelvk.meshing.GreedyMesher;
 import org.sakus.aerogelvk.shaderpack.ShaderUniformLayout;
 import org.sakus.aerogelvk.shaderpack.VkShaderPackPipeline;
 import org.sakus.aerogelvk.vulkan.VkContext;
+import org.sakus.aerogelvk.vulkan.VkGpuProfiler;
 import org.sakus.aerogelvk.vulkan.VkInteropManager;
 import org.sakus.aerogelvk.vulkan.VkMegaBuffer;
 import org.sakus.aerogelvk.vulkan.VkPipelineManager;
@@ -71,6 +72,7 @@ public final class ValkyrieRenderer {
     private VkMegaBuffer vkMegaBuffer;
     private VkPipelineManager vkPipelineManager;
     private VkShaderPackPipeline vkShaderPackPipeline;
+    private final VkGpuProfiler gpuProfiler = new VkGpuProfiler();
     private AtlasUVTable atlasUVTable;
     private GreedyMesher greedyMesher;
     private volatile boolean pendingShaderPackReload = false;
@@ -158,6 +160,7 @@ public final class ValkyrieRenderer {
             if (!vkContext.isInitialized()) {
                 vkContext.init();
             }
+            this.gpuProfiler.init(vkContext);
 
             // 2. Zero-Copy OpenGL Interop Manager
             this.vkInteropManager = VkInteropManager.getInstance();
@@ -555,7 +558,7 @@ public final class ValkyrieRenderer {
         int slotDispatchLimit = vkMegaBuffer.getSlotDispatchLimit();
         boolean useShaderPack = shaderPackUniforms != null && isShaderPackActive();
         boolean useBuiltinPbr = activeSections > 0 && slotDispatchLimit > 0 && !useShaderPack;
-        boolean asyncComputeEnabled = vkContext.hasDedicatedComputeQueue() && useBuiltinPbr;
+        boolean asyncComputeEnabled = vkContext.hasDedicatedComputeQueue() && useBuiltinPbr && !VkGpuProfiler.isEnabled();
         boolean asyncComputeCullSubmitted = false;
         ValkyrieConfig config = ValkyrieConfig.get();
         boolean useHiZ = hasPreviousFrameHiZ && config.isHiZOcclusionEnabled();
@@ -767,6 +770,7 @@ public final class ValkyrieRenderer {
                     .sType(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
                     .flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
             vkBeginCommandBuffer(preCmd, beginInfo);
+            gpuProfiler.beginFrame(vkContext.getVkDevice(), frameSlot, preCmd, "builtin-pbr");
 
             if (asyncTransferSubmitted) {
                 vkMegaBuffer.recordTransferAcquireBarrier(preCmd);
@@ -779,7 +783,9 @@ public final class ValkyrieRenderer {
             } else {
                 long pipeLayout = vkPipelineManager.getPipelineLayout();
                 LongBuffer pSets = stack.longs(vkPipelineManager.getDescriptorSet0(frameSlot), vkPipelineManager.getDescriptorSet1());
+                int qCull = gpuProfiler.beginPass(preCmd, frameSlot, "chunk_cull");
                 dispatchChunkCull(preCmd, pipeLayout, pSets, slotDispatchLimit, useHiZ, 1, stack);
+                gpuProfiler.endPass(preCmd, frameSlot, qCull);
             }
             vkEndCommandBuffer(preCmd);
         }
@@ -803,9 +809,14 @@ public final class ValkyrieRenderer {
                                 .flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
                         vkBeginCommandBuffer(wCmd, beginInfo);
                         if (t < csmCascades.size()) {
-                            renderCsmCascade(wCmd, csmCascades.get(t), slotDispatchLimit, frameSlot, stack);
+                            int cascade = csmCascades.get(t);
+                            int qCsm = gpuProfiler.beginPass(wCmd, frameSlot, "csm_c" + cascade);
+                            renderCsmCascade(wCmd, cascade, slotDispatchLimit, frameSlot, stack);
+                            gpuProfiler.endPass(wCmd, frameSlot, qCsm);
                         } else {
+                            int qGb = gpuProfiler.beginPass(wCmd, frameSlot, "gbuffer_opaque");
                             renderGBuffer(wCmd, width, height, slotDispatchLimit, frameSlot, false, !hasTranslucent, stack);
+                            gpuProfiler.endPass(wCmd, frameSlot, qGb);
                         }
                         vkEndCommandBuffer(wCmd);
                     }
@@ -825,20 +836,30 @@ public final class ValkyrieRenderer {
             long pipeLayout = vkPipelineManager.getPipelineLayout();
             LongBuffer pSets = stack.longs(vkPipelineManager.getDescriptorSet0(frameSlot), vkPipelineManager.getDescriptorSet1());
             if (hasTranslucent) {
+                int qTrans = gpuProfiler.beginPass(postCmd, frameSlot, "gbuffer_translucent");
                 dispatchChunkCull(postCmd, pipeLayout, pSets, slotDispatchLimit, useHiZ, 2, stack);
                 renderGBuffer(postCmd, width, height, slotDispatchLimit, frameSlot, true, true, stack);
+                gpuProfiler.endPass(postCmd, frameSlot, qTrans);
             }
+            int qLight = gpuProfiler.beginPass(postCmd, frameSlot, "deferred_lighting");
             renderDeferredLighting(postCmd, width, height, frameSlot, stack);
+            gpuProfiler.endPass(postCmd, frameSlot, qLight);
             if (!asyncHiZOnCompute) {
                 if (config.isHiZOcclusionEnabled()) {
+                    int qHiz = gpuProfiler.beginPass(postCmd, frameSlot, "hiz_downsample");
                     renderHiZPyramid(postCmd, width, height, stack);
+                    gpuProfiler.endPass(postCmd, frameSlot, qHiz);
                     hasPreviousFrameHiZ = true;
                 } else {
                     hasPreviousFrameHiZ = false;
                 }
             }
+            int qPost = gpuProfiler.beginPass(postCmd, frameSlot, "post_composite");
             renderPostComposite(postCmd, width, height, sharedColorImage, frameSlot, stack);
+            gpuProfiler.endPass(postCmd, frameSlot, qPost);
+            int qDepth = gpuProfiler.beginPass(postCmd, frameSlot, "depth_convert");
             renderDepthConvert(postCmd, width, height, sharedDepthImage, sharedDepthImageView, frameSlot, stack);
+            gpuProfiler.endPass(postCmd, frameSlot, qDepth);
             vkEndCommandBuffer(postCmd);
         }
 
@@ -886,7 +907,10 @@ public final class ValkyrieRenderer {
             if (activeSections > 0 && slotDispatchLimit > 0) {
                 if (shaderPackUniforms != null && isShaderPackActive()) {
                     try {
-                        logActivePipelineIfChanged("shaderpack:" + vkShaderPackPipeline.getActivePackName());
+                        String packLabel = "shaderpack:" + vkShaderPackPipeline.getActivePackName();
+                        logActivePipelineIfChanged(packLabel);
+                        gpuProfiler.beginFrame(vkContext.getVkDevice(), frameSlot, commandBuffer, packLabel);
+                        vkShaderPackPipeline.setGpuProfiler(gpuProfiler, frameSlot);
                         vkShaderPackPipeline.recordFrame(
                                 commandBuffer,
                                 vkInteropManager.getSharedColorImage(),
@@ -904,6 +928,7 @@ public final class ValkyrieRenderer {
                         logActivePipelineIfChanged("builtin-pbr");
                         vkResetCommandBuffer(commandBuffer, 0);
                         vkBeginCommandBuffer(commandBuffer, beginInfo);
+                        gpuProfiler.beginFrame(vkContext.getVkDevice(), frameSlot, commandBuffer, "builtin-pbr");
                         recordGpuDrivenTerrainPasses(
                                 commandBuffer, width, height, slotDispatchLimit,
                                 vkInteropManager.getSharedColorImage(),
@@ -916,6 +941,7 @@ public final class ValkyrieRenderer {
                     }
                 } else {
                     logActivePipelineIfChanged("builtin-pbr");
+                    gpuProfiler.beginFrame(vkContext.getVkDevice(), frameSlot, commandBuffer, "builtin-pbr");
                     recordGpuDrivenTerrainPasses(
                             commandBuffer, width, height, slotDispatchLimit,
                             vkInteropManager.getSharedColorImage(),
@@ -930,6 +956,7 @@ public final class ValkyrieRenderer {
                 // Phase 2 fallback: animated sky/horizon procedural gradient
                 hasPreviousFrameHiZ = false;
                 logActivePipelineIfChanged("phase2-fallback");
+                gpuProfiler.beginFrame(vkContext.getVkDevice(), frameSlot, commandBuffer, "phase2-fallback");
                 recordPhase2FallbackPass(commandBuffer, width, height, stack);
             }
 
@@ -1099,14 +1126,18 @@ public final class ValkyrieRenderer {
         // --------------------------------------------------------------------
         // Pass 1: Clear DrawCountSSBO & Compute Frustum + Hi-Z Culling (Opaque passFlagFilter=1)
         // --------------------------------------------------------------------
+        int qCull = gpuProfiler.beginPass(cmd, frameSlot, "chunk_cull");
         dispatchChunkCull(cmd, pipeLayout, pSets, slotDispatchLimit, useHiZ, 1, stack);
+        gpuProfiler.endPass(cmd, frameSlot, qCull);
 
         // --------------------------------------------------------------------
         // Pass 2: Cascaded Shadow Map (CSM) Dynamic Rendering Pass
         // --------------------------------------------------------------------
         if (config.isCsmEnabled() && csmCascades != null) {
             for (int c : csmCascades) {
+                int qCsm = gpuProfiler.beginPass(cmd, frameSlot, "csm_c" + c);
                 renderCsmCascade(cmd, c, slotDispatchLimit, frameSlot, stack);
+                gpuProfiler.endPass(cmd, frameSlot, qCsm);
             }
         }
 
@@ -1115,26 +1146,34 @@ public final class ValkyrieRenderer {
         // --------------------------------------------------------------------
         // Pass 3a: Opaque G-Buffer Dynamic Rendering Pass (gbufferPipeline)
         // --------------------------------------------------------------------
+        int qGbOpaque = gpuProfiler.beginPass(cmd, frameSlot, "gbuffer_opaque");
         renderGBuffer(cmd, width, height, slotDispatchLimit, frameSlot, false, !hasTranslucent, stack);
+        gpuProfiler.endPass(cmd, frameSlot, qGbOpaque);
 
         // --------------------------------------------------------------------
         // Pass 3b: Translucent Culling & G-Buffer Pass (passFlagFilter=2, translucentGbufferPipeline)
         // --------------------------------------------------------------------
         if (hasTranslucent) {
+            int qGbTrans = gpuProfiler.beginPass(cmd, frameSlot, "gbuffer_translucent");
             dispatchChunkCull(cmd, pipeLayout, pSets, slotDispatchLimit, useHiZ, 2, stack);
             renderGBuffer(cmd, width, height, slotDispatchLimit, frameSlot, true, true, stack);
+            gpuProfiler.endPass(cmd, frameSlot, qGbTrans);
         }
 
         // --------------------------------------------------------------------
         // Pass 4: Deferred Lighting & Water SSR Compute Pass (deferred_lighting.comp)
         // --------------------------------------------------------------------
+        int qLight = gpuProfiler.beginPass(cmd, frameSlot, "deferred_lighting");
         renderDeferredLighting(cmd, width, height, frameSlot, stack);
+        gpuProfiler.endPass(cmd, frameSlot, qLight);
 
         // --------------------------------------------------------------------
         // Pass 4b: Hi-Z Occlusion Pyramid Downsample for Next Frame (hiz_downsample.comp)
         // --------------------------------------------------------------------
         if (config.isHiZOcclusionEnabled()) {
+            int qHiz = gpuProfiler.beginPass(cmd, frameSlot, "hiz_downsample");
             renderHiZPyramid(cmd, width, height, stack);
+            gpuProfiler.endPass(cmd, frameSlot, qHiz);
             hasPreviousFrameHiZ = true;
         } else {
             hasPreviousFrameHiZ = false;
@@ -1143,12 +1182,16 @@ public final class ValkyrieRenderer {
         // --------------------------------------------------------------------
         // Pass 5: Post-Process ACES Filmic Tonemapping (post_composite.comp)
         // --------------------------------------------------------------------
+        int qPost = gpuProfiler.beginPass(cmd, frameSlot, "post_composite");
         renderPostComposite(cmd, width, height, sharedColorImage, frameSlot, stack);
+        gpuProfiler.endPass(cmd, frameSlot, qPost);
 
         // --------------------------------------------------------------------
         // Pass 6: Convert Reversed-Z G-Buffer Depth -> Standard-Z Shared Depth
         // --------------------------------------------------------------------
+        int qDepth = gpuProfiler.beginPass(cmd, frameSlot, "depth_convert");
         renderDepthConvert(cmd, width, height, sharedDepthImage, sharedDepthImageView, frameSlot, stack);
+        gpuProfiler.endPass(cmd, frameSlot, qDepth);
     }
 
     private void dispatchChunkCull(
@@ -2370,6 +2413,7 @@ public final class ValkyrieRenderer {
             vkShaderPackPipeline.close();
             vkShaderPackPipeline = null;
         }
+        gpuProfiler.close(vkContext != null && vkContext.isInitialized() ? vkContext.getVkDevice() : null);
         explicitPackLoaded = false;
         pendingShaderPackReload = false;
         lastLoggedRenderPipeline = "";

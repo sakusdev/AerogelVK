@@ -6,6 +6,7 @@ import org.sakus.aerogelvk.shaderpack.GlslToVulkanTranspiler.TranspiledProgram;
 import org.sakus.aerogelvk.shaderpack.ShaderPackManager.PassProgram;
 import org.sakus.aerogelvk.shaderpack.ShaderPackManager.ShaderPackPrograms;
 import org.sakus.aerogelvk.vulkan.VkContext;
+import org.sakus.aerogelvk.vulkan.VkGpuProfiler;
 import org.sakus.aerogelvk.vulkan.VkMegaBuffer;
 import org.sakus.aerogelvk.vulkan.VkPipelineManager;
 import org.sakus.aerogelvk.vulkan.VkShaderCompiler;
@@ -302,6 +303,13 @@ public class VkShaderPackPipeline implements AutoCloseable {
     private boolean packReady = false;
     private PassTraceListener passTraceListener;
     private int passTraceColorIndex = 0;
+    private VkGpuProfiler gpuProfiler;
+    private int profilerFrameSlot = 0;
+
+    public void setGpuProfiler(VkGpuProfiler gpuProfiler, int frameSlot) {
+        this.gpuProfiler = gpuProfiler;
+        this.profilerFrameSlot = frameSlot;
+    }
 
     @FunctionalInterface
     public interface PassTraceListener {
@@ -886,8 +894,10 @@ public class VkShaderPackPipeline implements AutoCloseable {
                 if (pass.getPipeline() == VK_NULL_HANDLE) {
                     continue;
                 }
+                int qPass = (gpuProfiler != null) ? gpuProfiler.beginPass(cmd, profilerFrameSlot, pass.getName()) : -1;
                 long set1 = updateDescriptorSet1ForCurrentState(passSetSlot++);
                 recordFullscreenColorPass(cmd, stack, pass, set1, scaledWidth, scaledHeight);
+                if (gpuProfiler != null) gpuProfiler.endPass(cmd, profilerFrameSlot, qPass);
                 notifyPassTrace(cmd, stack, pass.getName());
             }
 
@@ -895,17 +905,21 @@ public class VkShaderPackPipeline implements AutoCloseable {
 
             // 3. Optional shadow pass (cull all geometry when shadowPass is present)
             if (shadowPass != null && shadowPass.getPipeline() != VK_NULL_HANDLE) {
+                int qShadow = (gpuProfiler != null) ? gpuProfiler.beginPass(cmd, profilerFrameSlot, "shadow") : -1;
                 dispatchShaderPackCull(cmd, stack, slotLimit, 0);
                 long set1 = updateDescriptorSet1ForCurrentState(passSetSlot++);
                 recordShadowPass(cmd, stack, shadowPass, set1, maxDrawCount);
                 targets.recordCopyShadowDepth(cmd, 0, 1, stack);
+                if (gpuProfiler != null) gpuProfiler.endPass(cmd, profilerFrameSlot, qShadow);
             }
 
             // 4. Primary gbuffers_terrain pass (opaque-only when gbuffers_water is present, else all)
             if (gbuffersTerrainPass != null && gbuffersTerrainPass.getPipeline() != VK_NULL_HANDLE) {
+                int qTerrain = (gpuProfiler != null) ? gpuProfiler.beginPass(cmd, profilerFrameSlot, "gbuffers_terrain") : -1;
                 dispatchShaderPackCull(cmd, stack, slotLimit, hasWaterPass ? 1 : 0);
                 long set1 = updateDescriptorSet1ForCurrentState(passSetSlot++);
                 recordGeometryPass(cmd, stack, gbuffersTerrainPass, set1, maxDrawCount, scaledWidth, scaledHeight, false);
+                if (gpuProfiler != null) gpuProfiler.endPass(cmd, profilerFrameSlot, qTerrain);
                 notifyPassTrace(cmd, stack, "gbuffers_terrain");
             }
 
@@ -915,9 +929,11 @@ public class VkShaderPackPipeline implements AutoCloseable {
 
             // 5. Optional gbuffers_water pass (translucent geometry filtered by passFlags=2)
             if (hasWaterPass && megaBuffer.hasTranslucentSections()) {
+                int qWater = (gpuProfiler != null) ? gpuProfiler.beginPass(cmd, profilerFrameSlot, "gbuffers_water") : -1;
                 dispatchShaderPackCull(cmd, stack, slotLimit, 2);
                 long set1 = updateDescriptorSet1ForCurrentState(passSetSlot++);
                 recordGeometryPass(cmd, stack, gbuffersWaterPass, set1, maxDrawCount, scaledWidth, scaledHeight, true);
+                if (gpuProfiler != null) gpuProfiler.endPass(cmd, profilerFrameSlot, qWater);
                 notifyPassTrace(cmd, stack, "gbuffers_water");
             }
 
@@ -926,8 +942,10 @@ public class VkShaderPackPipeline implements AutoCloseable {
                 if (pass.getPipeline() == VK_NULL_HANDLE) {
                     continue;
                 }
+                int qDef = (gpuProfiler != null) ? gpuProfiler.beginPass(cmd, profilerFrameSlot, pass.getName()) : -1;
                 long set1 = updateDescriptorSet1ForCurrentState(passSetSlot++);
                 recordFullscreenColorPass(cmd, stack, pass, set1, scaledWidth, scaledHeight);
+                if (gpuProfiler != null) gpuProfiler.endPass(cmd, profilerFrameSlot, qDef);
                 notifyPassTrace(cmd, stack, pass.getName());
             }
 
@@ -936,18 +954,24 @@ public class VkShaderPackPipeline implements AutoCloseable {
                 if (pass.getPipeline() == VK_NULL_HANDLE) {
                     continue;
                 }
+                int qComp = (gpuProfiler != null) ? gpuProfiler.beginPass(cmd, profilerFrameSlot, pass.getName()) : -1;
                 long set1 = updateDescriptorSet1ForCurrentState(passSetSlot++);
                 recordFullscreenColorPass(cmd, stack, pass, set1, scaledWidth, scaledHeight);
+                if (gpuProfiler != null) gpuProfiler.endPass(cmd, profilerFrameSlot, qComp);
                 notifyPassTrace(cmd, stack, pass.getName());
             }
 
             // 8. Final fullscreen pass -> writes directly into full-resolution sharedColorImageView
+            int qFinal = (gpuProfiler != null) ? gpuProfiler.beginPass(cmd, profilerFrameSlot, "final") : -1;
             long finalSet1 = updateDescriptorSet1ForCurrentState(passSetSlot);
             recordFinalPass(cmd, stack, finalPass, finalSet1, sharedColorImage, sharedColorImageView, width, height);
+            if (gpuProfiler != null) gpuProfiler.endPass(cmd, profilerFrameSlot, qFinal);
 
             // 9. Copy/blit depthtex0 -> sharedDepthImage (leaves sharedDepthImage in VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
             if (sharedDepthImage != VK_NULL_HANDLE) {
+                int qDepth = (gpuProfiler != null) ? gpuProfiler.beginPass(cmd, profilerFrameSlot, "depth_copy") : -1;
                 targets.recordCopyDepthToExternal(cmd, 0, sharedDepthImage, width, height, stack);
+                if (gpuProfiler != null) gpuProfiler.endPass(cmd, profilerFrameSlot, qDepth);
             }
         }
     }
