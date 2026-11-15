@@ -360,7 +360,50 @@ public final class ValkyrieRenderer {
             }
         }
 
-        // 1. Wait on this frame slot's fence ONLY if compositeToOpenGL didn't already wait for it
+        // 1. Stage D: Overlap CPU-side frame preparation with previous in-flight GPU work
+        // before waiting on the current frame slot's fence.
+        drainDirtySections(Minecraft.getInstance().level);
+
+        List<GreedyMesher.MeshedSectionResult> completedMeshes = null;
+        GreedyMesher.MeshedSectionResult polled;
+        while ((polled = greedyMesher.pollCompleted()) != null) {
+            if (completedMeshes == null) {
+                completedMeshes = new ArrayList<>();
+            }
+            completedMeshes.add(polled);
+        }
+
+        // Compute Matrices and Sun Direction on CPU while GPU finishes the prior slot
+        ClientLevel level = Minecraft.getInstance().level;
+        float partialTicks = deltaTracker != null ? deltaTracker.getGameTimeDeltaPartialTick(true) : 0f;
+        float timeOfDay = (level != null) ? level.getTimeOfDay(partialTicks) : 0.25f;
+
+        float sunAngle = (timeOfDay - 0.25f) * (float) (Math.PI * 2.0);
+        Vector3f sunDir = new Vector3f((float) Math.cos(sunAngle), (float) Math.sin(sunAngle), 0.25f).normalize();
+
+        Vector3f cameraPos = new Vector3f(
+                (float) camera.getPosition().x,
+                (float) camera.getPosition().y,
+                (float) camera.getPosition().z
+        );
+
+        // frustumMatrix from GameRenderer already holds camera rotation inverse (world -> view rotation)
+        Matrix4f viewMatrix = new Matrix4f(frustumMatrix).translate(-cameraPos.x, -cameraPos.y, -cameraPos.z);
+        Matrix4f projMatrix = toVulkanReversedZ(projectionMatrix);
+        Matrix4f viewProjMatrix = new Matrix4f(projMatrix).mul(viewMatrix);
+        Matrix4f invViewProjMatrix = new Matrix4f(viewProjMatrix).invert();
+
+        // Compute 3 CSM Cascade Matrices
+        computeCsmMatrices(cameraPos, sunDir, viewMatrix);
+
+        ShaderUniformLayout.UniformData shaderPackUniforms = null;
+        if (isShaderPackActive()) {
+            shaderPackUniforms = buildShaderPackUniformData(
+                    level, camera, cameraPos, frustumMatrix, projectionMatrix, partialTicks
+            );
+        }
+
+        // 2. Wait on this frame slot's fence ONLY if compositeToOpenGL didn't already wait for it
         int slot = currentFrameSlot;
         VkDevice device = vkContext.getVkDevice();
         if (!fenceWaited[slot]) {
@@ -386,60 +429,35 @@ public final class ValkyrieRenderer {
         }
         vkMegaBuffer.beginFrameSlot(slot, FRAMES_IN_FLIGHT);
 
-        // 1b. Drain deduplicated dirty section coordinates and capture non-empty snapshots
-        drainDirtySections(Minecraft.getInstance().level);
-
-        // 2. Poll completed meshing results and stream into MegaBuffer (opaque, translucent, and half-scale VoxelShape sub-meshes)
-        GreedyMesher.MeshedSectionResult result;
-        while ((result = greedyMesher.pollCompleted()) != null) {
-            int shadowFlag = result.flags() & 2;
-            vkMegaBuffer.uploadSectionSubMesh(
-                    result.sectionX(), result.sectionY(), result.sectionZ(), 0,
-                    result.packedVertices(), result.quadCount(), result.aabbPacked(), shadowFlag
-            );
-            vkMegaBuffer.uploadSectionSubMesh(
-                    result.sectionX(), result.sectionY(), result.sectionZ(), 1,
-                    result.translucentVertices(), result.translucentQuadCount(), result.translucentAabbPacked(), 1 | shadowFlag
-            );
-            vkMegaBuffer.uploadSectionSubMesh(
-                    result.sectionX(), result.sectionY(), result.sectionZ(), 2,
-                    result.halfScaleOpaqueVertices(), result.halfScaleOpaqueQuadCount(), result.halfScaleOpaqueAabbPacked(), 4 | shadowFlag
-            );
-            vkMegaBuffer.uploadSectionSubMesh(
-                    result.sectionX(), result.sectionY(), result.sectionZ(), 3,
-                    result.halfScaleTranslucentVertices(), result.halfScaleTranslucentQuadCount(), result.halfScaleTranslucentAabbPacked(), 5 | shadowFlag
-            );
-            dirtyShadow = true;
+        // 3. Stream polled meshing results into MegaBuffer (opaque, translucent, and half-scale VoxelShape sub-meshes)
+        if (completedMeshes != null) {
+            for (GreedyMesher.MeshedSectionResult result : completedMeshes) {
+                int shadowFlag = result.flags() & 2;
+                vkMegaBuffer.uploadSectionSubMesh(
+                        result.sectionX(), result.sectionY(), result.sectionZ(), 0,
+                        result.packedVertices(), result.quadCount(), result.aabbPacked(), shadowFlag
+                );
+                vkMegaBuffer.uploadSectionSubMesh(
+                        result.sectionX(), result.sectionY(), result.sectionZ(), 1,
+                        result.translucentVertices(), result.translucentQuadCount(), result.translucentAabbPacked(), 1 | shadowFlag
+                );
+                vkMegaBuffer.uploadSectionSubMesh(
+                        result.sectionX(), result.sectionY(), result.sectionZ(), 2,
+                        result.halfScaleOpaqueVertices(), result.halfScaleOpaqueQuadCount(), result.halfScaleOpaqueAabbPacked(), 4 | shadowFlag
+                );
+                vkMegaBuffer.uploadSectionSubMesh(
+                        result.sectionX(), result.sectionY(), result.sectionZ(), 3,
+                        result.halfScaleTranslucentVertices(), result.halfScaleTranslucentQuadCount(), result.halfScaleTranslucentAabbPacked(), 5 | shadowFlag
+                );
+                dirtyShadow = true;
+            }
         }
 
-        // 3. Refresh Block Atlas UVs & Texture if dirty
+        // 4. Refresh Block Atlas UVs & Texture if dirty
         if (atlasUVTable.isDirty()) {
             syncAtlasResources();
             updateDescriptorSet0Buffers();
         }
-
-        // 4. Compute Matrices and Sun Direction
-        ClientLevel level = Minecraft.getInstance().level;
-        float partialTicks = deltaTracker != null ? deltaTracker.getGameTimeDeltaPartialTick(true) : 0f;
-        float timeOfDay = (level != null) ? level.getTimeOfDay(partialTicks) : 0.25f;
-
-        float sunAngle = (timeOfDay - 0.25f) * (float) (Math.PI * 2.0);
-        Vector3f sunDir = new Vector3f((float) Math.cos(sunAngle), (float) Math.sin(sunAngle), 0.25f).normalize();
-
-        Vector3f cameraPos = new Vector3f(
-                (float) camera.getPosition().x,
-                (float) camera.getPosition().y,
-                (float) camera.getPosition().z
-        );
-
-        // frustumMatrix from GameRenderer already holds camera rotation inverse (world -> view rotation)
-        Matrix4f viewMatrix = new Matrix4f(frustumMatrix).translate(-cameraPos.x, -cameraPos.y, -cameraPos.z);
-        Matrix4f projMatrix = toVulkanReversedZ(projectionMatrix);
-        Matrix4f viewProjMatrix = new Matrix4f(projMatrix).mul(viewMatrix);
-        Matrix4f invViewProjMatrix = new Matrix4f(viewProjMatrix).invert();
-
-        // Compute 3 CSM Cascade Matrices
-        computeCsmMatrices(cameraPos, sunDir, viewMatrix);
 
         // Update Frame Uniform Buffer (UBO) for this frame slot
         vkPipelineManager.updateFrameUbo(
@@ -459,13 +477,6 @@ public final class ValkyrieRenderer {
         );
 
         prevViewProj.set(viewProjMatrix);
-
-        ShaderUniformLayout.UniformData shaderPackUniforms = null;
-        if (isShaderPackActive()) {
-            shaderPackUniforms = buildShaderPackUniformData(
-                    level, camera, cameraPos, frustumMatrix, projectionMatrix, partialTicks
-            );
-        }
 
         // 5. Stage A: Async Transfer Queue submission when dedicated transfer queue is available
         boolean asyncTransferSubmitted = false;
