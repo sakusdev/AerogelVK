@@ -546,8 +546,9 @@ public final class VkPipelineManager implements AutoCloseable {
                     .stencilTestEnable(false);
 
             VkPipelineColorBlendAttachmentState.Buffer blendAttachments = VkPipelineColorBlendAttachmentState.calloc(2, stack);
+            boolean enableBlend0 = translucent && VkContext.getInstance().isIndependentBlendSupported();
             for (int i = 0; i < 2; i++) {
-                if (translucent && i == 0) {
+                if (enableBlend0 && i == 0) {
                     blendAttachments.get(i)
                             .blendEnable(true)
                             .srcColorBlendFactor(VK_BLEND_FACTOR_SRC_ALPHA)
@@ -627,7 +628,7 @@ public final class VkPipelineManager implements AutoCloseable {
                     .sType(VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO)
                     .polygonMode(VK_POLYGON_MODE_FILL)
                     .cullMode(VK_CULL_MODE_NONE)
-                    .depthClampEnable(true)
+                    .depthClampEnable(VkContext.getInstance().isDepthClampSupported())
                     .depthBiasEnable(true)
                     .lineWidth(1.0f);
 
@@ -1076,9 +1077,9 @@ public final class VkPipelineManager implements AutoCloseable {
             VkImageSubresourceRange.Buffer range = VkImageSubresourceRange.calloc(1, stack)
                     .aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).baseMipLevel(0).levelCount(hiZMipLevels).baseArrayLayer(0).layerCount(1);
             vkCmdClearColorImage(cmd, hiZImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, clearZero, range);
-            recordImageBarrier(cmd, hiZImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            recordImageBarrier(cmd, hiZImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
                     VK_IMAGE_ASPECT_COLOR_BIT, 0, hiZMipLevels, 0, 1,
-                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, stack);
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, stack);
             ctx.endSingleTimeCommands(cmd);
 
             // HDR Color: R16G16B16A16_SFLOAT
@@ -1216,7 +1217,7 @@ public final class VkPipelineManager implements AutoCloseable {
 
             // 3: uHiZPyramid
             VkDescriptorImageInfo.Buffer hiZInfo = VkDescriptorImageInfo.calloc(1, stack)
-                    .imageLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL).imageView(hiZView).sampler(nearestSampler);
+                    .imageLayout(VK_IMAGE_LAYOUT_GENERAL).imageView(hiZView).sampler(nearestSampler);
             writes.get(3).sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET).dstSet(descriptorSet1).dstBinding(3)
                     .descriptorCount(1).descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).pImageInfo(hiZInfo);
 

@@ -257,21 +257,28 @@ public final class VkShaderPackTargets implements AutoCloseable {
         for (int i = 0; i < MAX_COLORTEX; i++) {
             String fmtName = (formatNames != null && i < formatNames.length) ? formatNames[i] : null;
             int requestedFormat = parseVkFormat(fmtName);
-            colorFormats[i] = ensureSupportedColorFormat(requestedFormat);
-            colorMipmapRequested[i] = (mipmaps != null && i < mipmaps.length && mipmaps[i]);
+            boolean mipmapEnabled = (mipmaps != null && i < mipmaps.length && mipmaps[i]);
+            colorFormats[i] = ensureSupportedColorFormat(requestedFormat, mipmapEnabled);
+            colorMipmapRequested[i] = mipmapEnabled;
         }
     }
 
-    private int ensureSupportedColorFormat(int vkFormat) {
+    private int ensureSupportedColorFormat(int vkFormat, boolean mipmapEnabled) {
         if (device == null) return vkFormat;
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkFormatProperties props = VkFormatProperties.calloc(stack);
             vkGetPhysicalDeviceFormatProperties(VkContext.getInstance().getPhysicalDevice(), vkFormat, props);
             int required = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+            if (mipmapEnabled) {
+                required |= VK_FORMAT_FEATURE_BLIT_SRC_BIT
+                        | VK_FORMAT_FEATURE_BLIT_DST_BIT
+                        | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+            }
             if ((props.optimalTilingFeatures() & required) == required) {
                 return vkFormat;
             }
-            LOGGER.warn("[Valkyrie] Vulkan format {} does not support COLOR_ATTACHMENT | SAMPLED on this GPU; falling back to RGBA16F.", vkFormat);
+            LOGGER.warn("[Valkyrie] Vulkan format {} does not support required features (mipmap={}) on this GPU; falling back to RGBA16F.",
+                    vkFormat, mipmapEnabled);
             return VK_FORMAT_R16G16B16A16_SFLOAT;
         }
     }

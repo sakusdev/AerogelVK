@@ -589,6 +589,11 @@ public final class ShaderPackVerificationTest {
                     ctx, mega, shaderPackPipeline, tempGameDir, shaderpacksDir,
                     packsToRender, blackPackNames, camPos, target, viewMatrix
             );
+            System.out.printf("  -> ShaderPack live verification complete (validationErrors=%d).%n",
+                    ctx.getValidationErrorCount());
+            if (ctx.isValidationEnabled() && ctx.getValidationErrorCount() > 0) {
+                throw new AssertionError("Vulkan Validation Layer reported " + ctx.getValidationErrorCount() + " error(s) during ShaderPackVerificationTest!");
+            }
         } finally {
             ValkyrieConfig.get().disableShaderPack();
             if (shaderPackPipeline != null) {

@@ -95,7 +95,13 @@ public final class ValkyrieRenderer {
     private final VkCommandBuffer[] commandBuffers = new VkCommandBuffer[FRAMES_IN_FLIGHT];
     private final VkCommandBuffer[] postCommandBuffers = new VkCommandBuffer[FRAMES_IN_FLIGHT];
     private final VkCommandBuffer[] transferCommandBuffers = new VkCommandBuffer[FRAMES_IN_FLIGHT];
+    private final VkCommandBuffer[] cullComputeCommandBuffers = new VkCommandBuffer[FRAMES_IN_FLIGHT];
+    private final VkCommandBuffer[] hizComputeCommandBuffers = new VkCommandBuffer[FRAMES_IN_FLIGHT];
     private final long[] transferCompleteSemaphores = new long[FRAMES_IN_FLIGHT];
+    private final long[] cullCompleteSemaphores = new long[FRAMES_IN_FLIGHT];
+    private final long[] gbufferDoneSemaphores = new long[FRAMES_IN_FLIGHT];
+    private long hizReadySemaphore = VK_NULL_HANDLE;
+    private boolean hizSemaphorePending = false;
     private final long[][] workerCommandPools = new long[RECORD_WORKER_COUNT][FRAMES_IN_FLIGHT];
     private final VkCommandBuffer[][][] workerCommandBuffers = new VkCommandBuffer[RECORD_WORKER_COUNT][FRAMES_IN_FLIGHT][MAX_PARALLEL_CMDS_PER_WORKER];
     private ExecutorService recordExecutor;
@@ -203,11 +209,26 @@ public final class ValkyrieRenderer {
                 this.commandBuffers[i] = vkContext.allocateCommandBuffer();
                 this.postCommandBuffers[i] = vkContext.allocateCommandBuffer();
                 this.transferCommandBuffers[i] = vkContext.allocateTransferCommandBuffer();
+                this.cullComputeCommandBuffers[i] = vkContext.allocateComputeCommandBuffer();
+                this.hizComputeCommandBuffers[i] = vkContext.allocateComputeCommandBuffer();
+
                 int semRes = vkCreateSemaphore(vkContext.getVkDevice(), semInfo, null, pSem);
                 if (semRes != VK_SUCCESS) {
                     throw new RuntimeException("Failed to create transfer semaphore[" + i + "]: " + semRes);
                 }
                 this.transferCompleteSemaphores[i] = pSem.get(0);
+
+                semRes = vkCreateSemaphore(vkContext.getVkDevice(), semInfo, null, pSem);
+                if (semRes != VK_SUCCESS) {
+                    throw new RuntimeException("Failed to create cull semaphore[" + i + "]: " + semRes);
+                }
+                this.cullCompleteSemaphores[i] = pSem.get(0);
+
+                semRes = vkCreateSemaphore(vkContext.getVkDevice(), semInfo, null, pSem);
+                if (semRes != VK_SUCCESS) {
+                    throw new RuntimeException("Failed to create gbuffer-done semaphore[" + i + "]: " + semRes);
+                }
+                this.gbufferDoneSemaphores[i] = pSem.get(0);
 
                 int res = vkCreateFence(vkContext.getVkDevice(), fenceInfo, null, pFence);
                 if (res != VK_SUCCESS) {
@@ -216,6 +237,12 @@ public final class ValkyrieRenderer {
                 this.frameFences[i] = pFence.get(0);
                 this.fenceWaited[i] = true;
             }
+            int hizSemRes = vkCreateSemaphore(vkContext.getVkDevice(), semInfo, null, pSem);
+            if (hizSemRes != VK_SUCCESS) {
+                throw new RuntimeException("Failed to create Hi-Z semaphore: " + hizSemRes);
+            }
+            this.hizReadySemaphore = pSem.get(0);
+            this.hizSemaphorePending = false;
 
             // Stage B: Per-worker, per-slot VkCommandPools & pre-allocated primary command buffers
             VkCommandPoolCreateInfo workerPoolInfo = VkCommandPoolCreateInfo.calloc(stack)
@@ -471,9 +498,59 @@ public final class ValkyrieRenderer {
             }
         }
 
-        // 5b. Record Graphics Command Buffer(s) (Stage B: multi-threaded independent primary CBs for builtin PBR when >= 2 passes, else serial)
+        // 5b. Stage C: Async Compute Queue chunk culling when dedicated compute queue is available
+        int activeSections = vkMegaBuffer.getActiveSectionCount();
+        int slotDispatchLimit = vkMegaBuffer.getSlotDispatchLimit();
+        boolean useShaderPack = shaderPackUniforms != null && isShaderPackActive();
+        boolean useBuiltinPbr = activeSections > 0 && slotDispatchLimit > 0 && !useShaderPack;
+        boolean asyncComputeEnabled = vkContext.hasDedicatedComputeQueue() && useBuiltinPbr;
+        boolean asyncComputeCullSubmitted = false;
+        ValkyrieConfig config = ValkyrieConfig.get();
+        boolean useHiZ = hasPreviousFrameHiZ && config.isHiZOcclusionEnabled();
+
+        if (asyncComputeEnabled) {
+            VkCommandBuffer cullCmd = cullComputeCommandBuffers[slot];
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                vkResetCommandBuffer(cullCmd, 0);
+                VkCommandBufferBeginInfo cBegin = VkCommandBufferBeginInfo.calloc(stack)
+                        .sType(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
+                        .flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
+                vkBeginCommandBuffer(cullCmd, cBegin);
+                long pipeLayout = vkPipelineManager.getPipelineLayout();
+                LongBuffer pSets = stack.longs(vkPipelineManager.getDescriptorSet0(slot), vkPipelineManager.getDescriptorSet1());
+                recordChunkCullCompute(
+                        cullCmd, pipeLayout, pSets, slotDispatchLimit, useHiZ, 1,
+                        vkContext.hasSeparateComputeQueueFamily(), stack);
+                vkEndCommandBuffer(cullCmd);
+
+                PointerBuffer pCullCmd = stack.pointers(cullCmd);
+                LongBuffer pCullSig = stack.longs(cullCompleteSemaphores[slot]);
+                VkSubmitInfo cSubmit = VkSubmitInfo.calloc(stack)
+                        .sType(VK_STRUCTURE_TYPE_SUBMIT_INFO)
+                        .pCommandBuffers(pCullCmd)
+                        .pSignalSemaphores(pCullSig);
+                if (hizSemaphorePending) {
+                    LongBuffer pWaitHiz = stack.longs(hizReadySemaphore);
+                    IntBuffer pWaitMask = stack.ints(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                    cSubmit.waitSemaphoreCount(1)
+                            .pWaitSemaphores(pWaitHiz)
+                            .pWaitDstStageMask(pWaitMask);
+                    hizSemaphorePending = false;
+                }
+                int cRes = vkQueueSubmit(vkContext.getComputeQueue(), cSubmit, VK_NULL_HANDLE);
+                if (cRes == VK_SUCCESS) {
+                    asyncComputeCullSubmitted = true;
+                } else {
+                    LOGGER.error("[Valkyrie] Compute queue cull submit failed: {}", cRes);
+                }
+            }
+        }
+
+        // 5c. Record Graphics Command Buffer(s) (Stage B: multi-threaded independent primary CBs for builtin PBR when >= 2 passes, else serial)
+        boolean asyncHiZOnCompute = asyncComputeEnabled && config.isHiZOcclusionEnabled();
         List<VkCommandBuffer> submittedCmds = recordFrameCommands(
-                slot, width, height, shaderPackUniforms, asyncTransferSubmitted);
+                slot, width, height, shaderPackUniforms, asyncTransferSubmitted,
+                asyncComputeCullSubmitted, asyncHiZOnCompute);
 
         // B4: Track actual final Vulkan image layouts before GL waitSemaphoreEXT acquires them
         vkInteropManager.setVkExportedLayouts(
@@ -481,7 +558,7 @@ public final class ValkyrieRenderer {
                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
         );
 
-        // 6. Submit Command Buffer(s) (using external/transfer semaphores when active, else fence sync in composite)
+        // 6. Submit Command Buffer(s) (using external/transfer/compute semaphores when active, else fence sync in composite)
         try (MemoryStack stack = MemoryStack.stackPush()) {
             PointerBuffer pCmd = stack.mallocPointer(submittedCmds.size());
             for (int i = 0; i < submittedCmds.size(); i++) {
@@ -493,7 +570,7 @@ public final class ValkyrieRenderer {
                     .pCommandBuffers(pCmd);
 
             boolean waitGl = vkInteropManager.usesExternalSemaphores() && vkInteropManager.consumeGlSemaphoreSignaled();
-            int waitCount = (asyncTransferSubmitted ? 1 : 0) + (waitGl ? 1 : 0);
+            int waitCount = (asyncTransferSubmitted ? 1 : 0) + (asyncComputeCullSubmitted ? 1 : 0) + (waitGl ? 1 : 0);
             if (waitCount > 0) {
                 LongBuffer pWaitSemaphores = stack.mallocLong(waitCount);
                 IntBuffer pWaitDstStageMask = stack.mallocInt(waitCount);
@@ -501,6 +578,11 @@ public final class ValkyrieRenderer {
                 if (asyncTransferSubmitted) {
                     pWaitSemaphores.put(idx, transferCompleteSemaphores[slot]);
                     pWaitDstStageMask.put(idx, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                    idx++;
+                }
+                if (asyncComputeCullSubmitted) {
+                    pWaitSemaphores.put(idx, cullCompleteSemaphores[slot]);
+                    pWaitDstStageMask.put(idx, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT);
                     idx++;
                 }
                 if (waitGl) {
@@ -514,8 +596,17 @@ public final class ValkyrieRenderer {
                         .pWaitDstStageMask(pWaitDstStageMask);
             }
 
-            if (vkInteropManager.usesExternalSemaphores()) {
-                LongBuffer pSignalSemaphores = stack.longs(vkInteropManager.getVkRenderCompleteSemaphore());
+            boolean sigExt = vkInteropManager.usesExternalSemaphores();
+            int sigCount = (sigExt ? 1 : 0) + (asyncHiZOnCompute ? 1 : 0);
+            if (sigCount > 0) {
+                LongBuffer pSignalSemaphores = stack.mallocLong(sigCount);
+                int sIdx = 0;
+                if (sigExt) {
+                    pSignalSemaphores.put(sIdx++, vkInteropManager.getVkRenderCompleteSemaphore());
+                }
+                if (asyncHiZOnCompute) {
+                    pSignalSemaphores.put(sIdx, gbufferDoneSemaphores[slot]);
+                }
                 submitInfo.pSignalSemaphores(pSignalSemaphores);
             }
 
@@ -524,6 +615,39 @@ public final class ValkyrieRenderer {
                 LOGGER.error("[Valkyrie] Failed to submit render command buffer: {}", res);
             } else {
                 fenceWaited[slot] = false;
+            }
+        }
+
+        // 6b. Stage C: Submit async Hi-Z downsample on computeQueue after graphicsQueue signals gbufferDoneSemaphores[slot]
+        if (asyncHiZOnCompute) {
+            VkCommandBuffer hizCmd = hizComputeCommandBuffers[slot];
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                vkResetCommandBuffer(hizCmd, 0);
+                VkCommandBufferBeginInfo hBegin = VkCommandBufferBeginInfo.calloc(stack)
+                        .sType(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
+                        .flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
+                vkBeginCommandBuffer(hizCmd, hBegin);
+                renderHiZPyramid(hizCmd, width, height, stack);
+                vkEndCommandBuffer(hizCmd);
+
+                PointerBuffer pHizCmd = stack.pointers(hizCmd);
+                LongBuffer pWaitGfx = stack.longs(gbufferDoneSemaphores[slot]);
+                IntBuffer pWaitMask = stack.ints(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                LongBuffer pSigHiz = stack.longs(hizReadySemaphore);
+                VkSubmitInfo hSubmit = VkSubmitInfo.calloc(stack)
+                        .sType(VK_STRUCTURE_TYPE_SUBMIT_INFO)
+                        .waitSemaphoreCount(1)
+                        .pWaitSemaphores(pWaitGfx)
+                        .pWaitDstStageMask(pWaitMask)
+                        .pCommandBuffers(pHizCmd)
+                        .pSignalSemaphores(pSigHiz);
+                int hRes = vkQueueSubmit(vkContext.getComputeQueue(), hSubmit, VK_NULL_HANDLE);
+                if (hRes == VK_SUCCESS) {
+                    hasPreviousFrameHiZ = true;
+                    hizSemaphorePending = true;
+                } else {
+                    LOGGER.error("[Valkyrie] Compute queue Hi-Z submit failed: {}", hRes);
+                }
             }
         }
 
@@ -538,7 +662,9 @@ public final class ValkyrieRenderer {
             int width,
             int height,
             ShaderUniformLayout.UniformData shaderPackUniforms,
-            boolean asyncTransferSubmitted
+            boolean asyncTransferSubmitted,
+            boolean asyncComputeCullSubmitted,
+            boolean asyncHiZOnCompute
     ) {
         int activeSections = vkMegaBuffer.getActiveSectionCount();
         int slotDispatchLimit = vkMegaBuffer.getSlotDispatchLimit();
@@ -561,7 +687,7 @@ public final class ValkyrieRenderer {
             if (totalParallelPasses >= 2) {
                 return recordBuiltinPbrParallel(
                         frameSlot, width, height, slotDispatchLimit,
-                        csmCascades, asyncTransferSubmitted);
+                        csmCascades, asyncTransferSubmitted, asyncComputeCullSubmitted, asyncHiZOnCompute);
             }
         }
 
@@ -577,7 +703,9 @@ public final class ValkyrieRenderer {
             int height,
             int slotDispatchLimit,
             List<Integer> csmCascades,
-            boolean asyncTransferSubmitted
+            boolean asyncTransferSubmitted,
+            boolean asyncComputeCullSubmitted,
+            boolean asyncHiZOnCompute
     ) {
         ValkyrieConfig config = ValkyrieConfig.get();
         boolean useHiZ = hasPreviousFrameHiZ && config.isHiZOcclusionEnabled();
@@ -588,7 +716,7 @@ public final class ValkyrieRenderer {
 
         logActivePipelineIfChanged("builtin-pbr");
 
-        // 1. Pre-pass CB on main thread: transfer/acquire + opaque chunk cull
+        // 1. Pre-pass CB on main thread: transfer/acquire + opaque chunk cull (or compute cull acquire barrier)
         VkCommandBuffer preCmd = commandBuffers[frameSlot];
         try (MemoryStack stack = MemoryStack.stackPush()) {
             vkResetCommandBuffer(preCmd, 0);
@@ -603,9 +731,13 @@ public final class ValkyrieRenderer {
                 vkMegaBuffer.recordPendingTransfersForSlot(frameSlot, preCmd, false);
             }
 
-            long pipeLayout = vkPipelineManager.getPipelineLayout();
-            LongBuffer pSets = stack.longs(vkPipelineManager.getDescriptorSet0(frameSlot), vkPipelineManager.getDescriptorSet1());
-            dispatchChunkCull(preCmd, pipeLayout, pSets, slotDispatchLimit, useHiZ, 1, stack);
+            if (asyncComputeCullSubmitted) {
+                recordComputeCullAcquireBarrier(preCmd, stack);
+            } else {
+                long pipeLayout = vkPipelineManager.getPipelineLayout();
+                LongBuffer pSets = stack.longs(vkPipelineManager.getDescriptorSet0(frameSlot), vkPipelineManager.getDescriptorSet1());
+                dispatchChunkCull(preCmd, pipeLayout, pSets, slotDispatchLimit, useHiZ, 1, stack);
+            }
             vkEndCommandBuffer(preCmd);
         }
 
@@ -654,11 +786,13 @@ public final class ValkyrieRenderer {
                 renderGBuffer(postCmd, width, height, slotDispatchLimit, frameSlot, true, true, stack);
             }
             renderDeferredLighting(postCmd, width, height, frameSlot, stack);
-            if (config.isHiZOcclusionEnabled()) {
-                renderHiZPyramid(postCmd, width, height, stack);
-                hasPreviousFrameHiZ = true;
-            } else {
-                hasPreviousFrameHiZ = false;
+            if (!asyncHiZOnCompute) {
+                if (config.isHiZOcclusionEnabled()) {
+                    renderHiZPyramid(postCmd, width, height, stack);
+                    hasPreviousFrameHiZ = true;
+                } else {
+                    hasPreviousFrameHiZ = false;
+                }
             }
             renderPostComposite(postCmd, width, height, sharedColorImage, frameSlot, stack);
             renderDepthConvert(postCmd, width, height, sharedDepthImage, sharedDepthImageView, frameSlot, stack);
@@ -979,6 +1113,19 @@ public final class ValkyrieRenderer {
             int passFlagFilter,
             MemoryStack stack
     ) {
+        recordChunkCullCompute(cmd, pipeLayout, pSets, slotDispatchLimit, useHiZ, passFlagFilter, false, stack);
+    }
+
+    private void recordChunkCullCompute(
+            VkCommandBuffer cmd,
+            long pipeLayout,
+            LongBuffer pSets,
+            int slotDispatchLimit,
+            boolean useHiZ,
+            int passFlagFilter,
+            boolean releaseToGraphics,
+            MemoryStack stack
+    ) {
         vkCmdFillBuffer(cmd, vkMegaBuffer.getDrawCountBuffer().buffer, 0, 4, 0);
 
         VkBufferMemoryBarrier.Buffer clearCountBarrier = VkBufferMemoryBarrier.calloc(1, stack)
@@ -1007,27 +1154,88 @@ public final class ValkyrieRenderer {
         int groupCountX = (slotDispatchLimit + 63) / 64;
         vkCmdDispatch(cmd, groupCountX, 1, 1);
 
-        VkBufferMemoryBarrier.Buffer indirectBarriers = VkBufferMemoryBarrier.calloc(2, stack);
-        indirectBarriers.get(0).sType(VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER)
-                .srcAccessMask(VK_ACCESS_SHADER_WRITE_BIT)
+        if (releaseToGraphics && vkContext.hasSeparateComputeQueueFamily()) {
+            VkBufferMemoryBarrier.Buffer releaseBarriers = VkBufferMemoryBarrier.calloc(3, stack);
+            releaseBarriers.get(0).sType(VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER)
+                    .srcAccessMask(VK_ACCESS_SHADER_WRITE_BIT)
+                    .dstAccessMask(0)
+                    .srcQueueFamilyIndex(vkContext.getComputeQueueFamilyIndex())
+                    .dstQueueFamilyIndex(vkContext.getQueueFamilyIndex())
+                    .buffer(vkMegaBuffer.getIndirectCmdBuffer().buffer)
+                    .offset(0).size(VK_WHOLE_SIZE);
+            releaseBarriers.get(1).sType(VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER)
+                    .srcAccessMask(VK_ACCESS_SHADER_WRITE_BIT)
+                    .dstAccessMask(0)
+                    .srcQueueFamilyIndex(vkContext.getComputeQueueFamilyIndex())
+                    .dstQueueFamilyIndex(vkContext.getQueueFamilyIndex())
+                    .buffer(vkMegaBuffer.getDrawCountBuffer().buffer)
+                    .offset(0).size(VK_WHOLE_SIZE);
+            releaseBarriers.get(2).sType(VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER)
+                    .srcAccessMask(VK_ACCESS_SHADER_WRITE_BIT)
+                    .dstAccessMask(0)
+                    .srcQueueFamilyIndex(vkContext.getComputeQueueFamilyIndex())
+                    .dstQueueFamilyIndex(vkContext.getQueueFamilyIndex())
+                    .buffer(vkMegaBuffer.getVisibleChunkIdBuffer().buffer)
+                    .offset(0).size(VK_WHOLE_SIZE);
+            vkCmdPipelineBarrier(cmd,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                    0, null, releaseBarriers, null);
+        } else {
+            VkBufferMemoryBarrier.Buffer indirectBarriers = VkBufferMemoryBarrier.calloc(2, stack);
+            indirectBarriers.get(0).sType(VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER)
+                    .srcAccessMask(VK_ACCESS_SHADER_WRITE_BIT)
+                    .dstAccessMask(VK_ACCESS_INDIRECT_COMMAND_READ_BIT)
+                    .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                    .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                    .buffer(vkMegaBuffer.getIndirectCmdBuffer().buffer)
+                    .offset(0).size(VK_WHOLE_SIZE);
+
+            indirectBarriers.get(1).sType(VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER)
+                    .srcAccessMask(VK_ACCESS_SHADER_WRITE_BIT)
+                    .dstAccessMask(VK_ACCESS_INDIRECT_COMMAND_READ_BIT)
+                    .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                    .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                    .buffer(vkMegaBuffer.getDrawCountBuffer().buffer)
+                    .offset(0).size(VK_WHOLE_SIZE);
+
+            vkCmdPipelineBarrier(cmd,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+                    0, null, indirectBarriers, null);
+        }
+    }
+
+    private void recordComputeCullAcquireBarrier(VkCommandBuffer graphicsCmd, MemoryStack stack) {
+        if (!vkContext.hasSeparateComputeQueueFamily()) {
+            return;
+        }
+        VkBufferMemoryBarrier.Buffer acquireBarriers = VkBufferMemoryBarrier.calloc(3, stack);
+        acquireBarriers.get(0).sType(VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER)
+                .srcAccessMask(0)
                 .dstAccessMask(VK_ACCESS_INDIRECT_COMMAND_READ_BIT)
-                .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
-                .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                .srcQueueFamilyIndex(vkContext.getComputeQueueFamilyIndex())
+                .dstQueueFamilyIndex(vkContext.getQueueFamilyIndex())
                 .buffer(vkMegaBuffer.getIndirectCmdBuffer().buffer)
                 .offset(0).size(VK_WHOLE_SIZE);
-
-        indirectBarriers.get(1).sType(VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER)
-                .srcAccessMask(VK_ACCESS_SHADER_WRITE_BIT)
+        acquireBarriers.get(1).sType(VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER)
+                .srcAccessMask(0)
                 .dstAccessMask(VK_ACCESS_INDIRECT_COMMAND_READ_BIT)
-                .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
-                .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                .srcQueueFamilyIndex(vkContext.getComputeQueueFamilyIndex())
+                .dstQueueFamilyIndex(vkContext.getQueueFamilyIndex())
                 .buffer(vkMegaBuffer.getDrawCountBuffer().buffer)
                 .offset(0).size(VK_WHOLE_SIZE);
-
-        vkCmdPipelineBarrier(cmd,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
-                0, null, indirectBarriers, null);
+        acquireBarriers.get(2).sType(VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER)
+                .srcAccessMask(0)
+                .dstAccessMask(VK_ACCESS_SHADER_READ_BIT)
+                .srcQueueFamilyIndex(vkContext.getComputeQueueFamilyIndex())
+                .dstQueueFamilyIndex(vkContext.getQueueFamilyIndex())
+                .buffer(vkMegaBuffer.getVisibleChunkIdBuffer().buffer)
+                .offset(0).size(VK_WHOLE_SIZE);
+        vkCmdPipelineBarrier(graphicsCmd,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
+                0, null, acquireBarriers, null);
     }
 
     private void renderCsmCascade(VkCommandBuffer cmd, int cascade, int maxDrawCount, int frameSlot, MemoryStack stack) {
@@ -1228,13 +1436,6 @@ public final class ValkyrieRenderer {
         ByteBuffer pcHiZ = stack.malloc(16);
 
         for (int mip = 0; mip < mipLevels; mip++) {
-            // Transition only destination mip to GENERAL while keeping already-written mips in SHADER_READ_ONLY_OPTIMAL
-            transitionImageLayout(cmd, hiZImage,
-                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-                    VK_IMAGE_ASPECT_COLOR_BIT, mip, 1, 0, 1,
-                    VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-
             pcHiZ.putInt(0, mip);
             pcHiZ.putInt(4, srcW);
             pcHiZ.putInt(8, srcH);
@@ -1243,9 +1444,9 @@ public final class ValkyrieRenderer {
 
             vkCmdDispatch(cmd, (dstW + 7) / 8, (dstH + 7) / 8, 1);
 
-            // Transition this written mip to SHADER_READ_ONLY_OPTIMAL before next mip reads it
+            // Ensure this written mip in GENERAL layout is visible before next mip reads it
             transitionImageLayout(cmd, hiZImage,
-                    VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
                     VK_IMAGE_ASPECT_COLOR_BIT, mip, 1, 0, 1,
                     VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
@@ -1378,7 +1579,7 @@ public final class ValkyrieRenderer {
 
         ByteBuffer pc = stack.malloc(4);
         pc.putFloat(0, (float) (frameIndex * 0.016));
-        vkCmdPushConstants(cmd, pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pc);
+        vkCmdPushConstants(cmd, pipeLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_COMPUTE_BIT, 0, pc);
 
         int groupsX = (width + 15) / 16;
         int groupsY = (height + 15) / 16;
@@ -1993,6 +2194,14 @@ public final class ValkyrieRenderer {
                     vkDestroySemaphore(device, transferCompleteSemaphores[i], null);
                     transferCompleteSemaphores[i] = VK_NULL_HANDLE;
                 }
+                if (cullCompleteSemaphores[i] != VK_NULL_HANDLE) {
+                    vkDestroySemaphore(device, cullCompleteSemaphores[i], null);
+                    cullCompleteSemaphores[i] = VK_NULL_HANDLE;
+                }
+                if (gbufferDoneSemaphores[i] != VK_NULL_HANDLE) {
+                    vkDestroySemaphore(device, gbufferDoneSemaphores[i], null);
+                    gbufferDoneSemaphores[i] = VK_NULL_HANDLE;
+                }
                 if (commandBuffers[i] != null) {
                     vkContext.freeCommandBuffer(commandBuffers[i]);
                     commandBuffers[i] = null;
@@ -2005,8 +2214,21 @@ public final class ValkyrieRenderer {
                     vkContext.freeTransferCommandBuffer(transferCommandBuffers[i]);
                     transferCommandBuffers[i] = null;
                 }
+                if (cullComputeCommandBuffers[i] != null) {
+                    vkContext.freeComputeCommandBuffer(cullComputeCommandBuffers[i]);
+                    cullComputeCommandBuffers[i] = null;
+                }
+                if (hizComputeCommandBuffers[i] != null) {
+                    vkContext.freeComputeCommandBuffer(hizComputeCommandBuffers[i]);
+                    hizComputeCommandBuffers[i] = null;
+                }
                 fenceWaited[i] = false;
             }
+            if (hizReadySemaphore != VK_NULL_HANDLE) {
+                vkDestroySemaphore(device, hizReadySemaphore, null);
+                hizReadySemaphore = VK_NULL_HANDLE;
+            }
+            hizSemaphorePending = false;
             for (int w = 0; w < RECORD_WORKER_COUNT; w++) {
                 for (int i = 0; i < FRAMES_IN_FLIGHT; i++) {
                     if (workerCommandPools[w][i] != VK_NULL_HANDLE) {

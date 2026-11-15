@@ -92,7 +92,7 @@ public final class ShaderDescriptorBindings {
     public static final int LOC_FRONT_COLOR = 0;
     public static final int LOC_TEXCOORD_BASE = 1; // occupies locations 1..4 (vec4[4])
     public static final int LOC_SPRITE_META = 5;   // flat uvec4(spriteId, quadW, quadH, active)
-    public static final int LOC_USER_VARYING_BASE = 8;
+    public static final int LOC_USER_VARYING_BASE = 6;
 
     private ShaderDescriptorBindings() {
     }

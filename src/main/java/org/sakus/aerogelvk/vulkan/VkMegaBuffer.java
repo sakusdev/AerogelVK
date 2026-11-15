@@ -85,7 +85,7 @@ public class VkMegaBuffer implements AutoCloseable {
     private int activeWriteSlot = 0;
 
     // Free-list vertex sub-allocator
-    private final int totalVertexCapacity;
+    private int totalVertexCapacity;
     private final List<FreeBlock> freeBlocks = new ArrayList<>();
 
     // Section slot tracking
@@ -172,16 +172,20 @@ public class VkMegaBuffer implements AutoCloseable {
             return;
         }
 
-        LOGGER.info("[Valkyrie] Initializing VkMegaBuffer (MegaVertexBuffer: {} MB, MaxChunks: {})...",
-                DEFAULT_VERTEX_BUFFER_BYTES / (1024 * 1024), MAX_CHUNKS);
-
         VkContext ctx = VkContext.getInstance();
+        long maxRange = ctx.getMaxStorageBufferRange();
+        long vertexBufferBytes = (maxRange > 0 ? Math.min(DEFAULT_VERTEX_BUFFER_BYTES, maxRange) : DEFAULT_VERTEX_BUFFER_BYTES) & ~7L;
+        this.totalVertexCapacity = (int) (vertexBufferBytes / 8L);
+
+        LOGGER.info("[Valkyrie] Initializing VkMegaBuffer (MegaVertexBuffer: {} MB, MaxChunks: {})...",
+                vertexBufferBytes / (1024 * 1024), MAX_CHUNKS);
+
         long vma = ctx.getVmaAllocator();
 
         // 1. Mega Vertex Buffer (Device Local)
         megaVertexBuffer = createVmaBuffer(
                 vma,
-                DEFAULT_VERTEX_BUFFER_BYTES,
+                vertexBufferBytes,
                 VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                 Vma.VMA_MEMORY_USAGE_GPU_ONLY,
                 0

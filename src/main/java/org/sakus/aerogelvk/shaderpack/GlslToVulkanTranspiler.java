@@ -381,17 +381,21 @@ public final class GlslToVulkanTranspiler {
         promoteCustomUniformsOverDerived(vertParsed, effectiveCustomUniforms);
         promoteCustomUniformsOverDerived(fragParsed, effectiveCustomUniforms);
 
-        Map<String, Integer> varyingLocations = assignVaryingLocations(vertParsed.varyings, fragParsed.varyings);
+        Set<String> fragUsedIds = collectUsedIdentifiers(fragParsed.bodyTokens);
+        int texCoordSlots = detectTexCoordSlots(vertParsed.bodyTokens, fragParsed.bodyTokens);
+        int userVaryingBase = ShaderDescriptorBindings.LOC_TEXCOORD_BASE + texCoordSlots + 1;
+        Map<String, Integer> varyingLocations = assignVaryingLocations(
+                vertParsed.varyings, fragParsed.varyings, fragUsedIds, userVaryingBase);
 
         List<VarDecl> missingVertOutputs = new ArrayList<>();
         for (VarDecl fragVar : fragParsed.varyings.values()) {
-            if (!vertParsed.varyings.containsKey(fragVar.name)) {
+            if (!vertParsed.varyings.containsKey(fragVar.name) && varyingLocations.containsKey(fragVar.name)) {
                 missingVertOutputs.add(fragVar);
             }
         }
 
-        String vertOut = emitShader(vertParsed, true, kind, effectiveDb, varyingLocations, missingVertOutputs, effectiveCustomUniforms);
-        String fragOut = emitShader(fragParsed, false, kind, effectiveDb, varyingLocations, Collections.emptyList(), effectiveCustomUniforms);
+        String vertOut = emitShader(vertParsed, true, kind, effectiveDb, varyingLocations, missingVertOutputs, effectiveCustomUniforms, texCoordSlots);
+        String fragOut = emitShader(fragParsed, false, kind, effectiveDb, varyingLocations, Collections.emptyList(), effectiveCustomUniforms, texCoordSlots);
         int attachmentCount = computeAttachmentCount(fragParsed, effectiveDb);
         return new TranspiledProgram(vertOut, fragOut, attachmentCount);
     }
@@ -949,23 +953,78 @@ public final class GlslToVulkanTranspiler {
         return null;
     }
 
+    private static Set<String> collectUsedIdentifiers(List<Token> tokens) {
+        Set<String> ids = new HashSet<>();
+        for (Token t : tokens) {
+            if (t.kind == TokenKind.WORD) {
+                ids.add(t.text);
+            }
+        }
+        return ids;
+    }
+
+    private static int detectTexCoordSlots(List<Token> vertTokens, List<Token> fragTokens) {
+        return Math.max(detectTexCoordSlotsSingle(vertTokens), detectTexCoordSlotsSingle(fragTokens));
+    }
+
+    private static int detectTexCoordSlotsSingle(List<Token> tokens) {
+        if (tokens == null) {
+            return 2;
+        }
+        for (int i = 0; i < tokens.size(); i++) {
+            Token t = tokens.get(i);
+            if (t.kind == TokenKind.WORD && ("gl_TexCoord".equals(t.text) || "vk_TexCoord".equals(t.text))) {
+                if (i + 3 < tokens.size()
+                        && tokens.get(i + 1).kind == TokenKind.PUNCT && "[".equals(tokens.get(i + 1).text)
+                        && tokens.get(i + 2).kind == TokenKind.NUMBER
+                        && tokens.get(i + 3).kind == TokenKind.PUNCT && "]".equals(tokens.get(i + 3).text)) {
+                    try {
+                        int idx = Integer.parseInt(tokens.get(i + 2).text);
+                        if (idx >= 2) {
+                            return 4;
+                        }
+                    } catch (NumberFormatException ignored) {
+                        return 4;
+                    }
+                } else {
+                    return 4;
+                }
+            }
+        }
+        return 2;
+    }
+
     private static Map<String, Integer> assignVaryingLocations(
             Map<String, VarDecl> primary,
             Map<String, VarDecl> secondary
     ) {
-        Map<String, Integer> locations = new LinkedHashMap<>();
-        int nextLoc = ShaderDescriptorBindings.LOC_USER_VARYING_BASE;
+        return assignVaryingLocations(primary, secondary, null, ShaderDescriptorBindings.LOC_USER_VARYING_BASE);
+    }
 
-        if (primary != null) {
-            for (VarDecl d : primary.values()) {
+    private static Map<String, Integer> assignVaryingLocations(
+            Map<String, VarDecl> primary,
+            Map<String, VarDecl> secondary,
+            Set<String> usedInSecondary,
+            int userVaryingBase
+    ) {
+        Map<String, Integer> locations = new LinkedHashMap<>();
+        int nextLoc = userVaryingBase;
+
+        // Assign locations to fragment-consumed varyings first so unused vertex-only
+        // outputs never push fragment input locations past maxFragmentInputComponents.
+        if (secondary != null) {
+            for (VarDecl d : secondary.values()) {
+                if (usedInSecondary != null && !usedInSecondary.contains(d.name)) {
+                    continue;
+                }
                 if (!locations.containsKey(d.name)) {
                     locations.put(d.name, nextLoc);
                     nextLoc += locationSlotCount(d.type, d.arraySuffix);
                 }
             }
         }
-        if (secondary != null) {
-            for (VarDecl d : secondary.values()) {
+        if (primary != null && usedInSecondary == null) {
+            for (VarDecl d : primary.values()) {
                 if (!locations.containsKey(d.name)) {
                     locations.put(d.name, nextLoc);
                     nextLoc += locationSlotCount(d.type, d.arraySuffix);
@@ -1015,6 +1074,19 @@ public final class GlslToVulkanTranspiler {
             List<VarDecl> extraVertStubs,
             Map<String, ShaderPackProperties.CustomUniform> customUniforms
     ) {
+        return emitShader(parsed, isVertex, passKind, drawbuffers, varyingLocations, extraVertStubs, customUniforms, 4);
+    }
+
+    private static String emitShader(
+            ParsedShader parsed,
+            boolean isVertex,
+            PassKind passKind,
+            int[] drawbuffers,
+            Map<String, Integer> varyingLocations,
+            List<VarDecl> extraVertStubs,
+            Map<String, ShaderPackProperties.CustomUniform> customUniforms,
+            int texCoordSlots
+    ) {
         List<ResolvedCustomUniform> resolvedCustoms = resolveCustomUniforms(parsed, customUniforms, passKind);
         Set<String> resolvedCustomNames = new HashSet<>();
         for (ResolvedCustomUniform rc : resolvedCustoms) {
@@ -1037,7 +1109,7 @@ public final class GlslToVulkanTranspiler {
         emitSet1Samplers(out);
 
         // 3. Built-in legacy synthetic inputs/outputs (must precede helpers referencing vk_SpriteMeta)
-        emitLegacyBuiltins(out, isVertex);
+        emitLegacyBuiltins(out, isVertex, texCoordSlots);
 
         // 4. Fog struct & compatibility texture helpers
         emitCompatibilityHelpers(out, isVertex, passKind);
@@ -1070,10 +1142,16 @@ public final class GlslToVulkanTranspiler {
             out.append('\n');
         }
 
-        // 7. Varyings -> layout(location = ...) out / in
+        // 7. Varyings -> layout(location = ...) out / in (unconsumed varyings stay local globals in vertex)
         String ioKeyword = isVertex ? "out" : "in";
         for (VarDecl v : parsed.varyings.values()) {
-            int loc = varyingLocations.getOrDefault(v.name, ShaderDescriptorBindings.LOC_USER_VARYING_BASE);
+            Integer loc = varyingLocations.get(v.name);
+            if (loc == null) {
+                if (isVertex) {
+                    out.append(v.type).append(' ').append(v.name).append(v.arraySuffix).append(";\n");
+                }
+                continue;
+            }
             out.append("layout(location = ").append(loc).append(") ");
             if (v.interpQualifier != null) {
                 out.append(v.interpQualifier).append(' ');
@@ -1124,7 +1202,7 @@ public final class GlslToVulkanTranspiler {
 
         // 10. Wrapper void main()
         if (isVertex) {
-            emitVertexMainWrapper(out, passKind, parsed.attributes, extraVertStubs);
+            emitVertexMainWrapper(out, passKind, parsed.attributes, extraVertStubs, texCoordSlots);
         } else {
             emitFragmentMainWrapper(out, useFragDataWrapper, attachmentCount);
         }
@@ -1373,7 +1451,8 @@ public final class GlslToVulkanTranspiler {
         }
     }
 
-    private static void emitLegacyBuiltins(StringBuilder out, boolean isVertex) {
+    private static void emitLegacyBuiltins(StringBuilder out, boolean isVertex, int texCoordSlots) {
+        int spriteMetaLoc = ShaderDescriptorBindings.LOC_TEXCOORD_BASE + texCoordSlots;
         if (isVertex) {
             out.append("vec4 vk_Vertex;\n")
                     .append("vec3 vk_Normal;\n")
@@ -1387,15 +1466,15 @@ public final class GlslToVulkanTranspiler {
             out.append("layout(location = ").append(ShaderDescriptorBindings.LOC_FRONT_COLOR)
                     .append(") out vec4 vk_FrontColor;\n");
             out.append("layout(location = ").append(ShaderDescriptorBindings.LOC_TEXCOORD_BASE)
-                    .append(") out vec4 vk_TexCoord[4];\n");
-            out.append("layout(location = ").append(ShaderDescriptorBindings.LOC_SPRITE_META)
+                    .append(") out vec4 vk_TexCoord[").append(texCoordSlots).append("];\n");
+            out.append("layout(location = ").append(spriteMetaLoc)
                     .append(") flat out uvec4 vk_SpriteMeta;\n\n");
         } else {
             out.append("layout(location = ").append(ShaderDescriptorBindings.LOC_FRONT_COLOR)
                     .append(") in vec4 vk_FrontColor;\n");
             out.append("layout(location = ").append(ShaderDescriptorBindings.LOC_TEXCOORD_BASE)
-                    .append(") in vec4 vk_TexCoord[4];\n");
-            out.append("layout(location = ").append(ShaderDescriptorBindings.LOC_SPRITE_META)
+                    .append(") in vec4 vk_TexCoord[").append(texCoordSlots).append("];\n");
+            out.append("layout(location = ").append(spriteMetaLoc)
                     .append(") flat in uvec4 vk_SpriteMeta;\n\n");
         }
     }
@@ -1856,12 +1935,13 @@ public final class GlslToVulkanTranspiler {
             StringBuilder out,
             PassKind passKind,
             Map<String, VarDecl> attributes,
-            List<VarDecl> extraVertStubs
+            List<VarDecl> extraVertStubs,
+            int texCoordSlots
     ) {
         out.append("void main() {\n");
         emitFogAndNormalInit(out, passKind);
 
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < texCoordSlots; i++) {
             out.append("    vk_TexCoord[").append(i).append("] = vec4(0.0);\n");
         }
 

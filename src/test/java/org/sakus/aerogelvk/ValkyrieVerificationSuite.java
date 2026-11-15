@@ -363,7 +363,7 @@ public class ValkyrieVerificationSuite {
             vkCmdBindDescriptorSets(gradCmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.getPipelineLayout(), 0, pSets, null);
             ByteBuffer pc = stack.malloc(4);
             pc.putFloat(0, 1.0f);
-            vkCmdPushConstants(gradCmd, pipe.getPipelineLayout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, pc);
+            vkCmdPushConstants(gradCmd, pipe.getPipelineLayout(), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_COMPUTE_BIT, 0, pc);
             vkCmdDispatch(gradCmd, 4, 4, 1);
             ctx.endSingleTimeCommands(gradCmd);
 
@@ -514,9 +514,13 @@ public class ValkyrieVerificationSuite {
         String wayland = System.getenv("WAYLAND_DISPLAY");
         if ((display == null || display.isBlank()) && (wayland == null || wayland.isBlank())) {
             System.out.println("  -> [SKIP-NO-DISPLAY] No X11/Wayland display available; skipping live GLFW+OpenGL interop check.");
+            VkContext ctx = VkContext.getInstance();
+            if (ctx.isValidationEnabled() && ctx.getValidationErrorCount() > 0) {
+                throw new AssertionError("Vulkan Validation Layer reported " + ctx.getValidationErrorCount() + " error(s) during headless verification!");
+            }
             VkPipelineManager.getInstance().close();
             VkMegaBuffer.getInstance().close();
-            VkContext.getInstance().close();
+            ctx.close();
             return;
         }
 
@@ -673,8 +677,11 @@ public class ValkyrieVerificationSuite {
                 throw new AssertionError("GL target FBO center depth out of range: " + glDepth + ", mode=" + interop.getInteropMode());
             }
 
-            System.out.printf("  -> Live OpenGL+Vulkan Interop verified (mode=%s, glRGBA=(%d,%d,%d,%d), glDepth=%.4f).%n",
-                    interop.getInteropMode(), r, g, b, a, glDepth);
+            System.out.printf("  -> Live OpenGL+Vulkan Interop verified (mode=%s, glRGBA=(%d,%d,%d,%d), glDepth=%.4f, validationErrors=%d).%n",
+                    interop.getInteropMode(), r, g, b, a, glDepth, ctx.getValidationErrorCount());
+            if (ctx.isValidationEnabled() && ctx.getValidationErrorCount() > 0) {
+                throw new AssertionError("Vulkan Validation Layer reported " + ctx.getValidationErrorCount() + " error(s) during ValkyrieVerificationSuite!");
+            }
         } finally {
             pipe.close();
             interop.close();

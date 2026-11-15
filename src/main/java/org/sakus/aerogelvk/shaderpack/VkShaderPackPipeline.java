@@ -1525,7 +1525,7 @@ public class VkShaderPackPipeline implements AutoCloseable {
 
             VkPipelineRasterizationStateCreateInfo rasterizer = VkPipelineRasterizationStateCreateInfo.calloc(stack)
                     .sType(VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO)
-                    .depthClampEnable(isShadowPass)
+                    .depthClampEnable(isShadowPass && VkContext.getInstance().isDepthClampSupported())
                     .rasterizerDiscardEnable(false)
                     .polygonMode(VK_POLYGON_MODE_FILL)
                     .lineWidth(1.0f)
@@ -1550,12 +1550,25 @@ public class VkShaderPackPipeline implements AutoCloseable {
 
             VkPipelineColorBlendAttachmentState.Buffer blendAttachments =
                     colorFormats.length > 0 ? VkPipelineColorBlendAttachmentState.calloc(colorFormats.length, stack) : null;
+            boolean indBlend = VkContext.getInstance().isIndependentBlendSupported();
+            boolean allBlendable = true;
+            if (alphaBlend && !indBlend) {
+                for (int fmt : colorFormats) {
+                    if (!VkContext.getInstance().supportsColorAttachmentBlend(fmt)) {
+                        allBlendable = false;
+                        break;
+                    }
+                }
+            }
             for (int i = 0; i < colorFormats.length; i++) {
+                boolean attBlend = alphaBlend && (indBlend
+                        ? VkContext.getInstance().supportsColorAttachmentBlend(colorFormats[i])
+                        : allBlendable);
                 VkPipelineColorBlendAttachmentState att = blendAttachments.get(i)
                         .colorWriteMask(VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
                                 | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT)
-                        .blendEnable(alphaBlend);
-                if (alphaBlend) {
+                        .blendEnable(attBlend);
+                if (attBlend) {
                     att.srcColorBlendFactor(VK_BLEND_FACTOR_SRC_ALPHA)
                             .dstColorBlendFactor(VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA)
                             .colorBlendOp(VK_BLEND_OP_ADD)

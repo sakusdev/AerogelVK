@@ -54,6 +54,10 @@ public class VkContext implements AutoCloseable {
     private byte[] deviceUuid;
     private boolean externalMemorySupported = false;
     private boolean externalSemaphoreSupported = false;
+    private boolean depthClampSupported = false;
+    private boolean independentBlendSupported = false;
+    private boolean maintenance4Supported = false;
+    private long maxStorageBufferRange = 128L * 1024 * 1024;
     private boolean validationEnabled = false;
     private long debugMessenger = VK10.VK_NULL_HANDLE;
     private VkDebugUtilsMessengerCallbackEXT debugCallback;
@@ -289,6 +293,7 @@ public class VkContext implements AutoCloseable {
                     .pNext(idProps.address());
             VK11.vkGetPhysicalDeviceProperties2(this.physicalDevice, props2);
             this.deviceName = props2.properties().deviceNameString();
+            this.maxStorageBufferRange = Integer.toUnsignedLong(props2.properties().limits().maxStorageBufferRange());
             byte[] uuid = new byte[VK10.VK_UUID_SIZE];
             idProps.deviceUUID().get(uuid);
             this.deviceUuid = uuid;
@@ -474,9 +479,17 @@ public class VkContext implements AutoCloseable {
             }
             ppExtensions.flip();
 
-            // Query supported core features so we only enable optional features (like shaderInt64) if present
-            VkPhysicalDeviceFeatures supportedCore = VkPhysicalDeviceFeatures.calloc(stack);
-            VK10.vkGetPhysicalDeviceFeatures(physicalDevice, supportedCore);
+            // Query supported core and Vulkan 1.3 features so optional features are only enabled if supported
+            VkPhysicalDeviceVulkan13Features supportedVk13 = VkPhysicalDeviceVulkan13Features.calloc(stack)
+                    .sType(VK13.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES);
+            VkPhysicalDeviceFeatures2 supportedFeatures2 = VkPhysicalDeviceFeatures2.calloc(stack)
+                    .sType(VK11.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)
+                    .pNext(supportedVk13.address());
+            VK11.vkGetPhysicalDeviceFeatures2(physicalDevice, supportedFeatures2);
+            VkPhysicalDeviceFeatures supportedCore = supportedFeatures2.features();
+            this.depthClampSupported = supportedCore.depthClamp();
+            this.independentBlendSupported = supportedCore.independentBlend();
+            this.maintenance4Supported = supportedVk13.maintenance4();
 
             // Queue setup (unique families with required queue counts)
             Map<Integer, Integer> familyQueueCounts = new LinkedHashMap<>();
@@ -502,7 +515,8 @@ public class VkContext implements AutoCloseable {
             VkPhysicalDeviceVulkan13Features vk13Features = VkPhysicalDeviceVulkan13Features.calloc(stack)
                     .sType(VK13.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES)
                     .dynamicRendering(true)
-                    .synchronization2(true);
+                    .synchronization2(true)
+                    .maintenance4(maintenance4Supported);
 
             VkPhysicalDeviceVulkan12Features vk12Features = VkPhysicalDeviceVulkan12Features.calloc(stack)
                     .sType(VK12.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES)
@@ -515,6 +529,8 @@ public class VkContext implements AutoCloseable {
                     .sType(VK11.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)
                     .pNext(vk12Features.address());
             features2.features().multiDrawIndirect(true);
+            features2.features().depthClamp(depthClampSupported);
+            features2.features().independentBlend(independentBlendSupported);
             features2.features().shaderInt64(supportedCore.shaderInt64());
             features2.features().shaderStorageImageArrayDynamicIndexing(supportedCore.shaderStorageImageArrayDynamicIndexing());
 
@@ -787,6 +803,29 @@ public class VkContext implements AutoCloseable {
 
     public boolean isExternalSemaphoreSupported() {
         return externalSemaphoreSupported;
+    }
+
+    public boolean isDepthClampSupported() {
+        return depthClampSupported;
+    }
+
+    public boolean isIndependentBlendSupported() {
+        return independentBlendSupported;
+    }
+
+    public long getMaxStorageBufferRange() {
+        return maxStorageBufferRange;
+    }
+
+    public boolean supportsColorAttachmentBlend(int vkFormat) {
+        if (physicalDevice == null) {
+            return true;
+        }
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkFormatProperties props = VkFormatProperties.calloc(stack);
+            VK10.vkGetPhysicalDeviceFormatProperties(physicalDevice, vkFormat, props);
+            return (props.optimalTilingFeatures() & VK10.VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT) != 0;
+        }
     }
 
     public boolean isValidationEnabled() {
