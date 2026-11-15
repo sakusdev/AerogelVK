@@ -406,6 +406,17 @@ public final class GreedyMesher {
                 && b.maxX >= 0.99 && b.maxY >= 0.99 && b.maxZ >= 0.99;
     }
 
+    private static boolean usesShapeOrModelPass(BlockState state, VoxelShape shape) {
+        if (!state.getFluidState().isEmpty()) {
+            return false;
+        }
+        if (state.getBlock() instanceof net.minecraft.world.level.block.BushBlock
+                || state.getBlock() instanceof net.minecraft.world.level.block.WebBlock) {
+            return true;
+        }
+        return !shape.isEmpty() && !isFullBoxShape(shape);
+    }
+
     public static MeshedSectionResult mesh(SectionSnapshot snapshot) {
         List<Long> vertices = new ArrayList<>();
         List<Long> translucentVertices = new ArrayList<>();
@@ -449,7 +460,7 @@ public final class GreedyMesher {
                     if (isOpaqueFullCube(state)) continue;
 
                     VoxelShape shape = state.getShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
-                    if (shape.isEmpty() || isFullBoxShape(shape)) continue;
+                    if (!usesShapeOrModelPass(state, shape)) continue;
 
                     boolean translucent = isTranslucentState(state);
                     if (translucent) hasTranslucent = true;
@@ -525,8 +536,8 @@ public final class GreedyMesher {
                         }
                         if (!isOpaqueFullCube(state)) {
                             VoxelShape shape = state.getShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
-                            if (!shape.isEmpty() && !isFullBoxShape(shape)) {
-                                continue; // Already emitted by non-full VoxelShape pass
+                            if (usesShapeOrModelPass(state, shape)) {
+                                continue; // Already emitted by non-full VoxelShape/model pass
                             }
                         }
                         boolean translucent = isTranslucentState(state);

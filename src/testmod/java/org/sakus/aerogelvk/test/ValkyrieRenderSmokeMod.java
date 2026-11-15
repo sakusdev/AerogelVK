@@ -149,7 +149,8 @@ public final class ValkyrieRenderSmokeMod implements ClientModInitializer {
                     sweepMode = Files.exists(Path.of("shaderpacks/.smoke_sweep"));
                     mc.options.onboardAccessibility = false;
                     mc.options.pauseOnLostFocus = false;
-                    int defaultRd = Boolean.getBoolean("aerogelvk.smoke.shapeShowcase") ? 2 : 4;
+                    String repro = System.getProperty("aerogelvk.smoke.repro", "");
+                    int defaultRd = (Boolean.getBoolean("aerogelvk.smoke.shapeShowcase") || (!repro.isEmpty() && !"end".equals(repro))) ? 2 : 4;
                     int rd = Integer.getInteger("aerogelvk.smoke.renderDistance", defaultRd);
                     mc.options.renderDistance().set(rd);
                     mc.options.getSoundSourceOptionInstance(SoundSource.MASTER).set(0.0);
@@ -180,37 +181,67 @@ public final class ValkyrieRenderSmokeMod implements ClientModInitializer {
                 // Tilt camera slightly downward so both terrain and sky occupy the viewport
                 mc.player.setXRot(22.0f);
 
-                if (Boolean.getBoolean("aerogelvk.smoke.shapeShowcase")) {
+                String reproMode = System.getProperty("aerogelvk.smoke.repro", "");
+                if (Boolean.getBoolean("aerogelvk.smoke.shapeShowcase") || !reproMode.isEmpty()) {
                     VkMegaBuffer mega = VkMegaBuffer.getInstance();
                     int activeSections = mega.isInitialized() ? mega.getActiveSectionCount() : 0;
                     if (!shapeShowcaseBuilt && mc.getSingleplayerServer() != null) {
                         shapeShowcaseBuilt = true;
                         mc.getSingleplayerServer().execute(() -> {
-                            ServerLevel overworld = mc.getSingleplayerServer().overworld();
-                            buildShapeShowcase(overworld);
+                            ServerLevel targetLevel = mc.getSingleplayerServer().overworld();
+                            if ("end".equals(reproMode)) {
+                                ServerLevel endLevel = mc.getSingleplayerServer().getLevel(net.minecraft.world.level.Level.END);
+                                if (endLevel != null) {
+                                    targetLevel = endLevel;
+                                }
+                            } else if (!reproMode.isEmpty()) {
+                                buildReproScene(targetLevel, reproMode);
+                            } else {
+                                buildShapeShowcase(targetLevel);
+                            }
+                            if ("night".equals(reproMode)) {
+                                targetLevel.setDayTime(18000L);
+                            } else {
+                                targetLevel.setDayTime(6000L);
+                            }
+                            final ServerLevel finalLevel = targetLevel;
                             for (var sp : mc.getSingleplayerServer().getPlayerList().getPlayers()) {
                                 sp.getAbilities().flying = true;
                                 sp.onUpdateAbilities();
-                                sp.teleportTo(overworld, 8.0, 162.0, -1.5, 0.0f, 28.0f);
+                                if ("end".equals(reproMode)) {
+                                    sp.teleportTo(finalLevel, 0.0, 72.0, -35.0, java.util.Set.of(), 0.0f, 15.0f);
+                                } else if ("redstone".equals(reproMode)) {
+                                    sp.teleportTo(finalLevel, 7.5, 162.5, 1.5, java.util.Set.of(), 0.0f, 38.0f);
+                                } else {
+                                    sp.teleportTo(finalLevel, 8.0, 162.0, -1.5, java.util.Set.of(), 0.0f, 24.0f);
+                                }
                             }
+                            shapeShowcaseServerDone = true;
                         });
                     } else if (shapeShowcaseBuilt && shapeShowcaseServerDone) {
                         mc.player.getAbilities().flying = true;
-                        mc.player.setYRot(0.0f);
-                        mc.player.setXRot(28.0f);
-                        mc.player.yRotO = 0.0f;
-                        mc.player.xRotO = 28.0f;
+                        if ("night".equals(reproMode)) {
+                            mc.level.setDayTime(18000L);
+                        }
+                        if (!"end".equals(reproMode)) {
+                            mc.player.setYRot(0.0f);
+                            mc.player.setXRot("redstone".equals(reproMode) ? 38.0f : 24.0f);
+                            mc.player.yRotO = 0.0f;
+                            mc.player.xRotO = mc.player.getXRot();
+                        }
                         if (activeSections > 0
                                 && renderedFramesInWorld >= 4
-                                && GreedyMesher.SectionSnapshot.capture(mc.level, 0, 10, 0) != null) {
+                                && ("end".equals(reproMode) || GreedyMesher.SectionSnapshot.capture(mc.level, 0, 10, 0) != null)) {
                             shapeShowcaseSettleTicks++;
                         }
                         if (shapeShowcaseSettleTicks % 5 == 0 && shapeShowcaseSettleTicks > 0) {
-                            LOGGER.info("[ValkyrieSmoke] shapeShowcase settle={}/15 activeSections={}",
-                                    shapeShowcaseSettleTicks, activeSections);
+                            LOGGER.info("[ValkyrieSmoke] repro={} settle={}/15 activeSections={}",
+                                    reproMode, shapeShowcaseSettleTicks, activeSections);
                         }
                         if (shapeShowcaseSettleTicks >= 15) {
-                            logShapeShowcaseSectionMetrics(mc);
+                            if (reproMode.isEmpty()) {
+                                logShapeShowcaseSectionMetrics(mc);
+                            }
                             finished = true;
                             captureAndValidate(mc, activeSections);
                             return;
@@ -630,6 +661,87 @@ public final class ValkyrieRenderSmokeMod implements ClientModInitializer {
             return;
         }
         mc.stop();
+    }
+
+    private void buildReproScene(ServerLevel level, String mode) {
+        for (int x = 1; x <= 14; x++) {
+            for (int z = 1; z <= 14; z++) {
+                level.setBlock(new BlockPos(x, 159, z),
+                        ("plants".equals(mode) ? Blocks.GRASS_BLOCK : Blocks.STONE).defaultBlockState(),
+                        Block.UPDATE_ALL);
+                for (int y = 160; y <= 165; y++) {
+                    level.setBlock(new BlockPos(x, y, z), Blocks.AIR.defaultBlockState(), Block.UPDATE_ALL);
+                }
+            }
+        }
+        switch (mode) {
+            case "plants" -> {
+                // 1-block controls on the left
+                level.setBlock(new BlockPos(2, 160, 5), Blocks.SHORT_GRASS.defaultBlockState(), Block.UPDATE_ALL);
+                level.setBlock(new BlockPos(4, 160, 5), Blocks.POPPY.defaultBlockState(), Block.UPDATE_ALL);
+                // 2-block tall plants
+                Block[] tall = { Blocks.TALL_GRASS, Blocks.ROSE_BUSH, Blocks.LILAC, Blocks.SUNFLOWER, Blocks.LARGE_FERN };
+                for (int i = 0; i < tall.length; i++) {
+                    int x = 6 + i * 2;
+                    level.setBlock(new BlockPos(x, 160, 5),
+                            tall[i].defaultBlockState().setValue(net.minecraft.world.level.block.DoublePlantBlock.HALF, DoubleBlockHalf.LOWER),
+                            Block.UPDATE_ALL);
+                    level.setBlock(new BlockPos(x, 161, 5),
+                            tall[i].defaultBlockState().setValue(net.minecraft.world.level.block.DoublePlantBlock.HALF, DoubleBlockHalf.UPPER),
+                            Block.UPDATE_ALL);
+                }
+            }
+            case "fluids" -> {
+                // Stone rim & staircase for flowing water + lava pool
+                for (int x = 2; x <= 13; x++) {
+                    level.setBlock(new BlockPos(x, 160, 3), Blocks.STONE.defaultBlockState(), Block.UPDATE_ALL);
+                    level.setBlock(new BlockPos(x, 160, 10), Blocks.STONE.defaultBlockState(), Block.UPDATE_ALL);
+                }
+                for (int z = 3; z <= 10; z++) {
+                    level.setBlock(new BlockPos(2, 160, z), Blocks.STONE.defaultBlockState(), Block.UPDATE_ALL);
+                    level.setBlock(new BlockPos(9, 160, z), Blocks.STONE.defaultBlockState(), Block.UPDATE_ALL);
+                    level.setBlock(new BlockPos(13, 160, z), Blocks.STONE.defaultBlockState(), Block.UPDATE_ALL);
+                }
+                // Water source at (3, 160, 5..8) flowing east -> steps down
+                for (int z = 5; z <= 8; z++) {
+                    level.setBlock(new BlockPos(3, 160, z), Blocks.WATER.defaultBlockState(), Block.UPDATE_ALL);
+                    for (int lvl = 1; lvl <= 5; lvl++) {
+                        level.setBlock(new BlockPos(3 + lvl, 160, z),
+                                Blocks.WATER.defaultBlockState().setValue(net.minecraft.world.level.block.LiquidBlock.LEVEL, lvl),
+                                Block.UPDATE_ALL);
+                    }
+                }
+                // Lava pool on the right (x=10..12, z=4..9)
+                for (int x = 10; x <= 12; x++) {
+                    for (int z = 4; z <= 9; z++) {
+                        level.setBlock(new BlockPos(x, 160, z), Blocks.LAVA.defaultBlockState(), Block.UPDATE_ALL);
+                    }
+                }
+            }
+            case "redstone" -> {
+                // Straight line, cross, corner, and step-up redstone wire
+                for (int x = 3; x <= 11; x++) {
+                    level.setBlock(new BlockPos(x, 160, 6), Blocks.REDSTONE_WIRE.defaultBlockState(), Block.UPDATE_ALL);
+                }
+                for (int z = 4; z <= 8; z++) {
+                    level.setBlock(new BlockPos(7, 160, z), Blocks.REDSTONE_WIRE.defaultBlockState(), Block.UPDATE_ALL);
+                }
+                // Step-up block at x=11..12
+                level.setBlock(new BlockPos(12, 160, 6), Blocks.STONE.defaultBlockState(), Block.UPDATE_ALL);
+                level.setBlock(new BlockPos(12, 161, 6), Blocks.REDSTONE_WIRE.defaultBlockState(), Block.UPDATE_ALL);
+                level.setBlock(new BlockPos(13, 160, 6), Blocks.REDSTONE_BLOCK.defaultBlockState(), Block.UPDATE_ALL);
+            }
+            case "day", "night" -> {
+                // Simple terrain + pillar + torch for day/night comparison
+                for (int y = 160; y <= 162; y++) {
+                    level.setBlock(new BlockPos(8, y, 6), Blocks.OAK_LOG.defaultBlockState(), Block.UPDATE_ALL);
+                }
+                level.setBlock(new BlockPos(7, 160, 6), Blocks.TORCH.defaultBlockState(), Block.UPDATE_ALL);
+            }
+            default -> {
+            }
+        }
+        LOGGER.info("[ValkyrieSmoke] Built repro scene '{}' in section (0, 10, 0)", mode);
     }
 
     private void buildShapeShowcase(ServerLevel level) {
