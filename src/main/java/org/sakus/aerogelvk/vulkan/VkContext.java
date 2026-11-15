@@ -82,14 +82,19 @@ public class VkContext implements AutoCloseable {
         }
 
         LOGGER.info("[Valkyrie] Initializing Vulkan 1.3 Context...");
-        createInstance();
-        pickPhysicalDevice();
-        createLogicalDevice();
-        createCommandPool();
-        initVmaAllocator();
+        try {
+            createInstance();
+            pickPhysicalDevice();
+            createLogicalDevice();
+            createCommandPool();
+            initVmaAllocator();
 
-        initialized = true;
-        LOGGER.info("[Valkyrie] Vulkan 1.3 Context successfully initialized.");
+            initialized = true;
+            LOGGER.info("[Valkyrie] Vulkan 1.3 Context successfully initialized.");
+        } catch (Throwable t) {
+            closePartialResources();
+            throw t;
+        }
     }
 
     private void createInstance() {
@@ -846,13 +851,21 @@ public class VkContext implements AutoCloseable {
 
     @Override
     public synchronized void close() {
-        if (!initialized) {
+        if (!initialized && vkInstance == null && vkDevice == null && vmaAllocator == 0) {
             return;
         }
 
         LOGGER.info("[Valkyrie] Cleaning up Vulkan 1.3 Context...");
+        closePartialResources();
+        LOGGER.info("[Valkyrie] Vulkan 1.3 Context destroyed cleanly.");
+    }
+
+    private void closePartialResources() {
         if (vkDevice != null) {
-            VK10.vkDeviceWaitIdle(vkDevice);
+            try {
+                VK10.vkDeviceWaitIdle(vkDevice);
+            } catch (Throwable ignored) {
+            }
         }
 
         if (vmaAllocator != 0) {
@@ -860,17 +873,17 @@ public class VkContext implements AutoCloseable {
             vmaAllocator = 0;
         }
 
-        if (computeCommandPool != 0) {
+        if (computeCommandPool != 0 && vkDevice != null) {
             VK10.vkDestroyCommandPool(vkDevice, computeCommandPool, null);
             computeCommandPool = 0;
         }
 
-        if (transferCommandPool != 0) {
+        if (transferCommandPool != 0 && vkDevice != null) {
             VK10.vkDestroyCommandPool(vkDevice, transferCommandPool, null);
             transferCommandPool = 0;
         }
 
-        if (commandPool != 0) {
+        if (commandPool != 0 && vkDevice != null) {
             VK10.vkDestroyCommandPool(vkDevice, commandPool, null);
             commandPool = 0;
         }
@@ -899,7 +912,7 @@ public class VkContext implements AutoCloseable {
             memoryProperties = null;
         }
 
+        physicalDevice = null;
         initialized = false;
-        LOGGER.info("[Valkyrie] Vulkan 1.3 Context destroyed cleanly.");
     }
 }

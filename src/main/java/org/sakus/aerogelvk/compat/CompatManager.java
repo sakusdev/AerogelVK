@@ -145,7 +145,8 @@ public final class CompatManager {
     public static boolean isSodiumTerrainBypassed() {
         return sodiumLoaded
                 && ValkyrieConfig.get().isSodiumCompatEnabled()
-                && !shouldYieldToExternalShaderPipeline();
+                && !shouldYieldToExternalShaderPipeline()
+                && !org.sakus.aerogelvk.ValkyrieRenderer.getInstance().isUnavailable();
     }
 
     public static boolean consumeDhFrameTextures(int[] outColorAndDepthTexIds) {

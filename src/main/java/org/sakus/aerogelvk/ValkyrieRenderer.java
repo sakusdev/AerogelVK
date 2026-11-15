@@ -116,6 +116,8 @@ public final class ValkyrieRenderer {
     private boolean dirtyShadow = true;
     private boolean hasPreviousFrameHiZ = false;
     private boolean initialized = false;
+    private volatile boolean unavailable = false;
+    private String unavailableReason = null;
 
     private final Matrix4f prevViewProj = new Matrix4f();
     private final Matrix4f[] csmMatrices = new Matrix4f[VkPipelineManager.CSM_CASCADE_COUNT];
@@ -132,6 +134,9 @@ public final class ValkyrieRenderer {
     }
 
     public synchronized void ensureInitialized(int width, int height) {
+        if (unavailable) {
+            return;
+        }
         if (width <= 0) width = 1280;
         if (height <= 0) height = 720;
 
@@ -147,147 +152,168 @@ public final class ValkyrieRenderer {
         this.currentWidth = width;
         this.currentHeight = height;
 
-        // 1. Vulkan 1.3 Context
-        this.vkContext = VkContext.getInstance();
-        if (!vkContext.isInitialized()) {
-            vkContext.init();
-        }
-
-        // 2. Zero-Copy OpenGL Interop Manager
-        this.vkInteropManager = VkInteropManager.getInstance();
-        vkInteropManager.recreate(width, height);
-
-        // 3. GPU Mega-Buffer
-        this.vkMegaBuffer = VkMegaBuffer.getInstance();
-        if (!vkMegaBuffer.isInitialized()) {
-            vkMegaBuffer.init();
-        }
-
-        // 4. Block Atlas UV Table
-        this.atlasUVTable = AtlasUVTable.getInstance();
-        atlasUVTable.rebuildFromBlockAtlas();
-
-        // 5. Greedy Mesher Worker Pool
-        this.greedyMesher = GreedyMesher.getInstance();
-
-        // 6. Pipeline Manager
-        this.vkPipelineManager = VkPipelineManager.getInstance();
-        if (!vkPipelineManager.isInitialized()) {
-            vkPipelineManager.init(
-                    width,
-                    height,
-                    vkInteropManager.getSharedColorImageView(),
-                    vkInteropManager.getSharedDepthImageView()
-            );
-        }
-
-        // 7. Upload initial Atlas UV table & Block Atlas texture, then update Descriptor Set 0
-        syncAtlasResources();
-        updateDescriptorSet0Buffers();
-
-        // 7b. Native Vulkan Shaderpack Pipeline (active only when ValkyrieConfig enables a pack or loadShaderPack() was called)
-        if (this.vkShaderPackPipeline == null) {
-            this.vkShaderPackPipeline = new VkShaderPackPipeline(vkContext, vkMegaBuffer);
-        }
-        if (!this.vkShaderPackPipeline.isInitialized()) {
-            this.vkShaderPackPipeline.init(width, height, VK_FORMAT_R8G8B8A8_UNORM);
-        }
-        syncShaderPackAtlas();
-        if (!explicitPackLoaded && (CompatManager.isNativeShaderPackAllowed() || pendingShaderPackReload)) {
-            pendingShaderPackReload = false;
-            reloadShaderPackLocked();
-        }
-
-        // 8. Allocate Double-Buffered Command Buffers, Transfer Semaphores & Frame Synchronization Fences
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkFenceCreateInfo fenceInfo = VkFenceCreateInfo.calloc(stack)
-                    .sType(VK_STRUCTURE_TYPE_FENCE_CREATE_INFO)
-                    .flags(VK_FENCE_CREATE_SIGNALED_BIT);
-            VkSemaphoreCreateInfo semInfo = VkSemaphoreCreateInfo.calloc(stack)
-                    .sType(VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO);
-
-            LongBuffer pFence = stack.mallocLong(1);
-            LongBuffer pSem = stack.mallocLong(1);
-            for (int i = 0; i < FRAMES_IN_FLIGHT; i++) {
-                this.commandBuffers[i] = vkContext.allocateCommandBuffer();
-                this.postCommandBuffers[i] = vkContext.allocateCommandBuffer();
-                this.transferCommandBuffers[i] = vkContext.allocateTransferCommandBuffer();
-                this.cullComputeCommandBuffers[i] = vkContext.allocateComputeCommandBuffer();
-                this.hizComputeCommandBuffers[i] = vkContext.allocateComputeCommandBuffer();
-
-                int semRes = vkCreateSemaphore(vkContext.getVkDevice(), semInfo, null, pSem);
-                if (semRes != VK_SUCCESS) {
-                    throw new RuntimeException("Failed to create transfer semaphore[" + i + "]: " + semRes);
-                }
-                this.transferCompleteSemaphores[i] = pSem.get(0);
-
-                semRes = vkCreateSemaphore(vkContext.getVkDevice(), semInfo, null, pSem);
-                if (semRes != VK_SUCCESS) {
-                    throw new RuntimeException("Failed to create cull semaphore[" + i + "]: " + semRes);
-                }
-                this.cullCompleteSemaphores[i] = pSem.get(0);
-
-                semRes = vkCreateSemaphore(vkContext.getVkDevice(), semInfo, null, pSem);
-                if (semRes != VK_SUCCESS) {
-                    throw new RuntimeException("Failed to create gbuffer-done semaphore[" + i + "]: " + semRes);
-                }
-                this.gbufferDoneSemaphores[i] = pSem.get(0);
-
-                int res = vkCreateFence(vkContext.getVkDevice(), fenceInfo, null, pFence);
-                if (res != VK_SUCCESS) {
-                    throw new RuntimeException("Failed to create frame fence[" + i + "]: " + res);
-                }
-                this.frameFences[i] = pFence.get(0);
-                this.fenceWaited[i] = true;
+        try {
+            // 1. Vulkan 1.3 Context
+            this.vkContext = VkContext.getInstance();
+            if (!vkContext.isInitialized()) {
+                vkContext.init();
             }
-            int hizSemRes = vkCreateSemaphore(vkContext.getVkDevice(), semInfo, null, pSem);
-            if (hizSemRes != VK_SUCCESS) {
-                throw new RuntimeException("Failed to create Hi-Z semaphore: " + hizSemRes);
-            }
-            this.hizReadySemaphore = pSem.get(0);
-            this.hizSemaphorePending = false;
 
-            // Stage B: Per-worker, per-slot VkCommandPools & pre-allocated primary command buffers
-            VkCommandPoolCreateInfo workerPoolInfo = VkCommandPoolCreateInfo.calloc(stack)
-                    .sType(VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO)
-                    .flags(VK_COMMAND_POOL_CREATE_TRANSIENT_BIT)
-                    .queueFamilyIndex(vkContext.getQueueFamilyIndex());
-            LongBuffer pPool = stack.mallocLong(1);
-            PointerBuffer pWorkerCmds = stack.mallocPointer(MAX_PARALLEL_CMDS_PER_WORKER);
-            for (int w = 0; w < RECORD_WORKER_COUNT; w++) {
+            // 2. Zero-Copy OpenGL Interop Manager
+            this.vkInteropManager = VkInteropManager.getInstance();
+            vkInteropManager.recreate(width, height);
+
+            // 3. GPU Mega-Buffer
+            this.vkMegaBuffer = VkMegaBuffer.getInstance();
+            if (!vkMegaBuffer.isInitialized()) {
+                vkMegaBuffer.init();
+            }
+
+            // 4. Block Atlas UV Table
+            this.atlasUVTable = AtlasUVTable.getInstance();
+            atlasUVTable.rebuildFromBlockAtlas();
+
+            // 5. Greedy Mesher Worker Pool
+            this.greedyMesher = GreedyMesher.getInstance();
+
+            // 6. Pipeline Manager
+            this.vkPipelineManager = VkPipelineManager.getInstance();
+            if (!vkPipelineManager.isInitialized()) {
+                vkPipelineManager.init(
+                        width,
+                        height,
+                        vkInteropManager.getSharedColorImageView(),
+                        vkInteropManager.getSharedDepthImageView()
+                );
+            }
+
+            // 7. Upload initial Atlas UV table & Block Atlas texture, then update Descriptor Set 0
+            syncAtlasResources();
+            updateDescriptorSet0Buffers();
+
+            // 7b. Native Vulkan Shaderpack Pipeline (active only when ValkyrieConfig enables a pack or loadShaderPack() was called)
+            if (this.vkShaderPackPipeline == null) {
+                this.vkShaderPackPipeline = new VkShaderPackPipeline(vkContext, vkMegaBuffer);
+            }
+            if (!this.vkShaderPackPipeline.isInitialized()) {
+                this.vkShaderPackPipeline.init(width, height, VK_FORMAT_R8G8B8A8_UNORM);
+            }
+            syncShaderPackAtlas();
+            if (!explicitPackLoaded && (CompatManager.isNativeShaderPackAllowed() || pendingShaderPackReload)) {
+                pendingShaderPackReload = false;
+                reloadShaderPackLocked();
+            }
+
+            // 8. Allocate Double-Buffered Command Buffers, Transfer Semaphores & Frame Synchronization Fences
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                VkFenceCreateInfo fenceInfo = VkFenceCreateInfo.calloc(stack)
+                        .sType(VK_STRUCTURE_TYPE_FENCE_CREATE_INFO)
+                        .flags(VK_FENCE_CREATE_SIGNALED_BIT);
+                VkSemaphoreCreateInfo semInfo = VkSemaphoreCreateInfo.calloc(stack)
+                        .sType(VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO);
+
+                LongBuffer pFence = stack.mallocLong(1);
+                LongBuffer pSem = stack.mallocLong(1);
                 for (int i = 0; i < FRAMES_IN_FLIGHT; i++) {
-                    int poolRes = vkCreateCommandPool(vkContext.getVkDevice(), workerPoolInfo, null, pPool);
-                    if (poolRes != VK_SUCCESS) {
-                        throw new RuntimeException("Failed to create worker command pool[" + w + "][" + i + "]: " + poolRes);
-                    }
-                    long pool = pPool.get(0);
-                    workerCommandPools[w][i] = pool;
+                    this.commandBuffers[i] = vkContext.allocateCommandBuffer();
+                    this.postCommandBuffers[i] = vkContext.allocateCommandBuffer();
+                    this.transferCommandBuffers[i] = vkContext.allocateTransferCommandBuffer();
+                    this.cullComputeCommandBuffers[i] = vkContext.allocateComputeCommandBuffer();
+                    this.hizComputeCommandBuffers[i] = vkContext.allocateComputeCommandBuffer();
 
-                    VkCommandBufferAllocateInfo allocInfo = VkCommandBufferAllocateInfo.calloc(stack)
-                            .sType(VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO)
-                            .commandPool(pool)
-                            .level(VK_COMMAND_BUFFER_LEVEL_PRIMARY)
-                            .commandBufferCount(MAX_PARALLEL_CMDS_PER_WORKER);
-                    int allocRes = vkAllocateCommandBuffers(vkContext.getVkDevice(), allocInfo, pWorkerCmds);
-                    if (allocRes != VK_SUCCESS) {
-                        throw new RuntimeException("Failed to allocate worker command buffers[" + w + "][" + i + "]: " + allocRes);
+                    int semRes = vkCreateSemaphore(vkContext.getVkDevice(), semInfo, null, pSem);
+                    if (semRes != VK_SUCCESS) {
+                        throw new RuntimeException("Failed to create transfer semaphore[" + i + "]: " + semRes);
                     }
-                    for (int k = 0; k < MAX_PARALLEL_CMDS_PER_WORKER; k++) {
-                        workerCommandBuffers[w][i][k] = new VkCommandBuffer(pWorkerCmds.get(k), vkContext.getVkDevice());
+                    this.transferCompleteSemaphores[i] = pSem.get(0);
+
+                    semRes = vkCreateSemaphore(vkContext.getVkDevice(), semInfo, null, pSem);
+                    if (semRes != VK_SUCCESS) {
+                        throw new RuntimeException("Failed to create cull semaphore[" + i + "]: " + semRes);
+                    }
+                    this.cullCompleteSemaphores[i] = pSem.get(0);
+
+                    semRes = vkCreateSemaphore(vkContext.getVkDevice(), semInfo, null, pSem);
+                    if (semRes != VK_SUCCESS) {
+                        throw new RuntimeException("Failed to create gbuffer-done semaphore[" + i + "]: " + semRes);
+                    }
+                    this.gbufferDoneSemaphores[i] = pSem.get(0);
+
+                    int res = vkCreateFence(vkContext.getVkDevice(), fenceInfo, null, pFence);
+                    if (res != VK_SUCCESS) {
+                        throw new RuntimeException("Failed to create frame fence[" + i + "]: " + res);
+                    }
+                    this.frameFences[i] = pFence.get(0);
+                    this.fenceWaited[i] = true;
+                }
+                int hizSemRes = vkCreateSemaphore(vkContext.getVkDevice(), semInfo, null, pSem);
+                if (hizSemRes != VK_SUCCESS) {
+                    throw new RuntimeException("Failed to create Hi-Z semaphore: " + hizSemRes);
+                }
+                this.hizReadySemaphore = pSem.get(0);
+                this.hizSemaphorePending = false;
+
+                // Stage B: Per-worker, per-slot VkCommandPools & pre-allocated primary command buffers
+                VkCommandPoolCreateInfo workerPoolInfo = VkCommandPoolCreateInfo.calloc(stack)
+                        .sType(VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO)
+                        .flags(VK_COMMAND_POOL_CREATE_TRANSIENT_BIT)
+                        .queueFamilyIndex(vkContext.getQueueFamilyIndex());
+                LongBuffer pPool = stack.mallocLong(1);
+                PointerBuffer pWorkerCmds = stack.mallocPointer(MAX_PARALLEL_CMDS_PER_WORKER);
+                for (int w = 0; w < RECORD_WORKER_COUNT; w++) {
+                    for (int i = 0; i < FRAMES_IN_FLIGHT; i++) {
+                        int poolRes = vkCreateCommandPool(vkContext.getVkDevice(), workerPoolInfo, null, pPool);
+                        if (poolRes != VK_SUCCESS) {
+                            throw new RuntimeException("Failed to create worker command pool[" + w + "][" + i + "]: " + poolRes);
+                        }
+                        long pool = pPool.get(0);
+                        workerCommandPools[w][i] = pool;
+
+                        VkCommandBufferAllocateInfo allocInfo = VkCommandBufferAllocateInfo.calloc(stack)
+                                .sType(VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO)
+                                .commandPool(pool)
+                                .level(VK_COMMAND_BUFFER_LEVEL_PRIMARY)
+                                .commandBufferCount(MAX_PARALLEL_CMDS_PER_WORKER);
+                        int allocRes = vkAllocateCommandBuffers(vkContext.getVkDevice(), allocInfo, pWorkerCmds);
+                        if (allocRes != VK_SUCCESS) {
+                            throw new RuntimeException("Failed to allocate worker command buffers[" + w + "][" + i + "]: " + allocRes);
+                        }
+                        for (int k = 0; k < MAX_PARALLEL_CMDS_PER_WORKER; k++) {
+                            workerCommandBuffers[w][i][k] = new VkCommandBuffer(pWorkerCmds.get(k), vkContext.getVkDevice());
+                        }
                     }
                 }
+                if (RECORD_WORKER_COUNT > 1 && (this.recordExecutor == null || this.recordExecutor.isShutdown())) {
+                    this.recordExecutor = Executors.newFixedThreadPool(RECORD_WORKER_COUNT, r -> {
+                        Thread t = new Thread(r, "valkyrie-cmd-recorder");
+                        t.setDaemon(true);
+                        return t;
+                    });
+                }
             }
-            if (RECORD_WORKER_COUNT > 1 && (this.recordExecutor == null || this.recordExecutor.isShutdown())) {
-                this.recordExecutor = Executors.newFixedThreadPool(RECORD_WORKER_COUNT, r -> {
-                    Thread t = new Thread(r, "valkyrie-cmd-recorder");
-                    t.setDaemon(true);
-                    return t;
-                });
-            }
-        }
 
-        this.initialized = true;
-        LOGGER.info("[Valkyrie] ValkyrieRenderer successfully initialized.");
+            this.initialized = true;
+            LOGGER.info("[Valkyrie] ValkyrieRenderer successfully initialized.");
+        } catch (Throwable t) {
+            markUnavailableLocked(t);
+        }
+    }
+
+    private void markUnavailableLocked(Throwable t) {
+        if (!this.unavailable) {
+            this.unavailable = true;
+            this.unavailableReason = (t.getMessage() != null && !t.getMessage().isBlank())
+                    ? t.getMessage()
+                    : t.getClass().getSimpleName();
+            LOGGER.warn("[Valkyrie] Vulkan initialization failed ({}); falling back to Vanilla/Sodium OpenGL rendering for this session.",
+                    this.unavailableReason, t);
+        }
+        this.initialized = false;
+        try {
+            destroyResourcesLocked();
+        } catch (Throwable cleanupErr) {
+            LOGGER.debug("[Valkyrie] Secondary error while cleaning up partial Vulkan resources.", cleanupErr);
+        }
     }
 
     private void syncAtlasResources() {
@@ -348,11 +374,17 @@ public final class ValkyrieRenderer {
      * Primary rendering hook called from MixinLevelRenderer.
      */
     public void renderWorld(Camera camera, Matrix4f frustumMatrix, Matrix4f projectionMatrix, DeltaTracker deltaTracker) {
+        if (unavailable) {
+            return;
+        }
         RenderTarget mainTarget = Minecraft.getInstance().getMainRenderTarget();
         int width = (mainTarget != null && mainTarget.width > 0) ? mainTarget.width : currentWidth;
         int height = (mainTarget != null && mainTarget.height > 0) ? mainTarget.height : currentHeight;
 
         ensureInitialized(width, height);
+        if (!initialized || unavailable) {
+            return;
+        }
 
         if (pendingShaderPackReload) {
             synchronized (this) {
@@ -1712,6 +1744,9 @@ public final class ValkyrieRenderer {
      * Composites the rendered Vulkan frame buffer into Minecraft's main OpenGL RenderTarget.
      */
     public void compositeToOpenGL(RenderTarget mainTarget) {
+        if (unavailable || !initialized) {
+            return;
+        }
         if (vkInteropManager != null) {
             if (!vkInteropManager.usesExternalSemaphores()
                     && vkContext != null && vkContext.isInitialized()) {
@@ -1726,7 +1761,11 @@ public final class ValkyrieRenderer {
     }
 
     public boolean isInitialized() {
-        return initialized;
+        return initialized && !unavailable;
+    }
+
+    public boolean isUnavailable() {
+        return unavailable;
     }
 
     public boolean isShaderPackActive() {
@@ -1753,6 +1792,9 @@ public final class ValkyrieRenderer {
      * If the renderer is not yet initialized, queues the reload for initialization.
      */
     public synchronized boolean reloadShaderPack() {
+        if (unavailable) {
+            return false;
+        }
         explicitPackLoaded = false;
         if (!initialized && (vkContext == null || !vkContext.isInitialized())) {
             pendingShaderPackReload = true;
@@ -1766,6 +1808,9 @@ public final class ValkyrieRenderer {
      * Hot-reloads the configured shaderpack from an explicit game directory (useful for headless tests).
      */
     public synchronized boolean reloadShaderPack(Path gameDir) {
+        if (unavailable) {
+            return false;
+        }
         explicitPackLoaded = false;
         ValkyrieConfig config = ValkyrieConfig.get();
         if (!CompatManager.isNativeShaderPackAllowed()) {
@@ -1804,7 +1849,15 @@ public final class ValkyrieRenderer {
      * {@code config/valkyrie.properties} has {@code shaderPack=off}.
      */
     public synchronized boolean loadShaderPack(Path packPath) {
-        ensureShaderPackPipelineInitialized();
+        if (unavailable) {
+            return false;
+        }
+        try {
+            ensureShaderPackPipelineInitialized();
+        } catch (Throwable t) {
+            markUnavailableLocked(t);
+            return false;
+        }
         if (vkShaderPackPipeline == null || packPath == null) {
             explicitPackLoaded = false;
             return false;
@@ -2139,7 +2192,7 @@ public final class ValkyrieRenderer {
      * Queues a chunk section rebuild (deduplicated; snapshots are captured per frame to prevent light-update bursts).
      */
     public void scheduleSectionRebuild(int sectionX, int sectionY, int sectionZ) {
-        if (Minecraft.getInstance().level == null || greedyMesher == null) {
+        if (unavailable || Minecraft.getInstance().level == null || greedyMesher == null) {
             return;
         }
         dirtySections.add(SectionPos.asLong(sectionX, sectionY, sectionZ));
@@ -2152,7 +2205,7 @@ public final class ValkyrieRenderer {
         for (int sectionY = minSection; sectionY < maxSection; sectionY++) {
             dirtySections.remove(SectionPos.asLong(chunkX, sectionY, chunkZ));
         }
-        if (vkMegaBuffer == null || !vkMegaBuffer.isInitialized()) {
+        if (unavailable || vkMegaBuffer == null || !vkMegaBuffer.isInitialized()) {
             return;
         }
         for (int sectionY = minSection; sectionY < maxSection; sectionY++) {
@@ -2162,6 +2215,10 @@ public final class ValkyrieRenderer {
     }
 
     public synchronized void onWorldReload() {
+        if (unavailable || !initialized) {
+            dirtySections.clear();
+            return;
+        }
         LOGGER.info("[Valkyrie] World reload event triggered.");
         dirtySections.clear();
         java.util.Arrays.fill(csmCascadeInitialized, false);
@@ -2186,6 +2243,9 @@ public final class ValkyrieRenderer {
     }
 
     public synchronized void onResize(int width, int height) {
+        if (unavailable || !initialized) {
+            return;
+        }
         width = Math.max(1, width);
         height = Math.max(1, height);
 
@@ -2221,10 +2281,17 @@ public final class ValkyrieRenderer {
     }
 
     public synchronized void shutdown() {
-        if (!initialized) return;
+        if (!initialized && vkContext == null && vkInteropManager == null && vkMegaBuffer == null
+                && vkPipelineManager == null && vkShaderPackPipeline == null) {
+            return;
+        }
 
         LOGGER.info("[Valkyrie] Shutting down ValkyrieRenderer...");
+        destroyResourcesLocked();
+        LOGGER.info("[Valkyrie] ValkyrieRenderer shut down cleanly.");
+    }
 
+    private void destroyResourcesLocked() {
         if (vkContext != null && vkContext.isInitialized()) {
             VkDevice device = vkContext.getVkDevice();
             vkDeviceWaitIdle(device);
@@ -2309,21 +2376,24 @@ public final class ValkyrieRenderer {
 
         if (vkPipelineManager != null) {
             vkPipelineManager.close();
+            vkPipelineManager = null;
         }
 
         if (vkMegaBuffer != null) {
             vkMegaBuffer.close();
+            vkMegaBuffer = null;
         }
 
         if (vkInteropManager != null) {
             vkInteropManager.close();
+            vkInteropManager = null;
         }
 
         if (vkContext != null) {
             vkContext.close();
+            vkContext = null;
         }
 
         initialized = false;
-        LOGGER.info("[Valkyrie] ValkyrieRenderer shut down cleanly.");
     }
 }
