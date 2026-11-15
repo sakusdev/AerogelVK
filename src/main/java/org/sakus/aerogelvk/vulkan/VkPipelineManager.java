@@ -278,9 +278,11 @@ public final class VkPipelineManager implements AutoCloseable {
         // Runtime lighting/culling flags & shadow range (560..575)
         ValkyrieConfig config = ValkyrieConfig.get();
         int renderFlags = 0;
-        if (config.isCsmEnabled()) renderFlags |= 1;
-        if (config.isFastShadowPcf()) renderFlags |= 2;
-        if (config.isSsrEnabled()) renderFlags |= 4;
+        boolean vanillaLighting = config.isVanillaLighting();
+        if (!vanillaLighting && config.isCsmEnabled()) renderFlags |= 1;
+        if (!vanillaLighting && config.isFastShadowPcf()) renderFlags |= 2;
+        if (!vanillaLighting && config.isSsrEnabled()) renderFlags |= 4;
+        if (vanillaLighting) renderFlags |= 8;
         frameUboHostBuffer.putInt(560, renderFlags);
         frameUboHostBuffer.putInt(564, config.getCsmCascades());
         frameUboHostBuffer.putFloat(568, config.getMaxShadowDistance());

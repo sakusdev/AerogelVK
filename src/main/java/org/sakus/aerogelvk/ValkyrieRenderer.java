@@ -1207,7 +1207,7 @@ public final class ValkyrieRenderer {
         // --------------------------------------------------------------------
         // Pass 2: Cascaded Shadow Map (CSM) Dynamic Rendering Pass
         // --------------------------------------------------------------------
-        if (config.isCsmEnabled() && csmCascades != null) {
+        if (config.isCsmEnabled() && !config.isVanillaLighting() && csmCascades != null) {
             for (int c : csmCascades) {
                 int qCsm = gpuProfiler.beginPass(cmd, frameSlot, "csm_c" + c);
                 renderCsmCascade(cmd, c, slotDispatchLimit, frameSlot, stack);
@@ -1804,7 +1804,7 @@ public final class ValkyrieRenderer {
      */
     private List<Integer> collectCsmCascadesToUpdate(boolean isBuiltinPipeline) {
         ValkyrieConfig config = ValkyrieConfig.get();
-        if (!isBuiltinPipeline || !config.isCsmEnabled()) {
+        if (!isBuiltinPipeline || !config.isCsmEnabled() || config.isVanillaLighting()) {
             java.util.Arrays.fill(csmCascadeInitialized, false);
             return List.of();
         }

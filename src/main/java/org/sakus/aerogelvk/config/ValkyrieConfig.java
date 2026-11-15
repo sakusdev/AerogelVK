@@ -39,6 +39,7 @@ public final class ValkyrieConfig {
     private int csmUpdateInterval = 6;
     private boolean fastShadowPcf = true;
     private boolean ssrEnabled = true;
+    private boolean vanillaLighting = false;
     private boolean fxaaEnabled = true;
     private boolean hiZOcclusionEnabled = true;
     private float exposure = 1.0f;
@@ -52,7 +53,7 @@ public final class ValkyrieConfig {
 
     private static final Set<String> KNOWN_KEYS = Set.of(
             "csmEnabled", "csmResolution", "csmCascades", "csmUpdateInterval",
-            "fastShadowPcf", "ssrEnabled", "fxaaEnabled", "hiZOcclusionEnabled",
+            "fastShadowPcf", "ssrEnabled", "vanillaLighting", "fxaaEnabled", "hiZOcclusionEnabled",
             "exposure", "sodiumCompatEnabled", "dhCompatEnabled", "irisCompatEnabled",
             "shaderPack", "shaderPackEnabled",
             "shaderPackRenderScale", "shaderPackShadowResolutionCap"
@@ -133,6 +134,7 @@ public final class ValkyrieConfig {
             props.setProperty("csmUpdateInterval", Integer.toString(csmUpdateInterval));
             props.setProperty("fastShadowPcf", Boolean.toString(fastShadowPcf));
             props.setProperty("ssrEnabled", Boolean.toString(ssrEnabled));
+            props.setProperty("vanillaLighting", Boolean.toString(vanillaLighting));
             props.setProperty("fxaaEnabled", Boolean.toString(fxaaEnabled));
             props.setProperty("hiZOcclusionEnabled", Boolean.toString(hiZOcclusionEnabled));
             props.setProperty("exposure", Float.toString(exposure));
@@ -165,6 +167,7 @@ public final class ValkyrieConfig {
         csmUpdateInterval = clampInt(parseInt(props.getProperty("csmUpdateInterval"), csmUpdateInterval), 1, 30);
         fastShadowPcf = parseBool(props.getProperty("fastShadowPcf"), fastShadowPcf);
         ssrEnabled = parseBool(props.getProperty("ssrEnabled"), ssrEnabled);
+        vanillaLighting = parseBool(props.getProperty("vanillaLighting"), vanillaLighting);
         fxaaEnabled = parseBool(props.getProperty("fxaaEnabled"), fxaaEnabled);
         hiZOcclusionEnabled = parseBool(props.getProperty("hiZOcclusionEnabled"), hiZOcclusionEnabled);
         exposure = Math.max(0.1f, Math.min(4.0f, parseFloat(props.getProperty("exposure"), exposure)));
@@ -312,6 +315,14 @@ public final class ValkyrieConfig {
 
     public boolean isSsrEnabled() {
         return ssrEnabled;
+    }
+
+    public boolean isVanillaLighting() {
+        return vanillaLighting;
+    }
+
+    public synchronized void setVanillaLighting(boolean vanillaLighting) {
+        this.vanillaLighting = vanillaLighting;
     }
 
     public boolean isFxaaEnabled() {

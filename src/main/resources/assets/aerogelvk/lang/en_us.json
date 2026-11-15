@@ -6,6 +6,8 @@
   "config.aerogelvk.category.compat": "Compatibility",
   "config.aerogelvk.option.hiZOcclusionEnabled": "Hi-Z Occlusion Culling",
   "config.aerogelvk.tooltip.hiZOcclusionEnabled": "Enables GPU Hi-Z depth pyramid occlusion culling (applied immediately).",
+  "config.aerogelvk.option.vanillaLighting": "Vanilla-Style Lighting (Lightweight)",
+  "config.aerogelvk.tooltip.vanillaLighting": "Replaces deferred PBR, CSM shadows, and SSR with simple Lambert + lightmap shading for low-end GPUs (applied immediately).",
   "config.aerogelvk.option.ssrEnabled": "Screen-Space Reflections (SSR)",
   "config.aerogelvk.tooltip.ssrEnabled": "Enables screen-space reflections in the built-in deferred PBR pipeline (applied immediately).",
   "config.aerogelvk.option.fxaaEnabled": "FXAA Anti-Aliasing",

@@ -49,6 +49,14 @@ public final class AerogelVkConfigScreen {
                 .build());
 
         rendering.addEntry(entryBuilder.startBooleanToggle(
+                        Component.translatable("config.aerogelvk.option.vanillaLighting"),
+                        config.isVanillaLighting())
+                .setDefaultValue(false)
+                .setTooltip(Component.translatable("config.aerogelvk.tooltip.vanillaLighting"))
+                .setSaveConsumer(config::setVanillaLighting)
+                .build());
+
+        rendering.addEntry(entryBuilder.startBooleanToggle(
                         Component.translatable("config.aerogelvk.option.ssrEnabled"),
                         config.isSsrEnabled())
                 .setDefaultValue(true)
