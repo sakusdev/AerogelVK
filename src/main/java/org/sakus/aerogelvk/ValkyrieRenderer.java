@@ -119,12 +119,15 @@ public final class ValkyrieRenderer {
 
     private final Matrix4f prevViewProj = new Matrix4f();
     private final Matrix4f[] csmMatrices = new Matrix4f[VkPipelineManager.CSM_CASCADE_COUNT];
+    private final Matrix4f[] renderedCsmMatrices = new Matrix4f[VkPipelineManager.CSM_CASCADE_COUNT];
+    private final boolean[] csmCascadeInitialized = new boolean[VkPipelineManager.CSM_CASCADE_COUNT];
 
     private ValkyrieRenderer() {
         this.atlasUVTable = AtlasUVTable.getInstance();
         this.greedyMesher = GreedyMesher.getInstance();
         for (int i = 0; i < csmMatrices.length; i++) {
             csmMatrices[i] = new Matrix4f();
+            renderedCsmMatrices[i] = new Matrix4f();
         }
     }
 
@@ -459,6 +462,12 @@ public final class ValkyrieRenderer {
             updateDescriptorSet0Buffers();
         }
 
+        // Determine CSM cascades to update this frame and keep renderedCsmMatrices locked to rendered depth
+        boolean useBuiltinCsm = !isShaderPackActive()
+                && vkMegaBuffer.getActiveSectionCount() > 0
+                && vkMegaBuffer.getSlotDispatchLimit() > 0;
+        List<Integer> csmCascadesToUpdate = collectCsmCascadesToUpdate(useBuiltinCsm);
+
         // Update Frame Uniform Buffer (UBO) for this frame slot
         vkPipelineManager.updateFrameUbo(
                 viewMatrix,
@@ -466,7 +475,7 @@ public final class ValkyrieRenderer {
                 viewProjMatrix,
                 invViewProjMatrix,
                 prevViewProj,
-                csmMatrices,
+                renderedCsmMatrices,
                 sunDir,
                 cameraPos,
                 width,
@@ -560,7 +569,7 @@ public final class ValkyrieRenderer {
         // 5c. Record Graphics Command Buffer(s) (Stage B: multi-threaded independent primary CBs for builtin PBR when >= 2 passes, else serial)
         boolean asyncHiZOnCompute = asyncComputeEnabled && config.isHiZOcclusionEnabled();
         List<VkCommandBuffer> submittedCmds = recordFrameCommands(
-                slot, width, height, shaderPackUniforms, asyncTransferSubmitted,
+                slot, width, height, shaderPackUniforms, csmCascadesToUpdate, asyncTransferSubmitted,
                 asyncComputeCullSubmitted, asyncHiZOnCompute);
 
         // B4: Track actual final Vulkan image layouts before GL waitSemaphoreEXT acquires them
@@ -673,6 +682,7 @@ public final class ValkyrieRenderer {
             int width,
             int height,
             ShaderUniformLayout.UniformData shaderPackUniforms,
+            List<Integer> csmCascades,
             boolean asyncTransferSubmitted,
             boolean asyncComputeCullSubmitted,
             boolean asyncHiZOnCompute
@@ -683,16 +693,6 @@ public final class ValkyrieRenderer {
 
         // Stage B: Parallelize independent CSM cascades + Opaque GBuffer into per-worker primary CBs
         if (activeSections > 0 && slotDispatchLimit > 0 && !useShaderPack && RECORD_WORKER_COUNT > 1 && recordExecutor != null) {
-            ValkyrieConfig config = ValkyrieConfig.get();
-            List<Integer> csmCascades = new ArrayList<>(VkPipelineManager.CSM_CASCADE_COUNT);
-            if (config.isCsmEnabled()) {
-                int activeCascades = Math.min(config.getCsmCascades(), VkPipelineManager.CSM_CASCADE_COUNT);
-                for (int c = 0; c < activeCascades; c++) {
-                    if (vkPipelineManager.shouldUpdateCascade(c, frameIndex, dirtyShadow)) {
-                        csmCascades.add(c);
-                    }
-                }
-            }
             // Only dispatch to worker threads when there are >= 2 independent passes
             int totalParallelPasses = csmCascades.size() + 1; // cascades + opaque GBuffer
             if (totalParallelPasses >= 2) {
@@ -704,7 +704,7 @@ public final class ValkyrieRenderer {
 
         // Serial fallback (shaderpack, phase2 fallback, or <2 independent passes)
         VkCommandBuffer commandBuffer = commandBuffers[frameSlot];
-        recordFrameCommandsSerial(commandBuffer, width, height, shaderPackUniforms, frameSlot, asyncTransferSubmitted);
+        recordFrameCommandsSerial(commandBuffer, width, height, shaderPackUniforms, csmCascades, frameSlot, asyncTransferSubmitted);
         return List.of(commandBuffer);
     }
 
@@ -828,6 +828,7 @@ public final class ValkyrieRenderer {
             int width,
             int height,
             ShaderUniformLayout.UniformData shaderPackUniforms,
+            List<Integer> csmCascades,
             int frameSlot,
             boolean asyncTransferSubmitted
     ) {
@@ -876,6 +877,7 @@ public final class ValkyrieRenderer {
                                 vkInteropManager.getSharedColorImage(),
                                 vkInteropManager.getSharedDepthImage(),
                                 vkInteropManager.getSharedDepthImageView(),
+                                csmCascades,
                                 frameSlot,
                                 stack
                         );
@@ -887,6 +889,7 @@ public final class ValkyrieRenderer {
                             vkInteropManager.getSharedColorImage(),
                             vkInteropManager.getSharedDepthImage(),
                             vkInteropManager.getSharedDepthImageView(),
+                            csmCascades,
                             frameSlot,
                             stack
                     );
@@ -977,9 +980,10 @@ public final class ValkyrieRenderer {
         }
 
         computeCsmMatrices(cameraPos, sunDir, viewMatrix);
+        List<Integer> csmCascadesToUpdate = collectCsmCascadesToUpdate(!isShaderPackActive());
         vkPipelineManager.updateFrameUbo(
                 viewMatrix, projMatrix, viewProjMatrix, invViewProjMatrix, prevViewProj,
-                csmMatrices, sunDir, cameraPos, width, height, frameIndex, (float) (frameIndex * 0.016666)
+                renderedCsmMatrices, sunDir, cameraPos, width, height, frameIndex, (float) (frameIndex * 0.016666)
         );
         prevViewProj.set(viewProjMatrix);
 
@@ -1024,14 +1028,16 @@ public final class ValkyrieRenderer {
                         logActivePipelineIfChanged("builtin-pbr");
                         recordGpuDrivenTerrainPasses(
                                 cmd, width, height, slotDispatchLimit,
-                                sharedColorImage, sharedDepthImage, sharedDepthImageView, 0, stack
+                                sharedColorImage, sharedDepthImage, sharedDepthImageView,
+                                csmCascadesToUpdate, 0, stack
                         );
                     }
                 } else {
                     logActivePipelineIfChanged("builtin-pbr");
                     recordGpuDrivenTerrainPasses(
                             cmd, width, height, slotDispatchLimit,
-                            sharedColorImage, sharedDepthImage, sharedDepthImageView, 0, stack
+                            sharedColorImage, sharedDepthImage, sharedDepthImageView,
+                            csmCascadesToUpdate, 0, stack
                     );
                 }
             }
@@ -1048,6 +1054,7 @@ public final class ValkyrieRenderer {
             long sharedColorImage,
             long sharedDepthImage,
             long sharedDepthImageView,
+            List<Integer> csmCascades,
             int frameSlot,
             MemoryStack stack
     ) {
@@ -1065,12 +1072,9 @@ public final class ValkyrieRenderer {
         // --------------------------------------------------------------------
         // Pass 2: Cascaded Shadow Map (CSM) Dynamic Rendering Pass
         // --------------------------------------------------------------------
-        if (config.isCsmEnabled()) {
-            int activeCascades = Math.min(config.getCsmCascades(), VkPipelineManager.CSM_CASCADE_COUNT);
-            for (int c = 0; c < activeCascades; c++) {
-                if (vkPipelineManager.shouldUpdateCascade(c, frameIndex, dirtyShadow)) {
-                    renderCsmCascade(cmd, c, slotDispatchLimit, frameSlot, stack);
-                }
+        if (config.isCsmEnabled() && csmCascades != null) {
+            for (int c : csmCascades) {
+                renderCsmCascade(cmd, c, slotDispatchLimit, frameSlot, stack);
             }
         }
 
@@ -1623,6 +1627,7 @@ public final class ValkyrieRenderer {
 
     private void computeCsmMatrices(Vector3f cameraPos, Vector3f sunDir, Matrix4f viewMatrix) {
         float[] splits = { 32.0f, 96.0f, 192.0f };
+        int csmRes = Math.max(1, vkPipelineManager != null ? vkPipelineManager.getCsmResolution() : 1024);
         boolean nearPole = Math.abs(sunDir.y) > 0.99f;
         float upX = 0f;
         float upY = nearPole ? 0f : 1f;
@@ -1635,9 +1640,35 @@ public final class ValkyrieRenderer {
                     cameraPos.x, cameraPos.y, cameraPos.z,
                     upX, upY, upZ
             );
+            // Snap light-space origin to shadow texel grid to prevent shadow edge shimmering
+            float texelWorldSize = (2.0f * dist) / (float) csmRes;
+            lightView.m30((float) Math.floor(lightView.m30() / texelWorldSize) * texelWorldSize);
+            lightView.m31((float) Math.floor(lightView.m31() / texelWorldSize) * texelWorldSize);
             Matrix4f lightProj = new Matrix4f().ortho(-dist, dist, -dist, dist, -dist * 2f, dist * 2f, true);
             csmMatrices[i].set(lightProj).mul(lightView);
         }
+    }
+
+    /**
+     * Collects the cascades to render this frame and synchronizes renderedCsmMatrices
+     * so deferred lighting never samples a stale cascade with a newer frame's matrix.
+     */
+    private List<Integer> collectCsmCascadesToUpdate(boolean isBuiltinPipeline) {
+        ValkyrieConfig config = ValkyrieConfig.get();
+        if (!isBuiltinPipeline || !config.isCsmEnabled()) {
+            java.util.Arrays.fill(csmCascadeInitialized, false);
+            return List.of();
+        }
+        int activeCascades = Math.min(config.getCsmCascades(), VkPipelineManager.CSM_CASCADE_COUNT);
+        List<Integer> cascades = new ArrayList<>(activeCascades);
+        for (int c = 0; c < activeCascades; c++) {
+            if (!csmCascadeInitialized[c] || vkPipelineManager.shouldUpdateCascade(c, frameIndex, dirtyShadow)) {
+                cascades.add(c);
+                renderedCsmMatrices[c].set(csmMatrices[c]);
+                csmCascadeInitialized[c] = true;
+            }
+        }
+        return cascades;
     }
 
     private void transitionImageLayout(
@@ -2133,6 +2164,8 @@ public final class ValkyrieRenderer {
     public synchronized void onWorldReload() {
         LOGGER.info("[Valkyrie] World reload event triggered.");
         dirtySections.clear();
+        java.util.Arrays.fill(csmCascadeInitialized, false);
+        dirtyShadow = true;
         if (vkContext != null && vkContext.isInitialized()) {
             vkDeviceWaitIdle(vkContext.getVkDevice());
         }

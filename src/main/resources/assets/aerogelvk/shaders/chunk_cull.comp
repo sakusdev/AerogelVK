@@ -128,7 +128,8 @@ void main() {
         if (c.y >  c.w) outside[3]++;
         if (c.z <  0.0) outside[4]++;
         if (c.z >  c.w) outside[5]++;
-        if (c.w <= 0.0 || c.z < 0.0) {
+        // Reversed-Z: far plane is z = 0 (c.z < 0), near plane is z = w (c.z > c.w)
+        if (c.w <= 0.0 || c.z > c.w) {
             intersectsNearPlane = true;
         }
     }
