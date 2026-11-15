@@ -753,6 +753,14 @@ public class VkMegaBuffer implements AutoCloseable {
         return sectionKeyToSlot.size();
     }
 
+    public synchronized int getDeferredUploadCount() {
+        return deferredUploads.size();
+    }
+
+    public synchronized long getStagingUsedBytes(int slot) {
+        return stagingHeads[Math.floorMod(slot, VkContext.FRAMES_IN_FLIGHT)];
+    }
+
     /**
      * Returns the upper bound (exclusive) of allocated ChunkDrawMeta slots to dispatch
      * in chunk_cull.comp, accounting for sparse freed slots.

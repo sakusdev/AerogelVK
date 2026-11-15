@@ -87,7 +87,25 @@ public final class ValkyrieRenderer {
     private float shaderPackFrameTimeCounter = 0.0f;
 
     private static final int FRAMES_IN_FLIGHT = 2;
-    private static final int MAX_SECTION_CAPTURES_PER_FRAME = 256;
+    private static final int MAX_SECTION_CAPTURES_PER_FRAME = 64;
+    private static final long MAX_DRAIN_NANOS_STORM = 12_000_000L; // 12 ms CPU budget during initial load storm
+    private static final long MAX_DRAIN_NANOS_STEADY = 4_000_000L; // 4 ms CPU budget in steady state
+    private static final int STORM_DIRTY_THRESHOLD = 500;
+    private static final int MAX_IN_FLIGHT_MESHES = 128;
+    private static final int MAX_SECTION_UPLOADS_PER_FRAME = 64;
+    private static final int DISTANCE_BUCKETS = 33;
+    private static final boolean CHUNK_PROFILE = Boolean.getBoolean("aerogelvk.chunkProfile");
+    private long chunkProfStartNs = 0L;
+    private long chunkProfLastLogNs = 0L;
+    private long chunkProfDrainNs = 0L;
+    private long chunkProfPollNs = 0L;
+    private long chunkProfFenceNs = 0L;
+    private long chunkProfUploadNs = 0L;
+    private long chunkProfUploadBytes = 0L;
+    private int chunkProfCaptured = 0;
+    private int chunkProfUploaded = 0;
+    private int chunkProfFrames = 0;
+    private boolean chunkProfSettled = false;
     private static final int RECORD_WORKER_COUNT = Math.max(1, Math.min(3,
             Runtime.getRuntime().availableProcessors() - Math.max(1, Runtime.getRuntime().availableProcessors() / 2)));
     private static final int MAX_PARALLEL_CMDS_PER_WORKER = 4;
@@ -398,18 +416,33 @@ public final class ValkyrieRenderer {
             }
         }
 
+        Vector3f cameraPos = new Vector3f(
+                (float) camera.getPosition().x,
+                (float) camera.getPosition().y,
+                (float) camera.getPosition().z
+        );
+
         // 1. Stage D: Overlap CPU-side frame preparation with previous in-flight GPU work
         // before waiting on the current frame slot's fence.
-        drainDirtySections(Minecraft.getInstance().level);
+        long cpT0 = CHUNK_PROFILE ? System.nanoTime() : 0L;
+        if (CHUNK_PROFILE && chunkProfStartNs == 0L && (!dirtySections.isEmpty() || vkMegaBuffer.getActiveSectionCount() > 0)) {
+            chunkProfStartNs = cpT0;
+            chunkProfLastLogNs = cpT0;
+        }
+        int capturedThisFrame = drainDirtySections(Minecraft.getInstance().level, cameraPos);
+        long cpT1 = CHUNK_PROFILE ? System.nanoTime() : 0L;
 
         List<GreedyMesher.MeshedSectionResult> completedMeshes = null;
         GreedyMesher.MeshedSectionResult polled;
-        while ((polled = greedyMesher.pollCompleted()) != null) {
+        int polledCount = 0;
+        while (polledCount < MAX_SECTION_UPLOADS_PER_FRAME && (polled = greedyMesher.pollCompleted()) != null) {
             if (completedMeshes == null) {
                 completedMeshes = new ArrayList<>();
             }
             completedMeshes.add(polled);
+            polledCount++;
         }
+        long cpT2 = CHUNK_PROFILE ? System.nanoTime() : 0L;
 
         // Compute Matrices and Sun Direction on CPU while GPU finishes the prior slot
         ClientLevel level = Minecraft.getInstance().level;
@@ -418,12 +451,6 @@ public final class ValkyrieRenderer {
 
         float sunAngle = (timeOfDay - 0.25f) * (float) (Math.PI * 2.0);
         Vector3f sunDir = new Vector3f((float) Math.cos(sunAngle), (float) Math.sin(sunAngle), 0.25f).normalize();
-
-        Vector3f cameraPos = new Vector3f(
-                (float) camera.getPosition().x,
-                (float) camera.getPosition().y,
-                (float) camera.getPosition().z
-        );
 
         // frustumMatrix from GameRenderer already holds camera rotation inverse (world -> view rotation)
         Matrix4f viewMatrix = new Matrix4f(frustumMatrix).translate(-cameraPos.x, -cameraPos.y, -cameraPos.z);
@@ -444,6 +471,7 @@ public final class ValkyrieRenderer {
         // 2. Wait on this frame slot's fence ONLY if compositeToOpenGL didn't already wait for it
         int slot = currentFrameSlot;
         VkDevice device = vkContext.getVkDevice();
+        long cpFenceT0 = CHUNK_PROFILE ? System.nanoTime() : 0L;
         if (!fenceWaited[slot]) {
             int waitRes = vkWaitForFences(device, frameFences[slot], true, 1_000_000_000L);
             if (waitRes != VK_SUCCESS) {
@@ -459,15 +487,18 @@ public final class ValkyrieRenderer {
                 fenceWaited[lastSubmittedSlot] = true;
             }
         }
+        long cpFenceT1 = CHUNK_PROFILE ? System.nanoTime() : 0L;
         vkResetFences(device, frameFences[slot]);
         for (int w = 0; w < RECORD_WORKER_COUNT; w++) {
             if (workerCommandPools[w][slot] != VK_NULL_HANDLE) {
                 vkResetCommandPool(device, workerCommandPools[w][slot], 0);
             }
         }
+        long cpUploadT0 = CHUNK_PROFILE ? System.nanoTime() : 0L;
         vkMegaBuffer.beginFrameSlot(slot, FRAMES_IN_FLIGHT);
 
         // 3. Stream polled meshing results into MegaBuffer (opaque, translucent, and half-scale VoxelShape sub-meshes)
+        int uploadedThisFrame = 0;
         if (completedMeshes != null) {
             for (GreedyMesher.MeshedSectionResult result : completedMeshes) {
                 int shadowFlag = result.flags() & 2;
@@ -488,6 +519,49 @@ public final class ValkyrieRenderer {
                         result.halfScaleTranslucentVertices(), result.halfScaleTranslucentQuadCount(), result.halfScaleTranslucentAabbPacked(), 5 | shadowFlag
                 );
                 dirtyShadow = true;
+                uploadedThisFrame++;
+            }
+        }
+        if (CHUNK_PROFILE && chunkProfStartNs != 0L) {
+            long cpNow = System.nanoTime();
+            chunkProfDrainNs += (cpT1 - cpT0);
+            chunkProfPollNs += (cpT2 - cpT1);
+            chunkProfFenceNs += (cpFenceT1 - cpFenceT0);
+            chunkProfUploadNs += (cpNow - cpUploadT0);
+            chunkProfUploadBytes += vkMegaBuffer.getStagingUsedBytes(slot);
+            chunkProfCaptured += capturedThisFrame;
+            chunkProfUploaded += uploadedThisFrame;
+            chunkProfFrames++;
+
+            int dirtyRem = dirtySections.size();
+            int inFlightRem = greedyMesher.getInFlightCount();
+            int compRem = greedyMesher.getCompletedCount();
+            int defRem = vkMegaBuffer.getDeferredUploadCount();
+            boolean queuesEmpty = (dirtyRem == 0 && inFlightRem == 0 && compRem == 0 && defRem == 0);
+            if (!chunkProfSettled && (cpNow - chunkProfLastLogNs >= 1_000_000_000L || (queuesEmpty && chunkProfCaptured > 0))) {
+                double elapsedMs = (cpNow - chunkProfStartNs) / 1_000_000.0;
+                double intervalSec = Math.max(0.001, (cpNow - chunkProfLastLogNs) / 1_000_000_000.0);
+                double fps = chunkProfFrames / intervalSec;
+                LOGGER.info("[ChunkProfile] t={}ms fps={} active={} dirty={} inFlight={} comp={} deferred={} | cap={} upl={} ({}MB) | drain={}ms poll={}ms fence={}ms upload={}ms",
+                        String.format("%.0f", elapsedMs),
+                        String.format("%.1f", fps),
+                        vkMegaBuffer.getActiveSectionCount(),
+                        dirtyRem, inFlightRem, compRem, defRem,
+                        chunkProfCaptured, chunkProfUploaded,
+                        String.format("%.1f", chunkProfUploadBytes / (1024.0 * 1024.0)),
+                        String.format("%.1f", chunkProfDrainNs / 1_000_000.0),
+                        String.format("%.1f", chunkProfPollNs / 1_000_000.0),
+                        String.format("%.1f", chunkProfFenceNs / 1_000_000.0),
+                        String.format("%.1f", chunkProfUploadNs / 1_000_000.0));
+                chunkProfLastLogNs = cpNow;
+                chunkProfFrames = 0;
+                chunkProfDrainNs = 0L;
+                chunkProfPollNs = 0L;
+                chunkProfFenceNs = 0L;
+                chunkProfUploadNs = 0L;
+                if (queuesEmpty && chunkProfCaptured > 100) {
+                    chunkProfSettled = true;
+                }
             }
         }
 
@@ -1811,6 +1885,16 @@ public final class ValkyrieRenderer {
         return unavailable;
     }
 
+    public boolean isChunkQueueIdle() {
+        if (!initialized || unavailable || greedyMesher == null || vkMegaBuffer == null) {
+            return true;
+        }
+        return dirtySections.isEmpty()
+                && greedyMesher.getInFlightCount() == 0
+                && greedyMesher.getCompletedCount() == 0
+                && vkMegaBuffer.getDeferredUploadCount() == 0;
+    }
+
     public boolean isShaderPackActive() {
         return vkShaderPackPipeline != null
                 && vkShaderPackPipeline.isInitialized()
@@ -2201,34 +2285,79 @@ public final class ValkyrieRenderer {
         return null;
     }
 
-    private void drainDirtySections(ClientLevel level) {
+    @SuppressWarnings("unchecked")
+    private final List<Long>[] dirtyDistanceBuckets = new List[DISTANCE_BUCKETS];
+
+    private int drainDirtySections(ClientLevel level, Vector3f cameraPos) {
         if (level == null || greedyMesher == null || dirtySections.isEmpty()) {
-            return;
+            return 0;
+        }
+        int inFlight = greedyMesher.getInFlightCount();
+        if (inFlight >= MAX_IN_FLIGHT_MESHES) {
+            return 0;
         }
         if (atlasUVTable != null && atlasUVTable.getSpriteCount() <= 1) {
             atlasUVTable.rebuildFromBlockAtlas();
         }
-        int dispatched = 0;
-        Iterator<Long> it = dirtySections.iterator();
-        while (it.hasNext() && dispatched < MAX_SECTION_CAPTURES_PER_FRAME) {
-            long key = it.next();
-            it.remove();
+
+        int camSX = SectionPos.blockToSectionCoord((int) Math.floor(cameraPos.x));
+        int camSY = SectionPos.blockToSectionCoord((int) Math.floor(cameraPos.y));
+        int camSZ = SectionPos.blockToSectionCoord((int) Math.floor(cameraPos.z));
+
+        for (int b = 0; b < DISTANCE_BUCKETS; b++) {
+            if (dirtyDistanceBuckets[b] == null) {
+                dirtyDistanceBuckets[b] = new ArrayList<>();
+            } else {
+                dirtyDistanceBuckets[b].clear();
+            }
+        }
+        for (Long key : dirtySections) {
             int sx = SectionPos.x(key);
             int sy = SectionPos.y(key);
             int sz = SectionPos.z(key);
-            if (level.getChunkSource().getChunkNow(sx, sz) == null) {
-                continue;
-            }
-            GreedyMesher.SectionSnapshot snapshot = GreedyMesher.SectionSnapshot.capture(level, sx, sy, sz);
-            if (snapshot == null) {
-                if (vkMegaBuffer != null && vkMegaBuffer.isInitialized()) {
-                    vkMegaBuffer.unloadSection(sx, sy, sz);
+            int dx = Math.abs(sx - camSX);
+            int dy = Math.abs(sy - camSY);
+            int dz = Math.abs(sz - camSZ);
+            int bucket = Math.min(DISTANCE_BUCKETS - 1, Math.max(dx, Math.max(dy, dz)));
+            dirtyDistanceBuckets[bucket].add(key);
+        }
+
+        long startNs = System.nanoTime();
+        long budgetNs = (dirtySections.size() > STORM_DIRTY_THRESHOLD)
+                ? MAX_DRAIN_NANOS_STORM
+                : MAX_DRAIN_NANOS_STEADY;
+        int dispatched = 0;
+        int processed = 0;
+        int maxDispatch = Math.min(MAX_SECTION_CAPTURES_PER_FRAME, MAX_IN_FLIGHT_MESHES - inFlight);
+        for (int b = 0; b < DISTANCE_BUCKETS && dispatched < maxDispatch; b++) {
+            List<Long> bucketList = dirtyDistanceBuckets[b];
+            for (int i = 0; i < bucketList.size() && dispatched < maxDispatch; i++) {
+                if (processed > 0 && (System.nanoTime() - startNs) >= budgetNs) {
+                    return dispatched;
                 }
-            } else {
-                greedyMesher.enqueue(snapshot);
-                dispatched++;
+                long key = bucketList.get(i);
+                if (!dirtySections.remove(key)) {
+                    continue;
+                }
+                processed++;
+                int sx = SectionPos.x(key);
+                int sy = SectionPos.y(key);
+                int sz = SectionPos.z(key);
+                if (level.getChunkSource().getChunkNow(sx, sz) == null) {
+                    continue;
+                }
+                GreedyMesher.SectionSnapshot snapshot = GreedyMesher.SectionSnapshot.capture(level, sx, sy, sz);
+                if (snapshot == null) {
+                    if (vkMegaBuffer != null && vkMegaBuffer.isInitialized()) {
+                        vkMegaBuffer.unloadSection(sx, sy, sz);
+                    }
+                } else {
+                    greedyMesher.enqueue(snapshot);
+                    dispatched++;
+                }
             }
         }
+        return dispatched;
     }
 
     /**
@@ -2264,6 +2393,17 @@ public final class ValkyrieRenderer {
         }
         LOGGER.info("[Valkyrie] World reload event triggered.");
         dirtySections.clear();
+        chunkProfStartNs = 0L;
+        chunkProfLastLogNs = 0L;
+        chunkProfDrainNs = 0L;
+        chunkProfPollNs = 0L;
+        chunkProfFenceNs = 0L;
+        chunkProfUploadNs = 0L;
+        chunkProfUploadBytes = 0L;
+        chunkProfCaptured = 0;
+        chunkProfUploaded = 0;
+        chunkProfFrames = 0;
+        chunkProfSettled = false;
         java.util.Arrays.fill(csmCascadeInitialized, false);
         dirtyShadow = true;
         if (vkContext != null && vkContext.isInitialized()) {

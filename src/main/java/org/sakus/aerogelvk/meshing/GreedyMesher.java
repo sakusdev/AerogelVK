@@ -24,6 +24,7 @@ import net.minecraft.world.level.block.RenderShape;
 import net.minecraft.world.level.block.ShulkerBoxBlock;
 import net.minecraft.world.level.block.SignBlock;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.DataLayer;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.lighting.LayerLightEventListener;
@@ -67,6 +68,7 @@ public final class GreedyMesher {
     private static volatile ExecutorService executor = newWorkerPool();
     private static final GreedyMesher INSTANCE = new GreedyMesher();
     private static final ConcurrentHashMap<Long, MeshedSectionResult> COMPLETED_MAP = new ConcurrentHashMap<>();
+    private static final java.util.concurrent.atomic.AtomicInteger IN_FLIGHT_COUNT = new java.util.concurrent.atomic.AtomicInteger(0);
 
     private static synchronized ExecutorService ensureExecutor() {
         if (executor == null || executor.isShutdown()) {
@@ -82,11 +84,21 @@ public final class GreedyMesher {
     public void enqueue(SectionSnapshot snapshot) {
         if (snapshot == null) return;
         long key = SectionPos.asLong(snapshot.sectionX(), snapshot.sectionY(), snapshot.sectionZ());
-        meshAsync(snapshot).thenAccept(result -> {
-            if (result != null) {
+        IN_FLIGHT_COUNT.incrementAndGet();
+        meshAsync(snapshot).whenComplete((result, err) -> {
+            IN_FLIGHT_COUNT.decrementAndGet();
+            if (result != null && err == null) {
                 COMPLETED_MAP.put(key, result);
             }
         });
+    }
+
+    public int getCompletedCount() {
+        return COMPLETED_MAP.size();
+    }
+
+    public int getInFlightCount() {
+        return IN_FLIGHT_COUNT.get();
     }
 
     public MeshedSectionResult pollCompleted() {
@@ -166,7 +178,8 @@ public final class GreedyMesher {
             int baseX = sectionX << 4;
             int baseZ = sectionZ << 4;
 
-            // Pre-fetch the 3x3 chunk neighborhood once instead of 5,832 map lookups
+            // Pre-fetch the 3x3 chunk neighborhood and 3x3x3 section + light DataLayers once
+            // instead of 5,832 map/light lookups per section.
             LevelChunk[] neighborChunks = new LevelChunk[9];
             for (int dz = -1; dz <= 1; dz++) {
                 for (int dx = -1; dx <= 1; dx++) {
@@ -176,6 +189,40 @@ public final class GreedyMesher {
                 }
             }
 
+            LevelChunkSection[] neighborSections = new LevelChunkSection[27];
+            DataLayer[] blockLightLayers = new DataLayer[27];
+            DataLayer[] skyLightLayers = new DataLayer[27];
+            for (int dy = -1; dy <= 1; dy++) {
+                int nsy = sectionY + dy;
+                int wySample = nsy << 4;
+                boolean yValid = wySample >= level.getMinBuildHeight() && wySample < level.getMaxBuildHeight();
+                for (int dz = -1; dz <= 1; dz++) {
+                    int nsz = sectionZ + dz;
+                    for (int dx = -1; dx <= 1; dx++) {
+                        int nsx = sectionX + dx;
+                        int nIdx = ((dy + 1) * 3 + (dz + 1)) * 3 + (dx + 1);
+                        LevelChunk chunk = neighborChunks[(dz + 1) * 3 + (dx + 1)];
+                        if (yValid && chunk != null) {
+                            int sIdx = chunk.getSectionIndex(wySample);
+                            if (sIdx >= 0 && sIdx < chunk.getSectionsCount()) {
+                                LevelChunkSection sec = chunk.getSection(sIdx);
+                                if (sec != null && !sec.hasOnlyAir()) {
+                                    neighborSections[nIdx] = sec;
+                                }
+                            }
+                        }
+                        SectionPos secPos = SectionPos.of(nsx, nsy, nsz);
+                        if (blockLightListener != null) {
+                            blockLightLayers[nIdx] = blockLightListener.getDataLayerData(secPos);
+                        }
+                        if (skyLightListener != null) {
+                            skyLightLayers[nIdx] = skyLightListener.getDataLayerData(secPos);
+                        }
+                    }
+                }
+            }
+
+            BlockState airState = Blocks.AIR.defaultBlockState();
             BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
             int minBuildY = level.getMinBuildHeight();
             int maxBuildY = level.getMaxBuildHeight();
@@ -183,76 +230,125 @@ public final class GreedyMesher {
             for (int y = 0; y < HALO_SIZE; y++) {
                 int wy = baseY + y - 1;
                 boolean inBoundsY = wy >= minBuildY && wy < maxBuildY;
+                int cy = (y == 0) ? 0 : (y == 17 ? 2 : 1);
+                int ly = wy & 15;
                 for (int z = 0; z < HALO_SIZE; z++) {
                     int wz = baseZ + z - 1;
-                    int cz = SectionPos.blockToSectionCoord(wz) - sectionZ + 1;
+                    int cz = (z == 0) ? 0 : (z == 17 ? 2 : 1);
+                    int lz = wz & 15;
+                    int yzBase = (y * HALO_SIZE + z) * HALO_SIZE;
+                    int cyzBase = (cy * 3 + cz) * 3;
                     for (int x = 0; x < HALO_SIZE; x++) {
                         int wx = baseX + x - 1;
-                        int idx = (y * HALO_SIZE + z) * HALO_SIZE + x;
+                        int idx = yzBase + x;
+                        int cx = (x == 0) ? 0 : (x == 17 ? 2 : 1);
+                        int nIdx = cyzBase + cx;
+                        int lx = wx & 15;
 
-                        pos.set(wx, wy, wz);
-
-                        BlockState state;
-                        if (!inBoundsY) {
-                            state = Blocks.AIR.defaultBlockState();
-                        } else {
-                            int cx = SectionPos.blockToSectionCoord(wx) - sectionX + 1;
-                            LevelChunk chunk = neighborChunks[cz * 3 + cx];
-                            if (chunk == null) {
-                                state = Blocks.AIR.defaultBlockState();
-                            } else {
-                                int sectionIdx = chunk.getSectionIndex(wy);
-                                if (sectionIdx < 0 || sectionIdx >= chunk.getSectionsCount()) {
-                                    state = Blocks.AIR.defaultBlockState();
-                                } else {
-                                    LevelChunkSection section = chunk.getSection(sectionIdx);
-                                    if (section == null || section.hasOnlyAir()) {
-                                        state = Blocks.AIR.defaultBlockState();
-                                    } else {
-                                        state = section.getBlockState(wx & 15, wy & 15, wz & 15);
-                                    }
-                                }
-                            }
-                        }
+                        LevelChunkSection sec = neighborSections[nIdx];
+                        BlockState state = (sec != null) ? sec.getBlockState(lx, ly, lz) : airState;
                         blocks[idx] = state;
 
                         int bl = 0;
                         int sl = 0;
                         if (inBoundsY) {
-                            try {
+                            DataLayer blLayer = blockLightLayers[nIdx];
+                            DataLayer slLayer = skyLightLayers[nIdx];
+                            if (blLayer != null) {
+                                bl = blLayer.get(lx, ly, lz);
+                            } else if (blockLightListener != null) {
+                                pos.set(wx, wy, wz);
                                 bl = blockLightListener.getLightValue(pos);
+                            }
+                            if (slLayer != null) {
+                                sl = slLayer.get(lx, ly, lz);
+                            } else if (skyLightListener != null) {
+                                pos.set(wx, wy, wz);
                                 sl = skyLightListener.getLightValue(pos);
-                            } catch (Exception e) {
-                                bl = 0;
-                                sl = 0;
                             }
                         }
                         blockLight[idx] = (byte) bl;
                         skyLight[idx] = (byte) sl;
+                    }
+                }
+            }
 
-                        if (inBoundsY && state != null && !state.isAir()
-                                && x >= 1 && x <= SECTION_SIZE && y >= 1 && y <= SECTION_SIZE && z >= 1 && z <= SECTION_SIZE) {
-                            int tint = -1;
-                            if (!state.getFluidState().isEmpty()) {
+            final int haloSq = HALO_SIZE * HALO_SIZE;
+            int[] waterColTint = null;
+            Block[] lastColTintBlock = null;
+            int[] lastColTintVal = null;
+            byte[] lastColTintYSlice = null;
+            for (int y = 1; y <= SECTION_SIZE; y++) {
+                int wy = baseY + y - 1;
+                if (wy < minBuildY || wy >= maxBuildY) {
+                    continue;
+                }
+                byte ySlice = (byte) (wy >> 3);
+                for (int z = 1; z <= SECTION_SIZE; z++) {
+                    int wz = baseZ + z - 1;
+                    int yzBase = (y * HALO_SIZE + z) * HALO_SIZE;
+                    int colBase = (z - 1) << 4;
+                    for (int x = 1; x <= SECTION_SIZE; x++) {
+                        int idx = yzBase + x;
+                        BlockState state = blocks[idx];
+                        if (state == airState || state.isAir()) {
+                            continue;
+                        }
+                        if (isOpaqueFullCube(blocks[idx + 1])
+                                && isOpaqueFullCube(blocks[idx - 1])
+                                && isOpaqueFullCube(blocks[idx + HALO_SIZE])
+                                && isOpaqueFullCube(blocks[idx - HALO_SIZE])
+                                && isOpaqueFullCube(blocks[idx + haloSq])
+                                && isOpaqueFullCube(blocks[idx - haloSq])) {
+                            continue;
+                        }
+                        int wx = baseX + x - 1;
+                        int colIdx = colBase + (x - 1);
+                        int tint = -1;
+                        if (!state.getFluidState().isEmpty()) {
+                            if (waterColTint == null) {
+                                waterColTint = new int[256];
+                                Arrays.fill(waterColTint, -2);
+                            }
+                            int cached = waterColTint[colIdx];
+                            if (cached != -2) {
+                                tint = cached;
+                            } else {
                                 try {
+                                    pos.set(wx, wy, wz);
                                     tint = BiomeColors.getAverageWaterColor(level, pos) & 0xFFFFFF;
                                 } catch (Exception ignored) {
                                 }
-                            } else if (blockColors != null) {
+                                waterColTint[colIdx] = tint;
+                            }
+                        } else if (blockColors != null) {
+                            Block blk = state.getBlock();
+                            if (lastColTintBlock != null && lastColTintBlock[colIdx] == blk && lastColTintYSlice[colIdx] == ySlice) {
+                                tint = lastColTintVal[colIdx];
+                            } else {
                                 try {
+                                    pos.set(wx, wy, wz);
                                     int c = blockColors.getColor(state, level, pos, 0);
                                     if (c != -1) {
                                         tint = c & 0xFFFFFF;
                                     }
                                 } catch (Exception ignored) {
                                 }
+                                if (lastColTintBlock == null) {
+                                    lastColTintBlock = new Block[256];
+                                    lastColTintVal = new int[256];
+                                    lastColTintYSlice = new byte[256];
+                                }
+                                lastColTintBlock[colIdx] = blk;
+                                lastColTintVal[colIdx] = tint;
+                                lastColTintYSlice[colIdx] = ySlice;
                             }
-                            tints[idx] = tint;
                         }
+                        tints[idx] = tint;
                     }
                 }
             }
-            
+
             return new SectionSnapshot(sectionX, sectionY, sectionZ, blocks, blockLight, skyLight, tints);
         }
     }

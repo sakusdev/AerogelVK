@@ -61,7 +61,7 @@ public final class ValkyrieRenderSmokeMod implements ClientModInitializer {
     private static final String WORLD_ID = "ValkyrieRenderSmoke";
     private static final int MAX_TOTAL_TICKS = 1200; // 60s @ 20tps
     private static final int MAX_SWEEP_TICKS = 6000;
-    private static final int SETTLE_TICKS_AFTER_SECTIONS = 30;
+    private static final int SETTLE_TICKS_AFTER_SECTIONS = Integer.getInteger("aerogelvk.smoke.settleTicks", 30);
     private static final int SWEEP_MIN_FRAMES = 6;
     private static final int SWEEP_MIN_TICKS = 10;
 
@@ -149,7 +149,9 @@ public final class ValkyrieRenderSmokeMod implements ClientModInitializer {
                     sweepMode = Files.exists(Path.of("shaderpacks/.smoke_sweep"));
                     mc.options.onboardAccessibility = false;
                     mc.options.pauseOnLostFocus = false;
-                    mc.options.renderDistance().set(Boolean.getBoolean("aerogelvk.smoke.shapeShowcase") ? 2 : 4);
+                    int defaultRd = Boolean.getBoolean("aerogelvk.smoke.shapeShowcase") ? 2 : 4;
+                    int rd = Integer.getInteger("aerogelvk.smoke.renderDistance", defaultRd);
+                    mc.options.renderDistance().set(rd);
                     mc.options.getSoundSourceOptionInstance(SoundSource.MASTER).set(0.0);
                     mc.options.getSoundSourceOptionInstance(SoundSource.MUSIC).set(0.0);
                     mc.options.save();
@@ -258,7 +260,22 @@ public final class ValkyrieRenderSmokeMod implements ClientModInitializer {
                             mc.getFps(), renderedFramesInWorld, String.format("%.2f", avgFps));
                 }
 
-                if (ticksWithActiveSections >= SETTLE_TICKS_AFTER_SECTIONS) {
+                boolean waitChunkSettle = Boolean.getBoolean("aerogelvk.smoke.waitChunkSettle");
+                if (waitChunkSettle) {
+                    if (ticksWithActiveSections >= 20 && ValkyrieRenderer.getInstance().isChunkQueueIdle()) {
+                        double loadElapsedSec = (firstInWorldFrameNanos > 0 && lastInWorldFrameNanos > firstInWorldFrameNanos)
+                                ? (lastInWorldFrameNanos - firstInWorldFrameNanos) / 1_000_000_000.0
+                                : 0.0;
+                        double loadAvgFps = (loadElapsedSec > 0 && renderedFramesInWorld > 1)
+                                ? (renderedFramesInWorld - 1) / loadElapsedSec
+                                : 0.0;
+                        LOGGER.info("[ValkyrieSmoke] CHUNK_SETTLED! activeSections={} elapsedSec={} frames={} loadAvgFps={}",
+                                activeSections, String.format("%.2f", loadElapsedSec), renderedFramesInWorld, String.format("%.2f", loadAvgFps));
+                        finished = true;
+                        captureAndValidate(mc, activeSections);
+                        return;
+                    }
+                } else if (ticksWithActiveSections >= SETTLE_TICKS_AFTER_SECTIONS) {
                     finished = true;
                     captureAndValidate(mc, activeSections);
                     return;
