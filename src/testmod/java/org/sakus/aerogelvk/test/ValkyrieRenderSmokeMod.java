@@ -2,15 +2,19 @@ package org.sakus.aerogelvk.test;
 
 import org.sakus.aerogelvk.ValkyrieRenderer;
 import org.sakus.aerogelvk.compat.CompatManager;
+import org.sakus.aerogelvk.config.ValkyrieConfig;
 import org.sakus.aerogelvk.meshing.AtlasUVTable;
 import org.sakus.aerogelvk.vulkan.VkInteropManager;
 import org.sakus.aerogelvk.vulkan.VkMegaBuffer;
 import com.mojang.blaze3d.platform.NativeImage;
+import com.terraformersmc.modmenu.ModMenu;
+import me.shedaniel.clothconfig2.gui.ClothConfigScreen;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.Screenshot;
+import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.world.Difficulty;
 import net.minecraft.world.level.GameRules;
 import net.minecraft.world.level.GameType;
@@ -58,6 +62,8 @@ public final class ValkyrieRenderSmokeMod implements ClientModInitializer {
     private boolean noonSet = false;
 
     private boolean sweepMode = false;
+    private boolean configGuiOpened = false;
+    private int configGuiTicks = 0;
     private boolean sweepInitialized = false;
     private final List<Path> sweepPacks = new ArrayList<>();
     private int sweepIndex = -1; // -1 = builtin Vulkan, 0..n-1 = shaderpacks
@@ -101,6 +107,19 @@ public final class ValkyrieRenderSmokeMod implements ClientModInitializer {
 
         ClientTickEvents.END_CLIENT_TICK.register(mc -> {
             if (finished) {
+                return;
+            }
+
+            if (Boolean.getBoolean("aerogelvk.smoke.configGuiVerify")) {
+                if (mc.getOverlay() == null && mc.screen != null) {
+                    finished = true;
+                    verifyPersistedConfigAfterRestart(mc);
+                }
+                return;
+            }
+
+            if (Boolean.getBoolean("aerogelvk.smoke.configGuiTest")) {
+                handleConfigGuiSmoke(mc);
                 return;
             }
 
@@ -432,6 +451,108 @@ public final class ValkyrieRenderSmokeMod implements ClientModInitializer {
         }
 
         LOGGER.info("[ValkyrieSmoke] IN-WORLD RENDER SMOKE TEST PASSED!");
+        mc.stop();
+    }
+
+    private void handleConfigGuiSmoke(Minecraft mc) {
+        if (!configGuiOpened) {
+            if (mc.getOverlay() == null && mc.screen != null) {
+                configGuiOpened = true;
+                try {
+                    Path cfgPath = mc.gameDirectory.toPath().resolve("config/aerogelvk.properties");
+                    Files.createDirectories(cfgPath.getParent());
+                    java.util.Properties props = new java.util.Properties();
+                    if (Files.exists(cfgPath)) {
+                        try (var in = Files.newInputStream(cfgPath)) {
+                            props.load(in);
+                        }
+                    }
+                    props.setProperty("unknownSmokeKey", "preserve_me_123");
+                    try (var out = Files.newOutputStream(cfgPath)) {
+                        props.store(out, "Config GUI smoke pre-seed");
+                    }
+                    ValkyrieConfig.get().reload();
+                } catch (IOException e) {
+                    LOGGER.error("[ValkyrieSmoke] Failed pre-seeding unknownSmokeKey", e);
+                    mc.stop();
+                    System.exit(5);
+                    return;
+                }
+
+                Screen cfgScreen = ModMenu.getConfigScreen("aerogelvk", mc.screen);
+                if (cfgScreen == null) {
+                    LOGGER.error("[ValkyrieSmoke] ModMenu.getConfigScreen('aerogelvk') returned null!");
+                    mc.stop();
+                    System.exit(6);
+                    return;
+                }
+                LOGGER.info("[ValkyrieSmoke] Opened ModMenu config screen: {}", cfgScreen.getClass().getName());
+                mc.setScreen(cfgScreen);
+            }
+            return;
+        }
+
+        configGuiTicks++;
+        if (configGuiTicks < 8) {
+            return;
+        }
+        finished = true;
+
+        try {
+            Path out = Path.of("build/config-gui-smoke.png").toAbsolutePath();
+            Files.createDirectories(out.getParent());
+            try (NativeImage img = Screenshot.takeScreenshot(mc.getMainRenderTarget())) {
+                img.writeToFile(out);
+                LOGGER.info("[ValkyrieSmoke] Captured ModMenu/ClothConfig GUI screenshot: {} ({}x{})",
+                        out, img.getWidth(), img.getHeight());
+            }
+            if (mc.screen instanceof ClothConfigScreen clothScreen) {
+                clothScreen.saveAll(false);
+            }
+            ValkyrieConfig cfg = ValkyrieConfig.get();
+            cfg.setExposure(2.3f);
+            cfg.setCsmCascades(2);
+            cfg.setFxaaEnabled(false);
+            cfg.save();
+            LOGGER.info("[ValkyrieSmoke] Saved modified config for restart persistence check (exposure={}, csmCascades={}, fxaaEnabled={}).",
+                    cfg.getExposure(), cfg.getCsmCascades(), cfg.isFxaaEnabled());
+        } catch (Throwable t) {
+            LOGGER.error("[ValkyrieSmoke] Config GUI smoke failed", t);
+            mc.stop();
+            System.exit(7);
+            return;
+        }
+        mc.stop();
+    }
+
+    private void verifyPersistedConfigAfterRestart(Minecraft mc) {
+        try {
+            ValkyrieConfig cfg = ValkyrieConfig.get();
+            cfg.loadOrCreate();
+            Path cfgPath = mc.gameDirectory.toPath().resolve("config/aerogelvk.properties");
+            java.util.Properties props = new java.util.Properties();
+            try (var in = Files.newInputStream(cfgPath)) {
+                props.load(in);
+            }
+            String unknown = props.getProperty("unknownSmokeKey");
+            if (Math.abs(cfg.getExposure() - 2.3f) > 0.01f
+                    || cfg.getCsmCascades() != 2
+                    || cfg.isFxaaEnabled()
+                    || !"preserve_me_123".equals(unknown)) {
+                LOGGER.error("[ValkyrieSmoke] Persisted config verification FAILED! exposure={}, csmCascades={}, fxaaEnabled={}, unknownSmokeKey={}",
+                        cfg.getExposure(), cfg.getCsmCascades(), cfg.isFxaaEnabled(), unknown);
+                mc.stop();
+                System.exit(8);
+                return;
+            }
+            LOGGER.info("[ValkyrieSmoke] CONFIG PERSISTENCE AFTER RESTART PASSED! (exposure={}, csmCascades={}, fxaaEnabled={}, unknownSmokeKey={})",
+                    cfg.getExposure(), cfg.getCsmCascades(), cfg.isFxaaEnabled(), unknown);
+        } catch (Throwable t) {
+            LOGGER.error("[ValkyrieSmoke] Restart persistence check exception", t);
+            mc.stop();
+            System.exit(9);
+            return;
+        }
         mc.stop();
     }
 }

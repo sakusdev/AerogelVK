@@ -9,7 +9,10 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 
 /**
  * Runtime configuration for ValkyrieRender, tuned for integrated and discrete GPUs.
@@ -45,6 +48,14 @@ public final class ValkyrieConfig {
     private String shaderPack = "off";
     private boolean shaderPackEnabled = false;
 
+    private static final Set<String> KNOWN_KEYS = Set.of(
+            "csmEnabled", "csmResolution", "csmCascades", "csmUpdateInterval",
+            "fastShadowPcf", "ssrEnabled", "fxaaEnabled", "hiZOcclusionEnabled",
+            "exposure", "sodiumCompatEnabled", "dhCompatEnabled", "irisCompatEnabled",
+            "shaderPack", "shaderPackEnabled"
+    );
+
+    private final Map<String, String> unknownProperties = new LinkedHashMap<>();
     private boolean loaded = false;
 
     private ValkyrieConfig() {
@@ -104,6 +115,15 @@ public final class ValkyrieConfig {
         try {
             Files.createDirectories(configPath.getParent());
             Properties props = new Properties();
+            if (Files.exists(configPath)) {
+                try (InputStream existing = Files.newInputStream(configPath)) {
+                    props.load(existing);
+                } catch (IOException ignored) {
+                }
+            }
+            for (Map.Entry<String, String> entry : unknownProperties.entrySet()) {
+                props.putIfAbsent(entry.getKey(), entry.getValue());
+            }
             props.setProperty("csmEnabled", Boolean.toString(csmEnabled));
             props.setProperty("csmResolution", Integer.toString(csmResolution));
             props.setProperty("csmCascades", Integer.toString(csmCascades));
@@ -128,6 +148,12 @@ public final class ValkyrieConfig {
     }
 
     private void applyProperties(Properties props) {
+        unknownProperties.clear();
+        for (String name : props.stringPropertyNames()) {
+            if (!KNOWN_KEYS.contains(name)) {
+                unknownProperties.put(name, props.getProperty(name));
+            }
+        }
         csmEnabled = parseBool(props.getProperty("csmEnabled"), csmEnabled);
         csmResolution = sanitizeResolution(parseInt(props.getProperty("csmResolution"), csmResolution));
         csmCascades = clampInt(parseInt(props.getProperty("csmCascades"), csmCascades), 1, 3);
@@ -303,6 +329,57 @@ public final class ValkyrieConfig {
 
     public boolean isIrisCompatEnabled() {
         return irisCompatEnabled;
+    }
+
+    public synchronized void setCsmEnabled(boolean csmEnabled) {
+        this.csmEnabled = csmEnabled;
+    }
+
+    public synchronized void setCsmResolution(int csmResolution) {
+        this.csmResolution = sanitizeResolution(csmResolution);
+    }
+
+    public synchronized void setCsmCascades(int csmCascades) {
+        this.csmCascades = clampInt(csmCascades, 1, 3);
+    }
+
+    public synchronized void setCsmUpdateInterval(int csmUpdateInterval) {
+        this.csmUpdateInterval = clampInt(csmUpdateInterval, 1, 30);
+    }
+
+    public synchronized void setFastShadowPcf(boolean fastShadowPcf) {
+        this.fastShadowPcf = fastShadowPcf;
+    }
+
+    public synchronized void setSsrEnabled(boolean ssrEnabled) {
+        this.ssrEnabled = ssrEnabled;
+    }
+
+    public synchronized void setFxaaEnabled(boolean fxaaEnabled) {
+        this.fxaaEnabled = fxaaEnabled;
+    }
+
+    public synchronized void setHiZOcclusionEnabled(boolean hiZOcclusionEnabled) {
+        this.hiZOcclusionEnabled = hiZOcclusionEnabled;
+    }
+
+    public synchronized void setExposure(float exposure) {
+        if (!Float.isFinite(exposure)) {
+            return;
+        }
+        this.exposure = Math.max(0.1f, Math.min(4.0f, exposure));
+    }
+
+    public synchronized void setSodiumCompatEnabled(boolean sodiumCompatEnabled) {
+        this.sodiumCompatEnabled = sodiumCompatEnabled;
+    }
+
+    public synchronized void setDhCompatEnabled(boolean dhCompatEnabled) {
+        this.dhCompatEnabled = dhCompatEnabled;
+    }
+
+    public synchronized void setIrisCompatEnabled(boolean irisCompatEnabled) {
+        this.irisCompatEnabled = irisCompatEnabled;
     }
 
     public synchronized String getShaderPack() {
