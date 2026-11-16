@@ -118,6 +118,14 @@ public final class AerogelVkConfigScreen {
                 .setSaveConsumer(config::setFastShadowPcf)
                 .build());
 
+        shadows.addEntry(entryBuilder.startBooleanToggle(
+                        Component.translatable("config.aerogelvk.option.shadowSkipStaticFrames"),
+                        config.isShadowSkipStaticFrames())
+                .setDefaultValue(true)
+                .setTooltip(Component.translatable("config.aerogelvk.tooltip.shadowSkipStaticFrames"))
+                .setSaveConsumer(config::setShadowSkipStaticFrames)
+                .build());
+
         shadows.addEntry(entryBuilder.startIntSlider(
                         Component.translatable("config.aerogelvk.option.csmResolution"),
                         config.getCsmResolution(), 512, 2048)
