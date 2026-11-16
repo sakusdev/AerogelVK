@@ -144,6 +144,29 @@ public final class ValkyrieRenderer {
     private final Matrix4f[] renderedCsmMatrices = new Matrix4f[VkPipelineManager.CSM_CASCADE_COUNT];
     private final boolean[] csmCascadeInitialized = new boolean[VkPipelineManager.CSM_CASCADE_COUNT];
 
+    // Static-frame shadow skip state
+    private static final float SHADOW_STATIC_EPSILON = 1e-4f;
+    private boolean shadowStaticStateValid = false;
+    private boolean shadowStaticDirtyThisFrame = true;
+    private final Vector3f prevShadowCameraPos = new Vector3f();
+    private final Matrix4f prevShadowViewMatrix = new Matrix4f();
+    private final Vector3f prevShadowSunDir = new Vector3f();
+    private long prevShadowDayTime = Long.MIN_VALUE;
+    private float prevShadowRainLevel = Float.NaN;
+    private int prevShadowLevelId = 0;
+    private String prevShadowDimensionId = "";
+    private int prevShadowEntityCount = -1;
+    private long prevShadowEntitySum = 0L;
+    private long prevShadowEntityXor = 0L;
+    private boolean prevCfgCsmEnabled = true;
+    private int prevCfgCsmCascades = 3;
+    private int prevCfgCsmResolution = 1024;
+    private int prevCfgCsmUpdateInterval = 6;
+    private boolean prevCfgVanillaLighting = false;
+    private boolean prevCfgShadowSkipStaticFrames = true;
+    private int prevCfgShadowResCap = 0;
+    private boolean prevCfgShaderPackActive = false;
+
     private ValkyrieRenderer() {
         this.atlasUVTable = AtlasUVTable.getInstance();
         this.greedyMesher = GreedyMesher.getInstance();
@@ -575,6 +598,11 @@ public final class ValkyrieRenderer {
         boolean useBuiltinCsm = !isShaderPackActive()
                 && vkMegaBuffer.getActiveSectionCount() > 0
                 && vkMegaBuffer.getSlotDispatchLimit() > 0;
+        this.shadowStaticDirtyThisFrame = evaluateStaticShadowState(
+                level, cameraPos, viewMatrix, sunDir, slot, uploadedThisFrame > 0);
+        if (this.shadowStaticDirtyThisFrame && isShaderPackActive() && vkShaderPackPipeline != null) {
+            vkShaderPackPipeline.invalidateShadow();
+        }
         List<Integer> csmCascadesToUpdate = collectCsmCascadesToUpdate(useBuiltinCsm);
 
         int dimFlags = 0;
@@ -1819,6 +1847,18 @@ public final class ValkyrieRenderer {
             return List.of();
         }
         int activeCascades = Math.min(config.getCsmCascades(), VkPipelineManager.CSM_CASCADE_COUNT);
+        if (config.isShadowSkipStaticFrames() && !shadowStaticDirtyThisFrame && !dirtyShadow) {
+            boolean allInitialized = true;
+            for (int c = 0; c < activeCascades; c++) {
+                if (!csmCascadeInitialized[c]) {
+                    allInitialized = false;
+                    break;
+                }
+            }
+            if (allInitialized) {
+                return List.of();
+            }
+        }
         List<Integer> cascades = new ArrayList<>(activeCascades);
         for (int c = 0; c < activeCascades; c++) {
             if (!csmCascadeInitialized[c] || vkPipelineManager.shouldUpdateCascade(c, frameIndex, dirtyShadow)) {
@@ -1828,6 +1868,122 @@ public final class ValkyrieRenderer {
             }
         }
         return cascades;
+    }
+
+    /**
+     * Evaluates whether camera, sun/time, scene geometry, entities, world/dimension, or shadow settings
+     * changed since the previous frame. Conservative: returns true whenever any tracked state differs.
+     */
+    private boolean evaluateStaticShadowState(
+            ClientLevel level,
+            Vector3f cameraPos,
+            Matrix4f viewMatrix,
+            Vector3f sunDir,
+            int slot,
+            boolean uploadedMeshesThisFrame) {
+        ValkyrieConfig cfg = ValkyrieConfig.get();
+        boolean packActive = isShaderPackActive();
+
+        int levelId = (level != null) ? System.identityHashCode(level) : 0;
+        String dimId = (level != null && level.dimension() != null)
+                ? level.dimension().location().toString()
+                : "";
+        long dayTime = (level != null) ? level.getDayTime() : 0L;
+        float rainLevel = (level != null) ? level.getRainLevel(1.0f) : 0.0f;
+
+        // Entity movement digest within shadow range (conservative 256m radius)
+        int entityCount = 0;
+        long entitySum = 0L;
+        long entityXor = 0L;
+        if (level != null) {
+            final float shadowRange = 256.0f;
+            final double shadowRangeSq = (double) shadowRange * (double) shadowRange;
+            for (net.minecraft.world.entity.Entity e : level.entitiesForRendering()) {
+                if (e.distanceToSqr(cameraPos.x, cameraPos.y, cameraPos.z) <= shadowRangeSq) {
+                    long h = Double.doubleToLongBits(e.getX());
+                    h = h * 31L + Double.doubleToLongBits(e.getY());
+                    h = h * 31L + Double.doubleToLongBits(e.getZ());
+                    h = h * 31L + Float.floatToIntBits(e.getYRot());
+                    h = h * 31L + Float.floatToIntBits(e.getXRot());
+                    h = h * 31L + e.getId();
+                    entitySum += h;
+                    entityXor ^= Long.rotateLeft(h, 17);
+                    entityCount++;
+                }
+            }
+        }
+
+        boolean worldChanged = !shadowStaticStateValid
+                || levelId != prevShadowLevelId
+                || !dimId.equals(prevShadowDimensionId);
+
+        boolean settingsChanged = !shadowStaticStateValid
+                || cfg.isCsmEnabled() != prevCfgCsmEnabled
+                || cfg.getCsmCascades() != prevCfgCsmCascades
+                || cfg.getCsmResolution() != prevCfgCsmResolution
+                || cfg.getCsmUpdateInterval() != prevCfgCsmUpdateInterval
+                || cfg.isVanillaLighting() != prevCfgVanillaLighting
+                || cfg.isShadowSkipStaticFrames() != prevCfgShadowSkipStaticFrames
+                || cfg.getShaderPackShadowResolutionCap() != prevCfgShadowResCap
+                || packActive != prevCfgShaderPackActive;
+
+        if (worldChanged || settingsChanged) {
+            java.util.Arrays.fill(csmCascadeInitialized, false);
+        }
+
+        boolean cameraChanged = !shadowStaticStateValid
+                || Math.abs(cameraPos.x - prevShadowCameraPos.x) > SHADOW_STATIC_EPSILON
+                || Math.abs(cameraPos.y - prevShadowCameraPos.y) > SHADOW_STATIC_EPSILON
+                || Math.abs(cameraPos.z - prevShadowCameraPos.z) > SHADOW_STATIC_EPSILON
+                || !matrixWithinEpsilon(viewMatrix, prevShadowViewMatrix, SHADOW_STATIC_EPSILON);
+
+        boolean sunOrTimeChanged = !shadowStaticStateValid
+                || dayTime != prevShadowDayTime
+                || Math.abs(rainLevel - prevShadowRainLevel) > SHADOW_STATIC_EPSILON
+                || Math.abs(sunDir.x - prevShadowSunDir.x) > SHADOW_STATIC_EPSILON
+                || Math.abs(sunDir.y - prevShadowSunDir.y) > SHADOW_STATIC_EPSILON
+                || Math.abs(sunDir.z - prevShadowSunDir.z) > SHADOW_STATIC_EPSILON;
+
+        boolean sceneChanged = dirtyShadow
+                || uploadedMeshesThisFrame
+                || vkMegaBuffer.hasPendingTransfers(slot)
+                || vkMegaBuffer.getDeferredUploadCount() > 0
+                || entityCount != prevShadowEntityCount
+                || entitySum != prevShadowEntitySum
+                || entityXor != prevShadowEntityXor;
+
+        prevShadowCameraPos.set(cameraPos);
+        prevShadowViewMatrix.set(viewMatrix);
+        prevShadowSunDir.set(sunDir);
+        prevShadowDayTime = dayTime;
+        prevShadowRainLevel = rainLevel;
+        prevShadowLevelId = levelId;
+        prevShadowDimensionId = dimId;
+        prevShadowEntityCount = entityCount;
+        prevShadowEntitySum = entitySum;
+        prevShadowEntityXor = entityXor;
+        prevCfgCsmEnabled = cfg.isCsmEnabled();
+        prevCfgCsmCascades = cfg.getCsmCascades();
+        prevCfgCsmResolution = cfg.getCsmResolution();
+        prevCfgCsmUpdateInterval = cfg.getCsmUpdateInterval();
+        prevCfgVanillaLighting = cfg.isVanillaLighting();
+        prevCfgShadowSkipStaticFrames = cfg.isShadowSkipStaticFrames();
+        prevCfgShadowResCap = cfg.getShaderPackShadowResolutionCap();
+        prevCfgShaderPackActive = packActive;
+        shadowStaticStateValid = true;
+
+        return worldChanged || settingsChanged || cameraChanged || sunOrTimeChanged || sceneChanged;
+    }
+
+    private static boolean matrixWithinEpsilon(Matrix4f a, Matrix4f b, float eps) {
+        return Math.abs(a.m00() - b.m00()) <= eps && Math.abs(a.m01() - b.m01()) <= eps
+                && Math.abs(a.m02() - b.m02()) <= eps && Math.abs(a.m03() - b.m03()) <= eps
+                && Math.abs(a.m10() - b.m10()) <= eps && Math.abs(a.m11() - b.m11()) <= eps
+                && Math.abs(a.m12() - b.m12()) <= eps && Math.abs(a.m13() - b.m13()) <= eps
+                && Math.abs(a.m20() - b.m20()) <= eps && Math.abs(a.m21() - b.m21()) <= eps
+                && Math.abs(a.m22() - b.m22()) <= eps && Math.abs(a.m23() - b.m23()) <= eps
+                && Math.abs(a.m30() - b.m30()) <= eps && Math.abs(a.m31() - b.m31()) <= eps
+                && Math.abs(a.m32() - b.m32()) <= eps && Math.abs(a.m33() - b.m33()) <= eps;
     }
 
     private void transitionImageLayout(

@@ -20,6 +20,8 @@
   "config.aerogelvk.tooltip.csmUpdateInterval": "外側カスケードを間引き更新するフレーム間隔（1〜30、即時反映）。",
   "config.aerogelvk.option.fastShadowPcf": "高速シャドウ PCF",
   "config.aerogelvk.tooltip.fastShadowPcf": "9タップの代わりに軽量な4タップ PCF フィルタを使用します（即時反映）。",
+  "config.aerogelvk.option.shadowSkipStaticFrames": "静止フレームのシャドウ更新をスキップ",
+  "config.aerogelvk.tooltip.shadowSkipStaticFrames": "カメラ・太陽・シーンが静止している場合、前フレームのシャドウマップを再利用します（即時反映）。",
   "config.aerogelvk.option.csmResolution": "CSM 解像度（要再起動）",
   "config.aerogelvk.tooltip.csmResolution": "シャドウマップ解像度（512 / 1024 / 2048 に丸められます）。※ 反映には再起動が必要です。",
   "config.aerogelvk.option.shaderPackEnabled": "ネイティブシェーダーパック有効化",

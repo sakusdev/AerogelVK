@@ -313,6 +313,32 @@ public class VkShaderPackPipeline implements AutoCloseable {
     private VkGpuProfiler gpuProfiler;
     private int profilerFrameSlot = 0;
 
+    // Static-frame shadow skip tracking
+    private static final float SHADOW_POS_EPSILON = 1e-4f;
+    private static final float SHADOW_MAT_EPSILON = 1e-4f;
+    private boolean shadowMapValid = false;
+    private boolean shadowSceneDirty = true;
+    private int packLoadGeneration = 0;
+    private final Vector3f prevShadowCamPos = new Vector3f();
+    private final Matrix4f prevShadowModelView = new Matrix4f();
+    private final Matrix4f prevShadowProj = new Matrix4f();
+    private final Vector3f prevShadowSunDir = new Vector3f();
+    private final Vector3f prevShadowLightPos = new Vector3f();
+    private int prevShadowWorldTime = Integer.MIN_VALUE;
+    private int prevShadowWorldDay = Integer.MIN_VALUE;
+    private int prevShadowMoonPhase = Integer.MIN_VALUE;
+    private float prevShadowAngle = Float.NaN;
+    private float prevShadowSunAngle = Float.NaN;
+    private float prevShadowRainStrength = Float.NaN;
+    private int prevShadowResolution = -1;
+    private int prevShadowCap = -1;
+    private int prevShadowPackGeneration = -1;
+
+    public void invalidateShadow() {
+        this.shadowSceneDirty = true;
+        this.shadowMapValid = false;
+    }
+
     public void setGpuProfiler(VkGpuProfiler gpuProfiler, int frameSlot) {
         this.gpuProfiler = gpuProfiler;
         this.profilerFrameSlot = frameSlot;
@@ -555,6 +581,8 @@ public class VkShaderPackPipeline implements AutoCloseable {
 
         packReady = (gbuffersTerrainPass != null && finalPass != null);
         hasPrevFrameState = false;
+        packLoadGeneration++;
+        invalidateShadow();
 
         LOGGER.info("[Valkyrie] Compiled shaderpack '{}': ready={}, passes={} (shadow={}, terrain={}, water={}, deferred={}, composite={}, final={}), warnings={}",
                 activePackName,
@@ -580,6 +608,8 @@ public class VkShaderPackPipeline implements AutoCloseable {
         }
         destroyPassPipelines();
         activePackName = "OFF";
+        packLoadGeneration++;
+        invalidateShadow();
         packReady = false;
         hasPrevFrameState = false;
     }
@@ -873,6 +903,7 @@ public class VkShaderPackPipeline implements AutoCloseable {
             this.activeRenderScale = desiredScale;
             this.activeShadowCap = desiredShadowCap;
             targets.reconfigure(scaledWidth, scaledHeight, activeProperties);
+            invalidateShadow();
         } else if (scaledWidth != targets.getWidth() || scaledHeight != targets.getHeight()
                 || width != displayWidth || height != displayHeight
                 || Math.abs(desiredScale - activeRenderScale) > 1e-4f) {
@@ -884,6 +915,9 @@ public class VkShaderPackPipeline implements AutoCloseable {
         updateUniforms(uniforms, scaledWidth, scaledHeight);
         updateDescriptorSet0();
 
+        boolean hasShadowPass = (shadowPass != null && shadowPass.getPipeline() != VK_NULL_HANDLE);
+        boolean skipShadow = shouldSkipStaticShadowPass(uniforms, hasShadowPass, desiredShadowCap);
+
         try (MemoryStack stack = MemoryStack.stackPush()) {
             // Flush any pending mesh uploads into MegaBuffer if not already flushed by caller
             megaBuffer.recordPendingTransfers(cmd);
@@ -891,8 +925,8 @@ public class VkShaderPackPipeline implements AutoCloseable {
             int slotLimit = megaBuffer.getSlotDispatchLimit();
             int maxDrawCount = Math.max(1, slotLimit);
 
-            // 1. Clear all shaderpack targets and transition them to SHADER_READ_ONLY_OPTIMAL
-            targets.recordClearAllTargets(cmd, frameClearR, frameClearG, frameClearB, stack);
+            // 1. Clear all shaderpack targets (preserving shadowtex/shadowcolor when skipping static shadow pass)
+            targets.recordClearAllTargets(cmd, frameClearR, frameClearG, frameClearB, !skipShadow, stack);
 
             int passSetSlot = 0;
 
@@ -910,14 +944,15 @@ public class VkShaderPackPipeline implements AutoCloseable {
 
             boolean hasWaterPass = (gbuffersWaterPass != null && gbuffersWaterPass.getPipeline() != VK_NULL_HANDLE);
 
-            // 3. Optional shadow pass (cull all geometry when shadowPass is present)
-            if (shadowPass != null && shadowPass.getPipeline() != VK_NULL_HANDLE) {
+            // 3. Optional shadow pass (skipped on static frames when shadowSkipStaticFrames is enabled)
+            if (hasShadowPass && !skipShadow) {
                 int qShadow = (gpuProfiler != null) ? gpuProfiler.beginPass(cmd, profilerFrameSlot, "shadow") : -1;
                 dispatchShaderPackCull(cmd, stack, slotLimit, 0);
                 long set1 = updateDescriptorSet1ForCurrentState(passSetSlot++);
                 recordShadowPass(cmd, stack, shadowPass, set1, maxDrawCount);
                 targets.recordCopyShadowDepth(cmd, 0, 1, stack);
                 if (gpuProfiler != null) gpuProfiler.endPass(cmd, profilerFrameSlot, qShadow);
+                recordShadowState(uniforms, desiredShadowCap);
             }
 
             // 4. Primary gbuffers_terrain pass (opaque-only when gbuffers_water is present, else all)
@@ -2245,6 +2280,81 @@ public class VkShaderPackPipeline implements AutoCloseable {
     public void resetTemporalState() {
         this.hasPrevFrameState = false;
         this.internalFrameCounter = 0;
+        invalidateShadow();
+    }
+
+    private boolean shouldSkipStaticShadowPass(
+            ShaderUniformLayout.UniformData u,
+            boolean hasShadowPass,
+            int desiredShadowCap) {
+        if (!hasShadowPass || !shadowMapValid || shadowSceneDirty || u == null) {
+            return false;
+        }
+        if (!org.sakus.aerogelvk.config.ValkyrieConfig.get().isShadowSkipStaticFrames()) {
+            return false;
+        }
+        if (packLoadGeneration != prevShadowPackGeneration
+                || targets.getShadowResolution() != prevShadowResolution
+                || desiredShadowCap != prevShadowCap) {
+            return false;
+        }
+        if (u.worldTime != prevShadowWorldTime
+                || u.worldDay != prevShadowWorldDay
+                || u.moonPhase != prevShadowMoonPhase) {
+            return false;
+        }
+        if (Math.abs(u.shadowAngle - prevShadowAngle) > SHADOW_POS_EPSILON
+                || Math.abs(u.sunAngle - prevShadowSunAngle) > SHADOW_POS_EPSILON
+                || Math.abs(u.rainStrength - prevShadowRainStrength) > SHADOW_POS_EPSILON) {
+            return false;
+        }
+        if (!vecWithinEpsilon(u.cameraPosition, prevShadowCamPos, SHADOW_POS_EPSILON)
+                || !vecWithinEpsilon(u.sunPosition, prevShadowSunDir, SHADOW_POS_EPSILON)
+                || !vecWithinEpsilon(u.shadowLightPosition, prevShadowLightPos, SHADOW_POS_EPSILON)) {
+            return false;
+        }
+        return matrixWithinEpsilon(u.gbufferModelView, prevShadowModelView, SHADOW_MAT_EPSILON)
+                && matrixWithinEpsilon(u.gbufferProjection, prevShadowProj, SHADOW_MAT_EPSILON);
+    }
+
+    private void recordShadowState(ShaderUniformLayout.UniformData u, int desiredShadowCap) {
+        if (u == null) {
+            shadowMapValid = false;
+            return;
+        }
+        prevShadowCamPos.set(u.cameraPosition);
+        prevShadowModelView.set(u.gbufferModelView);
+        prevShadowProj.set(u.gbufferProjection);
+        prevShadowSunDir.set(u.sunPosition);
+        prevShadowLightPos.set(u.shadowLightPosition);
+        prevShadowWorldTime = u.worldTime;
+        prevShadowWorldDay = u.worldDay;
+        prevShadowMoonPhase = u.moonPhase;
+        prevShadowAngle = u.shadowAngle;
+        prevShadowSunAngle = u.sunAngle;
+        prevShadowRainStrength = u.rainStrength;
+        prevShadowResolution = targets.getShadowResolution();
+        prevShadowCap = desiredShadowCap;
+        prevShadowPackGeneration = packLoadGeneration;
+        shadowMapValid = true;
+        shadowSceneDirty = false;
+    }
+
+    private static boolean vecWithinEpsilon(Vector3f a, Vector3f b, float eps) {
+        return Math.abs(a.x - b.x) <= eps
+                && Math.abs(a.y - b.y) <= eps
+                && Math.abs(a.z - b.z) <= eps;
+    }
+
+    private static boolean matrixWithinEpsilon(Matrix4f a, Matrix4f b, float eps) {
+        return Math.abs(a.m00() - b.m00()) <= eps && Math.abs(a.m01() - b.m01()) <= eps
+                && Math.abs(a.m02() - b.m02()) <= eps && Math.abs(a.m03() - b.m03()) <= eps
+                && Math.abs(a.m10() - b.m10()) <= eps && Math.abs(a.m11() - b.m11()) <= eps
+                && Math.abs(a.m12() - b.m12()) <= eps && Math.abs(a.m13() - b.m13()) <= eps
+                && Math.abs(a.m20() - b.m20()) <= eps && Math.abs(a.m21() - b.m21()) <= eps
+                && Math.abs(a.m22() - b.m22()) <= eps && Math.abs(a.m23() - b.m23()) <= eps
+                && Math.abs(a.m30() - b.m30()) <= eps && Math.abs(a.m31() - b.m31()) <= eps
+                && Math.abs(a.m32() - b.m32()) <= eps && Math.abs(a.m33() - b.m33()) <= eps;
     }
 
     @Override

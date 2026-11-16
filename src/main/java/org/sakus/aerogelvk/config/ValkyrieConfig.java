@@ -38,6 +38,7 @@ public final class ValkyrieConfig {
     private int csmCascades = 3;
     private int csmUpdateInterval = 6;
     private boolean fastShadowPcf = true;
+    private boolean shadowSkipStaticFrames = true;
     private boolean ssrEnabled = true;
     private boolean vanillaLighting = false;
     private boolean fxaaEnabled = true;
@@ -53,7 +54,7 @@ public final class ValkyrieConfig {
 
     private static final Set<String> KNOWN_KEYS = Set.of(
             "csmEnabled", "csmResolution", "csmCascades", "csmUpdateInterval",
-            "fastShadowPcf", "ssrEnabled", "vanillaLighting", "fxaaEnabled", "hiZOcclusionEnabled",
+            "fastShadowPcf", "shadowSkipStaticFrames", "ssrEnabled", "vanillaLighting", "fxaaEnabled", "hiZOcclusionEnabled",
             "exposure", "sodiumCompatEnabled", "dhCompatEnabled", "irisCompatEnabled",
             "shaderPack", "shaderPackEnabled",
             "shaderPackRenderScale", "shaderPackShadowResolutionCap"
@@ -133,6 +134,7 @@ public final class ValkyrieConfig {
             props.setProperty("csmCascades", Integer.toString(csmCascades));
             props.setProperty("csmUpdateInterval", Integer.toString(csmUpdateInterval));
             props.setProperty("fastShadowPcf", Boolean.toString(fastShadowPcf));
+            props.setProperty("shadowSkipStaticFrames", Boolean.toString(shadowSkipStaticFrames));
             props.setProperty("ssrEnabled", Boolean.toString(ssrEnabled));
             props.setProperty("vanillaLighting", Boolean.toString(vanillaLighting));
             props.setProperty("fxaaEnabled", Boolean.toString(fxaaEnabled));
@@ -166,6 +168,7 @@ public final class ValkyrieConfig {
         csmCascades = clampInt(parseInt(props.getProperty("csmCascades"), csmCascades), 1, 3);
         csmUpdateInterval = clampInt(parseInt(props.getProperty("csmUpdateInterval"), csmUpdateInterval), 1, 30);
         fastShadowPcf = parseBool(props.getProperty("fastShadowPcf"), fastShadowPcf);
+        shadowSkipStaticFrames = parseBool(props.getProperty("shadowSkipStaticFrames"), shadowSkipStaticFrames);
         ssrEnabled = parseBool(props.getProperty("ssrEnabled"), ssrEnabled);
         vanillaLighting = parseBool(props.getProperty("vanillaLighting"), vanillaLighting);
         fxaaEnabled = parseBool(props.getProperty("fxaaEnabled"), fxaaEnabled);
@@ -367,6 +370,14 @@ public final class ValkyrieConfig {
 
     public synchronized void setFastShadowPcf(boolean fastShadowPcf) {
         this.fastShadowPcf = fastShadowPcf;
+    }
+
+    public synchronized boolean isShadowSkipStaticFrames() {
+        return shadowSkipStaticFrames;
+    }
+
+    public synchronized void setShadowSkipStaticFrames(boolean shadowSkipStaticFrames) {
+        this.shadowSkipStaticFrames = shadowSkipStaticFrames;
     }
 
     public synchronized void setSsrEnabled(boolean ssrEnabled) {

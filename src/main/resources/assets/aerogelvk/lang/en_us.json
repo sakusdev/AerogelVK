@@ -22,6 +22,8 @@
   "config.aerogelvk.tooltip.csmUpdateInterval": "Frame interval for staggered outer cascade updates (1 - 30, applied immediately).",
   "config.aerogelvk.option.fastShadowPcf": "Fast Shadow PCF",
   "config.aerogelvk.tooltip.fastShadowPcf": "Uses faster 4-tap PCF shadow filtering instead of full 9-tap PCF (applied immediately).",
+  "config.aerogelvk.option.shadowSkipStaticFrames": "Skip Static Shadow Updates",
+  "config.aerogelvk.tooltip.shadowSkipStaticFrames": "Reuses the previous frame's shadow maps when camera, sun, and scene are static (applied immediately).",
   "config.aerogelvk.option.csmResolution": "CSM Resolution (Requires Restart)",
   "config.aerogelvk.tooltip.csmResolution": "Shadow map resolution clamped to 512 / 1024 / 2048. Restart required to reallocate shadow textures.",
   "config.aerogelvk.option.shaderPackEnabled": "Enable Native Shader Pack",

@@ -678,6 +678,16 @@ public final class VkShaderPackTargets implements AutoCloseable {
      * of a frame and transitions all of them to VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL.
      */
     public void recordClearAllTargets(VkCommandBuffer cmd, float clearR, float clearG, float clearB, MemoryStack stack) {
+        recordClearAllTargets(cmd, clearR, clearG, clearB, true, stack);
+    }
+
+    public void recordClearAllTargets(
+            VkCommandBuffer cmd,
+            float clearR,
+            float clearG,
+            float clearB,
+            boolean clearShadows,
+            MemoryStack stack) {
         for (int i = 0; i < MAX_COLORTEX; i++) {
             if (!colorClearEnabled[i]) {
                 continue;
@@ -695,11 +705,13 @@ public final class VkShaderPackTargets implements AutoCloseable {
         for (int i = 0; i < MAX_DEPTHTEX; i++) {
             recordClearDepthImage(cmd, depthImages[i], 1.0f, stack);
         }
-        for (int i = 0; i < MAX_SHADOWTEX; i++) {
-            recordClearDepthImage(cmd, shadowDepthImages[i], 1.0f, stack);
-        }
-        for (int i = 0; i < MAX_SHADOWCOLOR; i++) {
-            recordClearColorImage(cmd, shadowColorImages[i], 1, 1f, 1f, 1f, 1f, stack);
+        if (clearShadows) {
+            for (int i = 0; i < MAX_SHADOWTEX; i++) {
+                recordClearDepthImage(cmd, shadowDepthImages[i], 1.0f, stack);
+            }
+            for (int i = 0; i < MAX_SHADOWCOLOR; i++) {
+                recordClearColorImage(cmd, shadowColorImages[i], 1, 1f, 1f, 1f, 1f, stack);
+            }
         }
     }
 
