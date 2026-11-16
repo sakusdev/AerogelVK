@@ -297,6 +297,13 @@ public class VkShaderPackPipeline implements AutoCloseable {
     private int displayHeight = 1;
     private float activeRenderScale = 1.0f;
     private int activeShadowCap = 0;
+
+    // Full-resolution dummy depth for final pass when display size differs from scaled target size
+    private long finalDummyDepthImage = VK_NULL_HANDLE;
+    private long finalDummyDepthAllocation = VK_NULL_HANDLE;
+    private long finalDummyDepthView = VK_NULL_HANDLE;
+    private int finalDummyDepthWidth = 0;
+    private int finalDummyDepthHeight = 0;
     private String activePackName = "OFF";
     private ShaderPackProperties activeProperties = ShaderPackProperties.empty();
     private boolean initialized = false;
@@ -1233,11 +1240,15 @@ public class VkShaderPackPipeline implements AutoCloseable {
                     .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
         }
 
+        VkRenderingAttachmentInfo depthAttachment = prepareDummyDepthAttachment(
+                cmd, stack, targets.getDummyDepthImage(), targets.getDummyDepthView());
+
         VkRenderingInfo renderingInfo = VkRenderingInfo.calloc(stack)
                 .sType(VK_STRUCTURE_TYPE_RENDERING_INFO)
                 .renderArea(ra -> ra.offset(o -> o.set(0, 0)).extent(e -> e.set(width, height)))
                 .layerCount(1)
-                .pColorAttachments(colorAttachments);
+                .pColorAttachments(colorAttachments)
+                .pDepthAttachment(depthAttachment);
 
         vkCmdBeginRendering(cmd, renderingInfo);
         setViewportAndScissor(cmd, stack, width, height);
@@ -1283,11 +1294,25 @@ public class VkShaderPackPipeline implements AutoCloseable {
         colorAttachment.get(0).clearValue().color()
                 .float32(0, frameClearR).float32(1, frameClearG).float32(2, frameClearB).float32(3, 1.0f);
 
+        long dummyDepthImg;
+        long dummyDepthVw;
+        if (width == targets.getWidth() && height == targets.getHeight()) {
+            dummyDepthImg = targets.getDummyDepthImage();
+            dummyDepthVw = targets.getDummyDepthView();
+        } else {
+            ensureFinalDummyDepth(width, height);
+            dummyDepthImg = finalDummyDepthImage;
+            dummyDepthVw = finalDummyDepthView;
+        }
+        VkRenderingAttachmentInfo depthAttachment = prepareDummyDepthAttachment(
+                cmd, stack, dummyDepthImg, dummyDepthVw);
+
         VkRenderingInfo renderingInfo = VkRenderingInfo.calloc(stack)
                 .sType(VK_STRUCTURE_TYPE_RENDERING_INFO)
                 .renderArea(ra -> ra.offset(o -> o.set(0, 0)).extent(e -> e.set(width, height)))
                 .layerCount(1)
-                .pColorAttachments(colorAttachment);
+                .pColorAttachments(colorAttachment)
+                .pDepthAttachment(depthAttachment);
 
         vkCmdBeginRendering(cmd, renderingInfo);
         setViewportAndScissor(cmd, stack, width, height);
@@ -1305,6 +1330,100 @@ public class VkShaderPackPipeline implements AutoCloseable {
                 VK_ACCESS_TRANSFER_READ_BIT,
                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, stack);
+    }
+
+    private VkRenderingAttachmentInfo prepareDummyDepthAttachment(
+            VkCommandBuffer cmd,
+            MemoryStack stack,
+            long depthImage,
+            long depthView) {
+        VkShaderPackTargets.recordImageBarrier(cmd, depthImage,
+                VK_IMAGE_LAYOUT_UNDEFINED,
+                VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1,
+                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, stack);
+        return VkRenderingAttachmentInfo.calloc(stack)
+                .sType(VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO)
+                .imageView(depthView)
+                .imageLayout(VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL)
+                .loadOp(VK_ATTACHMENT_LOAD_OP_DONT_CARE)
+                .storeOp(VK_ATTACHMENT_STORE_OP_NONE);
+    }
+
+    private void ensureFinalDummyDepth(int width, int height) {
+        if (finalDummyDepthImage != VK_NULL_HANDLE
+                && finalDummyDepthWidth == width && finalDummyDepthHeight == height) {
+            return;
+        }
+        VkDevice device = ctx.getVkDevice();
+        if (finalDummyDepthImage != VK_NULL_HANDLE) {
+            vkDeviceWaitIdle(device);
+            destroyFinalDummyDepth();
+        }
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkImageCreateInfo imageInfo = VkImageCreateInfo.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO)
+                    .imageType(VK_IMAGE_TYPE_2D)
+                    .extent(e -> e.width(width).height(height).depth(1))
+                    .mipLevels(1)
+                    .arrayLayers(1)
+                    .format(VK_FORMAT_D32_SFLOAT)
+                    .tiling(VK_IMAGE_TILING_OPTIMAL)
+                    .initialLayout(VK_IMAGE_LAYOUT_UNDEFINED)
+                    .usage(VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)
+                    .samples(VK_SAMPLE_COUNT_1_BIT)
+                    .sharingMode(VK_SHARING_MODE_EXCLUSIVE);
+
+            VmaAllocationCreateInfo allocInfo = VmaAllocationCreateInfo.calloc(stack)
+                    .usage(Vma.VMA_MEMORY_USAGE_AUTO);
+
+            LongBuffer pImage = stack.mallocLong(1);
+            PointerBuffer pAlloc = stack.mallocPointer(1);
+            int res = Vma.vmaCreateImage(ctx.getVmaAllocator(), imageInfo, allocInfo, pImage, pAlloc, null);
+            if (res != VK_SUCCESS) {
+                throw new RuntimeException("Failed to create final dummy depth image: " + res);
+            }
+            finalDummyDepthImage = pImage.get(0);
+            finalDummyDepthAllocation = pAlloc.get(0);
+
+            VkImageViewCreateInfo viewInfo = VkImageViewCreateInfo.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO)
+                    .image(finalDummyDepthImage)
+                    .viewType(VK_IMAGE_VIEW_TYPE_2D)
+                    .format(VK_FORMAT_D32_SFLOAT)
+                    .subresourceRange(r -> r
+                            .aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT)
+                            .baseMipLevel(0)
+                            .levelCount(1)
+                            .baseArrayLayer(0)
+                            .layerCount(1));
+
+            LongBuffer pView = stack.mallocLong(1);
+            res = vkCreateImageView(device, viewInfo, null, pView);
+            if (res != VK_SUCCESS) {
+                throw new RuntimeException("Failed to create final dummy depth imageView: " + res);
+            }
+            finalDummyDepthView = pView.get(0);
+            finalDummyDepthWidth = width;
+            finalDummyDepthHeight = height;
+        }
+    }
+
+    private void destroyFinalDummyDepth() {
+        if (finalDummyDepthView != VK_NULL_HANDLE) {
+            vkDestroyImageView(ctx.getVkDevice(), finalDummyDepthView, null);
+            finalDummyDepthView = VK_NULL_HANDLE;
+        }
+        if (finalDummyDepthImage != VK_NULL_HANDLE) {
+            Vma.vmaDestroyImage(ctx.getVmaAllocator(), finalDummyDepthImage, finalDummyDepthAllocation);
+            finalDummyDepthImage = VK_NULL_HANDLE;
+            finalDummyDepthAllocation = VK_NULL_HANDLE;
+        }
+        finalDummyDepthWidth = 0;
+        finalDummyDepthHeight = 0;
     }
 
     /**
@@ -1424,7 +1543,9 @@ public class VkShaderPackPipeline implements AutoCloseable {
             }
 
             boolean hasDepthAttachment = (kind == PassKind.GBUFFERS || kind == PassKind.SHADOW);
-            int depthFormat = hasDepthAttachment ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_UNDEFINED;
+            // Always supply D32_SFLOAT so fullscreen/final passes never pass NULL pDepthAttachment
+            // (defensive workaround for drivers that dereference pDepthAttachment without a NULL check).
+            int depthFormat = VK_FORMAT_D32_SFLOAT;
             boolean depthTest = hasDepthAttachment;
             boolean depthWrite = hasDepthAttachment && !alphaBlend;
 
@@ -1502,7 +1623,7 @@ public class VkShaderPackPipeline implements AutoCloseable {
                         ctx.getVkDevice(), "fallback_final.fsh",
                         transpiled.getFragmentGlsl(), VkShaderCompiler.STAGE_FRAGMENT);
                 long pipeline = createGraphicsPipeline(
-                        vertModule, fragModule, colorFormats, VK_FORMAT_UNDEFINED, false, false, false, false);
+                        vertModule, fragModule, colorFormats, VK_FORMAT_D32_SFLOAT, false, false, false, false);
                 return new CompiledPass(
                         "final", PassKind.FINAL, pipeline, drawBuffers, 1, false, false, false);
             } finally {
@@ -2136,6 +2257,7 @@ public class VkShaderPackPipeline implements AutoCloseable {
             VkDevice device = ctx.getVkDevice();
             vkDeviceWaitIdle(device);
             destroyPassPipelines();
+            destroyFinalDummyDepth();
 
             if (cullPipeline != VK_NULL_HANDLE) {
                 vkDestroyPipeline(device, cullPipeline, null);

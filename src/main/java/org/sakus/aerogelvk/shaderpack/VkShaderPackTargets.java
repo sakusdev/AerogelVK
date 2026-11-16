@@ -68,6 +68,11 @@ public final class VkShaderPackTargets implements AutoCloseable {
     private final long[] depthAllocations = new long[MAX_DEPTHTEX];
     private final long[] depthViews = new long[MAX_DEPTHTEX];
 
+    // Dedicated dummy depth attachment for fullscreen/final passes (never sampled, depthTest/depthWrite disabled)
+    private long dummyDepthImage;
+    private long dummyDepthAllocation;
+    private long dummyDepthView;
+
     // Shadow depth targets (0..1)
     private final long[] shadowDepthImages = new long[MAX_SHADOWTEX];
     private final long[] shadowDepthAllocations = new long[MAX_SHADOWTEX];
@@ -656,6 +661,14 @@ public final class VkShaderPackTargets implements AutoCloseable {
                 recordClearDepthImage(cmd, depthImages[i], 1.0f, stack);
             }
 
+            dummyDepthImage = createImage(
+                    width, height, VK_FORMAT_D32_SFLOAT,
+                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                    1, pAlloc
+            );
+            dummyDepthAllocation = pAlloc.get(0);
+            dummyDepthView = createImageView(dummyDepthImage, VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1);
+
             ctx.endSingleTimeCommands(cmd);
         }
     }
@@ -1145,6 +1158,9 @@ public final class VkShaderPackTargets implements AutoCloseable {
     public long getDepthImage(int index) { return depthImages[index]; }
     public long getDepthView(int index) { return depthViews[index]; }
 
+    public long getDummyDepthImage() { return dummyDepthImage; }
+    public long getDummyDepthView() { return dummyDepthView; }
+
     public long getShadowDepthImage(int index) { return shadowDepthImages[index]; }
     public long getShadowDepthView(int index) { return shadowDepthViews[index]; }
 
@@ -1221,6 +1237,16 @@ public final class VkShaderPackTargets implements AutoCloseable {
                 depthImages[i] = VK_NULL_HANDLE;
                 depthAllocations[i] = VK_NULL_HANDLE;
             }
+        }
+
+        if (dummyDepthView != VK_NULL_HANDLE) {
+            vkDestroyImageView(device, dummyDepthView, null);
+            dummyDepthView = VK_NULL_HANDLE;
+        }
+        if (dummyDepthImage != VK_NULL_HANDLE) {
+            Vma.vmaDestroyImage(vmaAllocator, dummyDepthImage, dummyDepthAllocation);
+            dummyDepthImage = VK_NULL_HANDLE;
+            dummyDepthAllocation = VK_NULL_HANDLE;
         }
     }
 
