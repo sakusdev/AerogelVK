@@ -24,6 +24,13 @@
 - **Native OptiFine / Iris Shaderpack Support**
   - Runtime preprocessor (`#include`, `#ifdef`, `#if`, `DRAWBUFFERS`, `colortexFormat`) and GLSL-to-Vulkan 460 transpiler (`GlslToVulkanTranspiler`) compiled to SPIR-V via `shaderc`.
   - Supports `shadow`, `prepare`, `gbuffers_terrain`, `gbuffers_water`, `deferred`, `composite`, and `final` passes, plus `shaders.properties` custom uniforms/variables with dependency-ordered resolution.
+- **Built-in Deferred Renderer Visuals**
+  - Water is alpha-blended with sloped fluid surfaces (corner-height averaging); lava is opaque.
+  - Day/night cycle drives sun direction, sky, ambient light and fog; The End and no-skylight dimensions use dedicated ambient light and void sky.
+  - Optional lightweight `vanillaLighting` mode (Lambert + lightmap, no PBR specular / CSM / SSR).
+  - Non-full blocks (slabs, stairs, plants, redstone wire, etc.) are meshed from `VoxelShape` / baked models, with 1/256-block precision for baked-model quads.
+- **Config Screen (Cloth Config)**
+  - Shader pack is chosen from a selector populated from `shaderpacks/` and `shaders/` discovery (including `off` / `auto`); settings are stored in `aerogelvk.properties`.
 - **Mod Compatibility**
   - Designed to coexist with optimization and world mods (such as Sodium, Lithium, Iris, Distant Horizons, C2ME, ModernFix, FerriteCore, FastQuit, etc.).
 
@@ -36,6 +43,12 @@ Captured during in-game Fabric client smoke tests (`runRenderSmokeClient` / `run
 | Base Render Smoke Test | Mod Compat Smoke Test | Full Modpack Compat Smoke Test |
 | :---: | :---: | :---: |
 | ![Render Smoke Test](docs/screenshots/render-smoke-test.png) | ![Render Smoke Compat](docs/screenshots/render-smoke-compat.png) | ![Render Smoke All Compat](docs/screenshots/render-smoke-all-compat.png) |
+
+Built-in renderer repro scenes (`-Daerogelvk.smoke.repro=<fluids|night|end>`):
+
+| Fluids (water / lava) | Night | The End |
+| :---: | :---: | :---: |
+| ![Fluids](docs/screenshots/repro-fluids-after.png) | ![Night](docs/screenshots/repro-night-after.png) | ![The End](docs/screenshots/repro-end-after.png) |
 
 ---
 
@@ -66,7 +79,7 @@ All **14** tested OptiFine/Iris shaderpacks compile cleanly (`218` passes / `436
 
 ## Known Limitations
 
-- **Non-full block geometry (0.5-block quantization):** `VoxelShape` meshing currently quantizes non-full blocks at `0.5`-block granularity. Stairs and slabs are represented well, whereas thinner shapes (fence posts at 0.25 width, crops, doors/trapdoors, etc.) are approximated at 0.5-block resolution.
+- **Non-full block geometry (1/16-block quantization):** `VoxelShape` box meshing quantizes AABBs to a 1/16-block grid; baked-model quads (plants, redstone wire, etc.) keep 1/256-block precision.
 - **Headless verification vs. in-game FPS:** `verifyValkyrie` validates correctness and synthetic scene rendering in headless mode (`64x64` / `1280x720`); it is not an in-game FPS benchmark.
 
 ---
